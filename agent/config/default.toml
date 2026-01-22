@@ -1,0 +1,39 @@
+# CrowdCast Agent Configuration
+# This file is auto-generated on first run
+# Edit to customize behavior
+
+[obs]
+# OBS WebSocket connection settings
+host = "localhost"
+port = 4455
+# password = "your-obs-websocket-password"
+
+# How often to poll OBS for capture state (milliseconds)
+poll_interval_ms = 150
+
+# How often to run sanity check / blackscreen detection (seconds)
+sanity_check_interval_secs = 300
+
+[input]
+# What input events to capture
+capture_keyboard = true
+capture_mouse_move = true
+capture_mouse_click = true
+capture_mouse_scroll = true
+
+[upload]
+# Lambda endpoint for getting pre-signed S3 URLs
+# lambda_endpoint = "https://your-api-gateway.execute-api.region.amazonaws.com/prod/presign"
+
+# Delete local files after successful upload
+delete_after_upload = true
+
+# Maximum concurrent uploads
+max_concurrent_uploads = 2
+
+[recording]
+# Directory where OBS saves recordings (auto-detected if not set)
+# output_directory = "/path/to/obs/recordings"
+
+# Session ID (auto-generated if not set)
+# session_id = "my-session-id"

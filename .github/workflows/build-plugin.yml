@@ -1,0 +1,202 @@
+name: Build OBS Plugin
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  PLUGIN_NAME: obs-crowdcast
+  OBS_VERSION: "31.0.0"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            libobs-dev
+      
+      - name: Configure
+        working-directory: obs-crowdcast-plugin
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      
+      - name: Build
+        working-directory: obs-crowdcast-plugin
+        run: cmake --build build
+      
+      - name: Package
+        working-directory: obs-crowdcast-plugin
+        run: |
+          mkdir -p artifact
+          cp build/${{ env.PLUGIN_NAME }}.so artifact/${{ env.PLUGIN_NAME }}-linux-x64.so
+          cp -r data artifact/data
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}-linux-x64
+          path: obs-crowdcast-plugin/artifact/
+
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install build tools
+        run: brew install cmake ninja
+      
+      - name: Clone OBS source for headers
+        run: |
+          git clone --depth 1 --branch ${{ env.OBS_VERSION }} \
+            https://github.com/obsproject/obs-studio.git obs-source
+      
+      - name: Install OBS.app for linking
+        run: brew install --cask obs
+      
+      - name: Configure
+        working-directory: obs-crowdcast-plugin
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DOBS_SOURCE_DIR="${{ github.workspace }}/obs-source"
+      
+      - name: Build
+        working-directory: obs-crowdcast-plugin
+        run: cmake --build build
+      
+      - name: Package as macOS .plugin bundle
+        working-directory: obs-crowdcast-plugin
+        run: |
+          # Create .plugin bundle structure
+          BUNDLE_DIR="artifact/${{ env.PLUGIN_NAME }}.plugin"
+          mkdir -p "$BUNDLE_DIR/Contents/MacOS"
+          mkdir -p "$BUNDLE_DIR/Contents/Resources/locale"
+          
+          # Copy binary (no extension in MacOS folder)
+          cp build/${{ env.PLUGIN_NAME }}.so "$BUNDLE_DIR/Contents/MacOS/${{ env.PLUGIN_NAME }}"
+          
+          # Copy locale files
+          cp data/locale/*.ini "$BUNDLE_DIR/Contents/Resources/locale/"
+          
+          # Create Info.plist
+          cat > "$BUNDLE_DIR/Contents/Info.plist" << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>obs-crowdcast</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.crowdcast.obs-plugin</string>
+            <key>CFBundleName</key>
+            <string>obs-crowdcast</string>
+            <key>CFBundlePackageType</key>
+            <string>BNDL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0.0</string>
+            <key>CFBundleVersion</key>
+            <string>1</string>
+          </dict>
+          </plist>
+          EOF
+          
+          # Create zip for release (preserves bundle structure)
+          cd artifact && zip -r ${{ env.PLUGIN_NAME }}-macos-universal.zip ${{ env.PLUGIN_NAME }}.plugin
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}-macos-universal
+          path: |
+            obs-crowdcast-plugin/artifact/${{ env.PLUGIN_NAME }}.plugin/
+            obs-crowdcast-plugin/artifact/${{ env.PLUGIN_NAME }}-macos-universal.zip
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Clone OBS source for headers
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch ${{ env.OBS_VERSION }} `
+            https://github.com/obsproject/obs-studio.git obs-source
+      
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      
+      - name: Download pre-built OBS
+        shell: pwsh
+        run: |
+          $obsUrl = "https://github.com/obsproject/obs-studio/releases/download/${{ env.OBS_VERSION }}/OBS-Studio-${{ env.OBS_VERSION }}-Windows.zip"
+          Invoke-WebRequest -Uri $obsUrl -OutFile obs-windows.zip
+          Expand-Archive -Path obs-windows.zip -DestinationPath obs-installed
+      
+      - name: Configure
+        working-directory: obs-crowdcast-plugin
+        shell: pwsh
+        run: |
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOBS_SOURCE_DIR="${{ github.workspace }}/obs-source" `
+            -DOBS_INSTALLED_DIR="${{ github.workspace }}/obs-installed"
+      
+      - name: Build
+        working-directory: obs-crowdcast-plugin
+        run: cmake --build build
+      
+      - name: Package
+        working-directory: obs-crowdcast-plugin
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact
+          Copy-Item build/${{ env.PLUGIN_NAME }}.dll artifact/${{ env.PLUGIN_NAME }}-windows-x64.dll
+          Copy-Item -Recurse data artifact/data
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}-windows-x64
+          path: obs-crowdcast-plugin/artifact/
+
+  release:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          cp artifacts/${{ env.PLUGIN_NAME }}-linux-x64/${{ env.PLUGIN_NAME }}-linux-x64.so release/
+          cp artifacts/${{ env.PLUGIN_NAME }}-macos-universal/${{ env.PLUGIN_NAME }}-macos-universal.zip release/
+          cp artifacts/${{ env.PLUGIN_NAME }}-windows-x64/${{ env.PLUGIN_NAME }}-windows-x64.dll release/
+          cp -r artifacts/${{ env.PLUGIN_NAME }}-linux-x64/data release/
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*
+          generate_release_notes: true

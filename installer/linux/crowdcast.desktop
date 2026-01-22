@@ -1,0 +1,24 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CrowdCast
+GenericName=Screen and Input Capture
+Comment=Paired screencast and input capture agent for dataset collection
+Exec=crowdcast-agent
+Icon=crowdcast
+Terminal=false
+Categories=Utility;AudioVideo;Recorder;
+Keywords=screen;record;capture;input;keyboard;mouse;
+StartupNotify=true
+StartupWMClass=crowdcast-agent
+
+# Additional metadata
+X-GNOME-Autostart-enabled=false
+X-KDE-autostart-after=panel
+
+# Actions
+Actions=setup;
+
+[Desktop Action setup]
+Name=Run Setup Wizard
+Exec=crowdcast-agent --setup

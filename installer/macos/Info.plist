@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>CrowdCast</string>
+    
+    <key>CFBundleDisplayName</key>
+    <string>CrowdCast</string>
+    
+    <key>CFBundleIdentifier</key>
+    <string>dev.crowdcast.agent</string>
+    
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    
+    <key>CFBundleExecutable</key>
+    <string>crowdcast-agent</string>
+    
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+    
+    <key>LSUIElement</key>
+    <true/>
+    
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2024 CrowdCast. MIT License.</string>
+    
+    <key>NSAppleEventsUsageDescription</key>
+    <string>CrowdCast needs to control OBS Studio for screen recording.</string>
+    
+    <key>NSSystemAdministrationUsageDescription</key>
+    <string>CrowdCast may need elevated privileges for certain operations.</string>
+    
+    <key>CFBundleDocumentTypes</key>
+    <array/>
+    
+    <key>CFBundleURLTypes</key>
+    <array/>
+    
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+</dict>
+</plist>
