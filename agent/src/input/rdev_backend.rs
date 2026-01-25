@@ -14,7 +14,8 @@ use tracing::{debug, error, info};
 /// rdev-based input capture backend
 pub struct RdevBackend {
     capturing: Arc<AtomicBool>,
-    thread_handle: Option<thread::JoinHandle<()>>,
+    /// The instant when the backend was started, used for timestamp calculation
+    start_time: Option<Instant>,
 }
 
 impl RdevBackend {
@@ -22,7 +23,7 @@ impl RdevBackend {
     pub fn new() -> Self {
         Self {
             capturing: Arc::new(AtomicBool::new(false)),
-            thread_handle: None,
+            start_time: None,
         }
     }
 }
@@ -42,6 +43,7 @@ impl InputBackend for RdevBackend {
         self.capturing.store(true, Ordering::SeqCst);
         let capturing = self.capturing.clone();
         let start_time = Instant::now();
+        self.start_time = Some(start_time);
 
         let handle = thread::spawn(move || {
             info!("rdev input capture started");
@@ -75,8 +77,8 @@ impl InputBackend for RdevBackend {
                             y: 0.0,
                         }))
                     }
-                    rdev::EventType::MouseMove { x, y } => {
-                        Some(EventType::MouseMove(MouseMoveEvent { x, y }))
+                    rdev::EventType::MouseMove { delta_x, delta_y, .. } => {
+                        Some(EventType::MouseMove(MouseMoveEvent { delta_x, delta_y }))
                     }
                     rdev::EventType::Wheel { delta_x, delta_y } => {
                         Some(EventType::MouseScroll(MouseScrollEvent {
@@ -108,28 +110,11 @@ impl InputBackend for RdevBackend {
             info!("rdev input capture stopped");
         });
 
-        self.thread_handle = Some(handle);
+        let _ = handle;
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<()> {
-        self.capturing.store(false, Ordering::SeqCst);
-
-        // Note: rdev::listen() doesn't have a clean way to stop from another thread
-        // The thread will exit when the process exits or when we forcefully terminate it
-        // For now, we just set the flag and let events be dropped
-
-        if let Some(handle) = self.thread_handle.take() {
-            // We can't cleanly join because rdev::listen blocks indefinitely
-            // Just drop the handle
-            drop(handle);
-        }
-
-        info!("rdev backend stop requested");
-        Ok(())
-    }
-
-    fn is_capturing(&self) -> bool {
-        self.capturing.load(Ordering::SeqCst)
+    fn current_timestamp(&self) -> Option<u64> {
+        self.start_time.map(|t| t.elapsed().as_micros() as u64)
     }
 }

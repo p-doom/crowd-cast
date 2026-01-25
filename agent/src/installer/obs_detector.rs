@@ -206,8 +206,10 @@ pub fn is_obs_running() -> bool {
     
     #[cfg(target_os = "macos")]
     {
+        // Use -f to match against the full command path, which is more reliable
+        // than matching just the process name (which can vary in case)
         Command::new("pgrep")
-            .args(["-x", "OBS"])
+            .args(["-f", "OBS.app/Contents/MacOS/OBS"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)

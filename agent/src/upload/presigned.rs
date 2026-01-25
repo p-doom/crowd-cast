@@ -116,11 +116,12 @@ impl Uploader {
         
         Ok(())
     }
-    
+
     /// Check if uploader is configured
     pub fn is_configured(&self) -> bool {
         self.lambda_endpoint.is_some()
     }
+    
 }
 
 #[cfg(test)]

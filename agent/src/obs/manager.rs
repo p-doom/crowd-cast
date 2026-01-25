@@ -4,8 +4,7 @@
 
 use anyhow::{Context, Result};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::installer::{detect_obs, get_profile_name, get_scene_collection_name, OBSInstallation};
@@ -21,8 +20,6 @@ pub enum OBSState {
     Running,
     /// OBS is stopping
     Stopping,
-    /// OBS crashed or exited unexpectedly
-    Crashed,
 }
 
 /// Configuration for the OBS manager
@@ -32,12 +29,6 @@ pub struct OBSManagerConfig {
     pub auto_start_recording: bool,
     /// Whether to auto-start streaming when OBS launches
     pub auto_start_streaming: bool,
-    /// Whether to restart OBS if it crashes
-    pub auto_restart: bool,
-    /// Maximum number of restart attempts
-    pub max_restart_attempts: u32,
-    /// Delay between restart attempts
-    pub restart_delay: Duration,
     /// Use the CrowdCast profile
     pub use_crowdcast_profile: bool,
 }
@@ -47,9 +38,6 @@ impl Default for OBSManagerConfig {
         Self {
             auto_start_recording: false,
             auto_start_streaming: false,
-            auto_restart: true,
-            max_restart_attempts: 3,
-            restart_delay: Duration::from_secs(5),
             use_crowdcast_profile: true,
         }
     }
@@ -65,14 +53,6 @@ pub struct OBSManager {
     state: OBSState,
     /// Configuration
     config: OBSManagerConfig,
-    /// Number of restart attempts since last successful start
-    restart_attempts: u32,
-    /// Time of last crash
-    last_crash: Option<Instant>,
-    /// State change notifier
-    state_tx: watch::Sender<OBSState>,
-    /// State change receiver (for cloning)
-    state_rx: watch::Receiver<OBSState>,
 }
 
 impl OBSManager {
@@ -80,49 +60,18 @@ impl OBSManager {
     pub fn new(config: OBSManagerConfig) -> Result<Self> {
         let installation = detect_obs()
             .context("OBS Studio not found. Please install OBS first.")?;
-        
-        let (state_tx, state_rx) = watch::channel(OBSState::Stopped);
-        
+
         Ok(Self {
             installation,
             process: None,
             state: OBSState::Stopped,
             config,
-            restart_attempts: 0,
-            last_crash: None,
-            state_tx,
-            state_rx,
         })
-    }
-    
-    /// Create with specific OBS installation
-    pub fn with_installation(installation: OBSInstallation, config: OBSManagerConfig) -> Self {
-        let (state_tx, state_rx) = watch::channel(OBSState::Stopped);
-        
-        Self {
-            installation,
-            process: None,
-            state: OBSState::Stopped,
-            config,
-            restart_attempts: 0,
-            last_crash: None,
-            state_tx,
-            state_rx,
-        }
-    }
-    
-    /// Get the current OBS state
-    pub fn state(&self) -> OBSState {
-        self.state
-    }
-    
-    /// Subscribe to state changes
-    pub fn subscribe(&self) -> watch::Receiver<OBSState> {
-        self.state_rx.clone()
     }
     
     /// Launch OBS minimized to system tray
     pub fn launch_hidden(&mut self) -> Result<()> {
+        self.refresh_process_state();
         if self.state == OBSState::Running {
             debug!("OBS is already running");
             return Ok(());
@@ -160,7 +109,6 @@ impl OBSManager {
             .with_context(|| format!("Failed to launch OBS from {:?}", self.installation.executable))?;
         
         self.process = Some(process);
-        self.restart_attempts = 0;
         self.set_state(OBSState::Running);
         
         info!("OBS launched successfully");
@@ -215,76 +163,36 @@ impl OBSManager {
         Ok(())
     }
     
-    /// Check if OBS is still running and handle crashes
-    pub fn check_health(&mut self) -> Result<OBSState> {
-        if let Some(ref mut process) = self.process {
-            match process.try_wait() {
-                Ok(None) => {
-                    // Still running
-                    if self.state != OBSState::Running {
-                        self.set_state(OBSState::Running);
-                    }
-                }
-                Ok(Some(status)) => {
-                    // Process exited
-                    if status.success() {
-                        info!("OBS exited normally");
-                        self.set_state(OBSState::Stopped);
-                    } else {
-                        warn!("OBS crashed with status: {:?}", status);
-                        self.set_state(OBSState::Crashed);
-                        self.last_crash = Some(Instant::now());
-                        self.process = None;
-                        
-                        // Attempt auto-restart if configured
-                        if self.config.auto_restart {
-                            self.attempt_restart()?;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error checking OBS process: {}", e);
-                }
-            }
-        }
-        
-        Ok(self.state)
-    }
-    
-    /// Attempt to restart OBS after a crash
-    fn attempt_restart(&mut self) -> Result<()> {
-        if self.restart_attempts >= self.config.max_restart_attempts {
-            error!(
-                "OBS has crashed {} times, giving up on auto-restart",
-                self.restart_attempts
-            );
-            return Ok(());
-        }
-        
-        self.restart_attempts += 1;
-        info!(
-            "Attempting OBS restart ({}/{})",
-            self.restart_attempts, self.config.max_restart_attempts
-        );
-        
-        std::thread::sleep(self.config.restart_delay);
-        self.launch_hidden()
-    }
-    
     /// Set state and notify subscribers
     fn set_state(&mut self, state: OBSState) {
         self.state = state;
-        let _ = self.state_tx.send(state);
     }
-    
-    /// Get OBS installation info
-    pub fn installation(&self) -> &OBSInstallation {
-        &self.installation
-    }
-    
-    /// Check if OBS process is responding
-    pub fn is_responsive(&self) -> bool {
-        self.state == OBSState::Running
+
+    fn refresh_process_state(&mut self) {
+        if self.state != OBSState::Running {
+            return;
+        }
+
+        let mut exited = false;
+        if let Some(process) = self.process.as_mut() {
+            match process.try_wait() {
+                Ok(Some(status)) => {
+                    debug!("OBS process exited: {:?}", status);
+                    exited = true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Failed to check OBS process status: {}", e);
+                }
+            }
+        } else {
+            exited = true;
+        }
+
+        if exited {
+            self.process = None;
+            self.state = OBSState::Stopped;
+        }
     }
 }
 
@@ -306,7 +214,6 @@ mod tests {
     fn test_obs_manager_config_default() {
         let config = OBSManagerConfig::default();
         assert!(!config.auto_start_recording);
-        assert!(config.auto_restart);
-        assert_eq!(config.max_restart_attempts, 3);
+        assert!(!config.auto_start_streaming);
     }
 }

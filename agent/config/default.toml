@@ -32,8 +32,8 @@ delete_after_upload = true
 max_concurrent_uploads = 2
 
 [recording]
-# Directory where OBS saves recordings (auto-detected if not set)
-# output_directory = "/path/to/obs/recordings"
+# Directory where OBS saves recordings (defaults to an OS temp dir)
+# output_directory = "/path/to/recordings"
 
 # Session ID (auto-generated if not set)
 # session_id = "my-session-id"

@@ -15,6 +15,7 @@ pub mod profile;
 pub mod app_selector;
 pub mod permissions;
 pub mod autostart;
+pub mod obs_websocket;
 pub mod wizard;
 
 pub use obs_detector::*;
@@ -23,4 +24,5 @@ pub use profile::*;
 pub use app_selector::*;
 pub use permissions::*;
 pub use autostart::*;
+pub use obs_websocket::*;
 pub use wizard::*;

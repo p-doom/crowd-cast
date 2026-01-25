@@ -16,7 +16,7 @@ futures = "0.3"
 obws = { version = "0.14", features = ["events"] }
 
 # Input capture
-rdev = "0.5"
+rdev = { git = "https://github.com/p-doom/rdev" }
 
 # HTTP client for pre-signed URL uploads
 reqwest = { version = "0.12", features = ["json"] }
@@ -36,11 +36,8 @@ directories = "5"
 # File watching
 notify = "6"
 
-# System tray
-tray-icon = "0.19"
-muda = "0.15"  # Menu library used by tray-icon
 
-# Image analysis (for blackscreen fallback)
+# Image analysis
 image = "0.25"
 
 # Logging
@@ -74,6 +71,12 @@ zip = "2"
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows-specific
 windows = { version = "0.58", features = ["Win32_Foundation"] }
+
+[build-dependencies]
+cc = "1"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+pkg-config = "0.3"
 
 [profile.release]
 lto = true
