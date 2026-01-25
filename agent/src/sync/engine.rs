@@ -3,6 +3,7 @@
 //! Coordinates input capture with OBS recording/streaming state.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -79,6 +80,9 @@ struct SharedState {
 
     /// Count of consecutive identical screenshots
     stale_screenshot_count: AtomicUsize,
+
+    /// Keys currently pressed while capture is enabled
+    pressed_keys: RwLock<HashMap<String, crate::data::KeyEvent>>,
 }
 
 /// The sync engine coordinates input capture with OBS state
@@ -118,6 +122,7 @@ impl SyncEngine {
             obs_connected: AtomicBool::new(true),
             last_screenshot_hash: RwLock::new(None),
             stale_screenshot_count: AtomicUsize::new(0),
+            pressed_keys: RwLock::new(HashMap::new()),
         });
         
         let input_backend = create_input_backend();
@@ -209,6 +214,17 @@ impl SyncEngine {
                         };
                         
                         if should_record {
+                            match &event.event {
+                                crate::data::EventType::KeyPress(key) => {
+                                    let mut pressed = state.pressed_keys.write().await;
+                                    pressed.insert(key.name.clone(), key.clone());
+                                }
+                                crate::data::EventType::KeyRelease(key) => {
+                                    let mut pressed = state.pressed_keys.write().await;
+                                    pressed.remove(&key.name);
+                                }
+                                _ => {}
+                            }
                             c.add_event(event);
                             state.event_count.fetch_add(1, Ordering::SeqCst);
                         }
@@ -441,6 +457,34 @@ impl SyncEngine {
 
             self.state.stale_screenshot_count.store(0, Ordering::SeqCst);
             *self.state.last_screenshot_hash.write().await = None;
+
+            let pressed_keys = {
+                let mut pressed = self.state.pressed_keys.write().await;
+                if pressed.is_empty() {
+                    Vec::new()
+                } else {
+                    let keys: Vec<_> = pressed.values().cloned().collect();
+                    pressed.clear();
+                    keys
+                }
+            };
+
+            if !pressed_keys.is_empty() {
+                if let Some(timestamp_us) = self.input_backend.current_timestamp() {
+                    let mut chunk = self.state.current_chunk.write().await;
+                    if let Some(ref mut c) = *chunk {
+                        for key in pressed_keys {
+                            c.add_event(InputEvent {
+                                timestamp_us,
+                                event: crate::data::EventType::KeyRelease(key),
+                            });
+                            self.state.event_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                } else {
+                    warn!("Input backend not started, cannot flush pressed keys");
+                }
+            }
             
             // Increment pause count
             let mut chunk = self.state.current_chunk.write().await;

@@ -22,10 +22,10 @@
 #include <obs-frontend-api.h>
 #include <util/dstr.h>
 #include <util/threading.h>
+#include <util/platform.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /* Official obs-websocket vendor API header (uses proc_handler, not dlsym) */
 #include "obs-websocket-api/obs-websocket-api.h"
@@ -155,25 +155,13 @@ static void on_source_activate(void *data, calldata_t *cd)
     if (!name)
         return;
 
-    char name_copy[256];
-    strncpy(name_copy, name, sizeof(name_copy) - 1);
-    name_copy[sizeof(name_copy) - 1] = '\0';
-
-    bool hooked = false;
-    bool active = false;
-    bool any_hooked = false;
-
     pthread_mutex_lock(&g_state_mutex);
     source_state_t *state = find_source(name);
     if (state) {
         state->active = true;
-        hooked = state->hooked;
-        active = true;
     }
-    any_hooked = compute_any_hooked_locked();
     pthread_mutex_unlock(&g_state_mutex);
-
-    emit_hooked_sources_event(name_copy, hooked, active, any_hooked);
+    /* Polling thread will emit event on next iteration if any_hooked changed */
 }
 
 static void on_source_deactivate(void *data, calldata_t *cd)
@@ -187,25 +175,13 @@ static void on_source_deactivate(void *data, calldata_t *cd)
     if (!name)
         return;
 
-    char name_copy[256];
-    strncpy(name_copy, name, sizeof(name_copy) - 1);
-    name_copy[sizeof(name_copy) - 1] = '\0';
-
-    bool hooked = false;
-    bool active = false;
-    bool any_hooked = false;
-
     pthread_mutex_lock(&g_state_mutex);
     source_state_t *state = find_source(name);
     if (state) {
         state->active = false;
-        hooked = state->hooked;
-        active = false;
     }
-    any_hooked = compute_any_hooked_locked();
     pthread_mutex_unlock(&g_state_mutex);
-
-    emit_hooked_sources_event(name_copy, hooked, active, any_hooked);
+    /* Polling thread will emit event on next iteration if any_hooked changed */
 }
 
 /* ========================================================================== */
@@ -839,9 +815,8 @@ static void *poll_thread_func(void *param)
             emit_hooked_sources_event("_poll", false, false, new_any_hooked);
         }
         
-        /* Sleep 200ms */
-        struct timespec ts = {0, 200 * 1000 * 1000};  /* 200ms in nanoseconds */
-        nanosleep(&ts, NULL);
+        /* Sleep 200ms using OBS portable helper */
+        os_sleep_ms(200);
     }
     
     blog(LOG_INFO, "[crowdcast] Capture state polling thread stopped");

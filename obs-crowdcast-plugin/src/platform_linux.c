@@ -10,6 +10,7 @@
 
 #if !defined(_WIN32) && !defined(__APPLE__)
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>

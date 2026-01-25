@@ -163,7 +163,11 @@ def load_input_chunk(path: str) -> dict:
     }
 
 
-def extract_key_events(chunk: dict, allow_unreleased: bool = False) -> list[tuple[float, float, str]]:
+def extract_key_events(
+    chunk: dict,
+    allow_unreleased: bool = False,
+    strict_keys: bool = False,
+) -> list[tuple[float, float, str]]:
     events = []
     assert "events" in chunk, "Input log missing events array."
     assert "start_time_us" in chunk, "Input log missing start_time_us."
@@ -187,16 +191,30 @@ def extract_key_events(chunk: dict, allow_unreleased: bool = False) -> list[tupl
         if t > last_event_t:
             last_event_t = t
         if event_type == "KeyPress":
-            assert name not in active, f"KeyPress without release for {name}."
+            if name in active:
+                if strict_keys:
+                    assert False, f"KeyPress without release for {name}."
+                print(
+                    f"Warning: duplicate KeyPress for {name} at {t:.3f}s.",
+                    file=sys.stderr,
+                )
+                continue
             active[name] = t
         else:
-            assert name in active, f"KeyRelease without press for {name}."
+            if name not in active:
+                if strict_keys:
+                    assert False, f"KeyRelease without press for {name}."
+                print(
+                    f"Warning: KeyRelease without press for {name} at {t:.3f}s.",
+                    file=sys.stderr,
+                )
+                continue
             start = active.pop(name)
             assert t >= start, f"KeyRelease precedes KeyPress for {name}."
             events.append((start, t, normalize_key_name(name)))
 
     if active:
-        if not allow_unreleased:
+        if strict_keys and not allow_unreleased:
             assert False, f"Unreleased keys at end of log: {', '.join(sorted(active.keys()))}"
         end_time = last_event_t
         if isinstance(end_time_us, int):
@@ -321,13 +339,22 @@ def main() -> int:
         action="store_true",
         help="Close any unreleased keys at the end of the log instead of failing.",
     )
+    parser.add_argument(
+        "--strict-keys",
+        action="store_true",
+        help="Fail fast on duplicate presses, unmatched releases, or unreleased keys.",
+    )
     parser.add_argument("--width", type=int, help="ASS width (required without --video).")
     parser.add_argument("--height", type=int, help="ASS height (required without --video).")
 
     args = parser.parse_args()
 
     chunk = load_input_chunk(args.input)
-    key_events = extract_key_events(chunk, allow_unreleased=args.allow_unreleased_keys)
+    key_events = extract_key_events(
+        chunk,
+        allow_unreleased=args.allow_unreleased_keys,
+        strict_keys=args.strict_keys,
+    )
 
     if not key_events:
         parser.error("No KeyPress events found in input log.")
