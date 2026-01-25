@@ -7,6 +7,8 @@ use obws::events::{Event, OutputState};
 use obws::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info};
@@ -323,29 +325,16 @@ impl OBSController {
         Ok(bytes)
     }
 
-    /// Check if the current output is a "black screen"
-    /// Returns true if the screenshot appears to be mostly black
-    pub async fn is_black_screen(&self) -> Result<bool> {
+    /// Hash the current program output in pixel space for stale-frame detection.
+    pub async fn screenshot_luma_hash(&self) -> Result<u64> {
         let screenshot_bytes = self.get_screenshot().await?;
-
-        // Load image and check average brightness
         let img = image::load_from_memory(&screenshot_bytes)
             .context("Failed to load screenshot image")?;
 
         let gray = img.to_luma8();
-        let total_brightness: u64 = gray.pixels().map(|p| p.0[0] as u64).sum();
-        let pixel_count = gray.width() as u64 * gray.height() as u64;
-        let average_brightness = total_brightness / pixel_count;
-
-        // Consider it "black" if average brightness is below threshold
-        let is_black = average_brightness < 10;
-
-        debug!(
-            "Screenshot analysis: avg_brightness={}, is_black={}",
-            average_brightness, is_black
-        );
-
-        Ok(is_black)
+        let mut hasher = DefaultHasher::new();
+        gray.as_raw().hash(&mut hasher);
+        Ok(hasher.finish())
     }
 
     /// Get the current scene name

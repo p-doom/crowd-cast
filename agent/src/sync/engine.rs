@@ -73,6 +73,12 @@ struct SharedState {
     
     /// Whether OBS is connected
     obs_connected: AtomicBool,
+
+    /// Last screenshot hash used for stale-frame detection
+    last_screenshot_hash: RwLock<Option<u64>>,
+
+    /// Count of consecutive identical screenshots
+    stale_screenshot_count: AtomicUsize,
 }
 
 /// The sync engine coordinates input capture with OBS state
@@ -110,6 +116,8 @@ impl SyncEngine {
             chunk_counter: RwLock::new(0),
             event_count: AtomicUsize::new(0),
             obs_connected: AtomicBool::new(true),
+            last_screenshot_hash: RwLock::new(None),
+            stale_screenshot_count: AtomicUsize::new(0),
         });
         
         let input_backend = create_input_backend();
@@ -430,6 +438,9 @@ impl SyncEngine {
     async fn stop_capture(&self) {
         if self.state.capture_enabled.swap(false, Ordering::SeqCst) {
             info!("Input capture disabled");
+
+            self.state.stale_screenshot_count.store(0, Ordering::SeqCst);
+            *self.state.last_screenshot_hash.write().await = None;
             
             // Increment pause count
             let mut chunk = self.state.current_chunk.write().await;
@@ -565,16 +576,38 @@ impl SyncEngine {
     /// Run periodic sanity check
     async fn run_sanity_check(&self) {
         if self.state.capture_enabled.load(Ordering::SeqCst) {
-            match self.obs.is_black_screen().await {
-                Ok(is_black) => {
-                    if is_black {
-                        warn!("Sanity check: OBS output appears to be black screen");
-                    }
-                }
+            const STALE_SCREENSHOT_THRESHOLD: usize = 2;
+
+            let screenshot_hash = match self.obs.screenshot_luma_hash().await {
+                Ok(hash) => hash,
                 Err(e) => {
                     debug!("Sanity check failed: {}", e);
+                    return;
+                }
+            };
+
+            let mut last_hash = self.state.last_screenshot_hash.write().await;
+            if let Some(previous_hash) = *last_hash {
+                if previous_hash == screenshot_hash {
+                    let count = self
+                        .state
+                        .stale_screenshot_count
+                        .fetch_add(1, Ordering::SeqCst)
+                        + 1;
+                    if count == STALE_SCREENSHOT_THRESHOLD {
+                        warn!(
+                            "Sanity check: OBS output appears frozen ({} identical frames)",
+                            count
+                        );
+                    }
+                    return;
                 }
             }
+
+            *last_hash = Some(screenshot_hash);
+            self.state
+                .stale_screenshot_count
+                .store(0, Ordering::SeqCst);
         }
     }
 }
