@@ -29,8 +29,8 @@ pub struct OBSManagerConfig {
     pub auto_start_recording: bool,
     /// Whether to auto-start streaming when OBS launches
     pub auto_start_streaming: bool,
-    /// Use the CrowdCast profile
-    pub use_crowdcast_profile: bool,
+    /// Use the crowd-cast profile
+    pub use_crowd_cast_profile: bool,
 }
 
 impl Default for OBSManagerConfig {
@@ -38,7 +38,7 @@ impl Default for OBSManagerConfig {
         Self {
             auto_start_recording: false,
             auto_start_streaming: false,
-            use_crowdcast_profile: true,
+            use_crowd_cast_profile: true,
         }
     }
 }
@@ -81,8 +81,8 @@ impl OBSManager {
         
         let mut args = vec!["--minimize-to-tray".to_string()];
         
-        // Use CrowdCast profile if configured
-        if self.config.use_crowdcast_profile {
+        // Use crowd-cast profile if configured
+        if self.config.use_crowd_cast_profile {
             args.push("--profile".to_string());
             args.push(get_profile_name().to_string());
             args.push("--collection".to_string());

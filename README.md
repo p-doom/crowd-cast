@@ -1,19 +1,42 @@
-# CrowdCast
+<div align="center">
+  <img src="https://github.com/p-doom/crowd-code/blob/main/img/pdoom-logo.png?raw=true" width="60%" alt="p(doom)" />
+</div>
+<hr>
+<div align="center" style="line-height: 1;">
+  <a href="https://www.pdoom.org/"><img alt="Homepage"
+    src="https://img.shields.io/badge/Homepage-p%28doom%29-white?logo=home&logoColor=black"/></a>
+  <a href="https://huggingface.co/p-doom"><img alt="Hugging Face"
+    src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-p--doom-ffc107?color=ffc107&logoColor=white"/></a>
+  <br>
+  <a href="https://discord.gg/G4JNuPX2VR"><img alt="Discord"
+    src="https://img.shields.io/badge/Discord-p%28doom%29-7289da?logo=discord&logoColor=white&color=7289da"/></a>
+  <a href="https://github.com/p-doom"><img alt="GitHub"
+    src="https://img.shields.io/badge/GitHub-p--doom-24292e?logo=github&logoColor=white"/></a>
+  <a href="https://twitter.com/prob_doom"><img alt="Twitter Follow"
+    src="https://img.shields.io/badge/Twitter-prob__doom-white?logo=x&logoColor=white"/></a>
+  <br>
+  <a href="LICENSE.md" style="margin: 2px;">
+    <img alt="License" src="https://img.shields.io/badge/License-MIT-f5de53?&color=f5de53" style="display: inline-block; vertical-align: middle;"/>
+  </a>
+  <br>
+</div>
+
+# `crowd-cast`:  Crowd-Sourcing Months-Long Trajectories of Human Computer Work 
 
 A cross-platform infrastructure for capturing paired screencast and keyboard/mouse input data.
 
 ## Overview
 
-CrowdCast consists of two components:
+crowd-cast consists of two components:
 
-1. **OBS Plugin** (`obs-crowdcast-plugin/`) - A C plugin for OBS Studio that exposes window capture state and provides window enumeration via obs-websocket vendor requests
+1. **OBS Plugin** (`obs-crowd-cast-plugin/`) - A C plugin for OBS Studio that exposes window capture state and provides window enumeration via obs-websocket vendor requests
 2. **Agent** (`agent/`) - A Rust application that coordinates with OBS, captures input events, and uploads paired data to S3
 
 ## Architecture
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                        CrowdCast Agent (Rust)                  │
+│                        crowd-cast Agent (Rust)                 │
 │  ┌──────────┐  ┌───────────────┐  ┌──────────┐  ┌───────────┐  │
 │  │ Tray UI  │  │ OBS Controller│  │  Sync    │  │ Uploader  │  │
 │  └──────────┘  └───────┬───────┘  │  Engine  │  └─────┬─────┘  │
@@ -29,7 +52,7 @@ CrowdCast consists of two components:
 ┌─────────────────────────────────────┐        ┌───────────────┐
 │           OBS Studio                │        │  Lambda + S3  │
 │  ┌───────────────────────────────┐  │        └───────────────┘
-│  │  CrowdCast Plugin (C)         │  │
+│  │  crowd-cast Plugin (C)        │  │
 │  │  - Tracks hooked state        │  │
 │  │  - Window enumeration         │  │
 │  │  - Source creation            │  │
@@ -61,19 +84,19 @@ cd agent
 cargo build --release
 
 # Run the setup wizard
-./target/release/crowdcast-agent --setup
+./target/release/crowd-cast-agent --setup
 ```
 
 The setup wizard will:
 1. Detect or prompt you to install OBS Studio
-2. **Automatically download and install** the CrowdCast OBS plugin
+2. **Automatically download and install** the crowd-cast OBS plugin
 3. Create an optimized OBS profile with hardware encoding
 4. Launch OBS (so the plugin loads)
 5. Let you select which applications to capture (browsers, IDEs, etc.)
 6. Request necessary OS permissions (Accessibility, Screen Recording)
 7. Optionally configure autostart
 
-After setup, simply run `crowdcast-agent` and it will automatically:
+After setup, simply run `crowd-cast-agent` and it will automatically:
 - Launch OBS minimized to the system tray
 - Start capturing input when you begin recording
 - Upload paired data to your configured endpoint
@@ -101,9 +124,9 @@ No special setup required. Run as administrator if input capture doesn't work.
 ## Configuration
 
 Configuration is stored at:
-- Linux: `~/.config/crowdcast/agent/config.toml`
-- macOS: `~/Library/Application Support/dev.crowdcast.agent/config.toml`
-- Windows: `%APPDATA%\crowdcast\agent\config\config.toml`
+- Linux: `~/.config/crowd-cast/agent/config.toml`
+- macOS: `~/Library/Application Support/dev.crowd-cast.agent/config.toml`
+- Windows: `%APPDATA%\crowd-cast\agent\config\config.toml`
 
 Example configuration:
 
@@ -130,7 +153,7 @@ delete_after_upload = true
 ### First Run (Recommended)
 
 ```bash
-crowdcast-agent --setup
+crowd-cast-agent --setup
 ```
 
 This runs the interactive setup wizard that guides you through configuration.
@@ -138,7 +161,7 @@ This runs the interactive setup wizard that guides you through configuration.
 ### Normal Usage
 
 ```bash
-crowdcast-agent
+crowd-cast-agent
 ```
 
 The agent will:
@@ -150,7 +173,7 @@ The agent will:
 ### Command Line Options
 
 ```
-crowdcast-agent [OPTIONS]
+crowd-cast-agent [OPTIONS]
 
 OPTIONS:
     -h, --help            Print help message
@@ -274,7 +297,7 @@ def handler(event, context):
 
 ## Development
 
-This section is for contributors who want to modify CrowdCast.
+This section is for contributors who want to modify crowd-cast.
 
 ### Building the OBS Plugin
 
@@ -290,7 +313,7 @@ sudo apt install obs-studio libobs-dev  # Ubuntu/Debian
 sudo dnf install obs-studio obs-studio-devel  # Fedora
 
 # Build
-cd obs-crowdcast-plugin
+cd obs-crowd-cast-plugin
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
@@ -304,26 +327,26 @@ macOS plugins require a `.plugin` bundle format. The CI workflow produces this a
 git clone --depth 1 --branch 31.0.0 https://github.com/obsproject/obs-studio.git obs-source
 
 # Build (requires OBS.app installed)
-cd obs-crowdcast-plugin
+cd obs-crowd-cast-plugin
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
   -DOBS_SOURCE_DIR="../obs-source"
 cmake --build build
 
 # Create the .plugin bundle
-mkdir -p build/obs-crowdcast.plugin/Contents/{MacOS,Resources/locale}
-cp build/obs-crowdcast.so build/obs-crowdcast.plugin/Contents/MacOS/obs-crowdcast
-cp data/locale/*.ini build/obs-crowdcast.plugin/Contents/Resources/locale/
-cat > build/obs-crowdcast.plugin/Contents/Info.plist << 'EOF'
+mkdir -p build/obs-crowd-cast.plugin/Contents/{MacOS,Resources/locale}
+cp build/obs-crowd-cast.so build/obs-crowd-cast.plugin/Contents/MacOS/obs-crowd-cast
+cp data/locale/*.ini build/obs-crowd-cast.plugin/Contents/Resources/locale/
+cat > build/obs-crowd-cast.plugin/Contents/Info.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>CFBundleExecutable</key>
-  <string>obs-crowdcast</string>
+  <string>obs-crowd-cast</string>
   <key>CFBundleIdentifier</key>
-  <string>com.crowdcast.obs-plugin</string>
+  <string>com.crowd-cast.obs-plugin</string>
   <key>CFBundleName</key>
-  <string>obs-crowdcast</string>
+  <string>obs-crowd-cast</string>
   <key>CFBundlePackageType</key>
   <string>BNDL</string>
   <key>CFBundleVersion</key>
@@ -333,7 +356,7 @@ cat > build/obs-crowdcast.plugin/Contents/Info.plist << 'EOF'
 EOF
 
 # Install to OBS plugins directory
-cp -r build/obs-crowdcast.plugin ~/Library/Application\ Support/obs-studio/plugins/
+cp -r build/obs-crowd-cast.plugin ~/Library/Application\ Support/obs-studio/plugins/
 ```
 
 #### Windows
@@ -345,7 +368,7 @@ git clone --depth 1 --branch 31.0.0 https://github.com/obsproject/obs-studio.git
 # Download pre-built OBS
 # Extract to ../obs-installed
 
-cd obs-crowdcast-plugin
+cd obs-crowd-cast-plugin
 cmake -B build -G "Visual Studio 17 2022" ^
   -DOBS_SOURCE_DIR="../obs-source" ^
   -DOBS_INSTALLED_DIR="../obs-installed"
@@ -358,7 +381,7 @@ cmake --build build --config Release
 
 ```bash
 cd agent && cargo build --release
-makensis installer/windows/crowdcast.nsi
+makensis installer/windows/crowd-cast.nsi
 ```
 
 #### macOS (DMG)

@@ -98,12 +98,12 @@ pub async fn get_available_windows(client: &Client) -> Result<AvailableWindowsRe
     let response = client
         .general()
         .call_vendor_request(obws::requests::general::CallVendorRequest {
-            vendor_name: "crowdcast",
+            vendor_name: "crowd-cast",
             request_type: "GetAvailableWindows",
             request_data: &empty_data,
         })
         .await
-        .context("Failed to call crowdcast.GetAvailableWindows")?;
+        .context("Failed to call crowd-cast.GetAvailableWindows")?;
     
     let result: AvailableWindowsResponse = serde_json::from_value(response.response_data)
         .context("Failed to parse GetAvailableWindows response")?;
@@ -125,12 +125,12 @@ pub async fn create_capture_sources(
     let response = client
         .general()
         .call_vendor_request(obws::requests::general::CallVendorRequest {
-            vendor_name: "crowdcast",
+            vendor_name: "crowd-cast",
             request_type: "CreateCaptureSources",
             request_data: &request,
         })
         .await
-        .context("Failed to call crowdcast.CreateCaptureSources")?;
+        .context("Failed to call crowd-cast.CreateCaptureSources")?;
     
     let result: CreateSourcesResponse = serde_json::from_value(response.response_data)
         .context("Failed to parse CreateCaptureSources response")?;

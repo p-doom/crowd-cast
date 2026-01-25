@@ -1,4 +1,4 @@
-//! First-run setup wizard for CrowdCast
+//! First-run setup wizard for crowd-cast
 //!
 //! The wizard follows this flow:
 //! 1. Detect/Install OBS
@@ -99,7 +99,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
     };
 
     println!();
-    println!("=== CrowdCast Setup Wizard ===");
+    println!("=== crowd-cast Setup Wizard ===");
     println!();
 
     // Step 1: Check for OBS
@@ -118,7 +118,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
                 return Ok(result);
             }
             
-            println!("  OBS Studio is required for CrowdCast to function.");
+            println!("  OBS Studio is required for crowd-cast to function.");
             println!("  Would you like to open the OBS download page? (y/n)");
             
             if prompt_yes_no()? {
@@ -135,7 +135,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
 
     // Step 2: Install plugin
     println!();
-    println!("Step 2/8: Installing CrowdCast plugin...");
+    println!("Step 2/8: Installing crowd-cast plugin...");
     
     let plugin_status = check_plugin_installed(&obs);
     let mut plugin_installed_now = false;
@@ -163,7 +163,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
     println!("Step 3/8: Configuring OBS profile...");
     
     if profile_exists(&obs) && !config.force_profile_recreate {
-        println!("  [✓] CrowdCast profile already exists");
+        println!("  [✓] crowd-cast profile already exists");
         result.profile_created = true;
     } else {
         let encoder = detect_best_encoder();
@@ -171,7 +171,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
         
         match create_profile(&obs, encoder) {
             Ok(_) => {
-                println!("  [✓] Created CrowdCast profile with {} encoding", encoder.display_name());
+                println!("  [✓] Created crowd-cast profile with {} encoding", encoder.display_name());
                 result.profile_created = true;
             }
             Err(e) => {
@@ -183,7 +183,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
         // Also create scene collection
         match create_scene_collection(&obs) {
             Ok(_) => {
-                println!("  [✓] Created CrowdCast scene collection");
+                println!("  [✓] Created crowd-cast scene collection");
             }
             Err(e) => {
                 println!("  [!] Failed to create scene collection: {}", e);
@@ -229,7 +229,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
         println!("  Starting OBS minimized...");
         
         let manager_config = OBSManagerConfig {
-            use_crowdcast_profile: true,
+            use_crowd-cast_profile: true,
             auto_start_recording: false,
             ..Default::default()
         };
@@ -246,7 +246,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
     
     if plugin_installed_now && obs_was_running {
         needs_obs_restart = true;
-        restart_reasons.push("CrowdCast plugin installed".to_string());
+        restart_reasons.push("crowd-cast plugin installed".to_string());
     }
     
     if obs_was_running {
@@ -359,7 +359,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
             }
             Err(e) => {
                 println!("  [✗] Failed to get available windows: {}", e);
-                println!("      The CrowdCast plugin may not be loaded yet.");
+                println!("      The crowd-cast plugin may not be loaded yet.");
                 println!("      If OBS was already running, restart OBS to load the plugin.");
                 if !config.non_interactive {
                     println!("      Restart OBS and retry automatically? (y/n)");
@@ -572,7 +572,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
         let should_enable = if config.non_interactive {
             true
         } else {
-            println!("  Would you like CrowdCast to start automatically on login? (y/n)");
+            println!("  Would you like crowd-cast to start automatically on login? (y/n)");
             prompt_yes_no()?
         };
         
@@ -603,12 +603,12 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
         && result.permissions_granted;
     
     if result.success {
-        println!("CrowdCast is ready to use!");
+        println!("crowd-cast is ready to use!");
         println!();
         println!("Configuration:");
         println!("  • {} window capture sources created", result.sources_created);
         if result.autostart_enabled {
-            println!("  • CrowdCast will start automatically on login");
+            println!("  • crowd-cast will start automatically on login");
         }
         println!();
         println!("The agent will:");

@@ -1,10 +1,10 @@
 [package]
-name = "crowdcast-agent"
+name = "crowd-cast-agent"
 version = "0.1.0"
 edition = "2021"
-description = "CrowdCast data collection agent - captures paired screencast and input data"
+description = "crowd-cast data collection agent - captures paired screencast and input data"
 license = "MIT"
-repository = "https://github.com/crowdcast/crowd-cast"
+repository = "https://github.com/crowd-cast/crowd-cast"
 
 [dependencies]
 # Async runtime

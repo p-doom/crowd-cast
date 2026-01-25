@@ -1,31 +1,30 @@
-; CrowdCast NSIS Installer Script
-; Builds a Windows installer for CrowdCast Agent
+; crowd-cast NSIS Installer Script
+; Builds a Windows installer for crowd-cast Agent
 
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 
 ; Application metadata
-!define APPNAME "CrowdCast"
-!define COMPANYNAME "CrowdCast"
+!define APPNAME "crowd-cast"
+!define COMPANYNAME "crowd-cast"
 !define DESCRIPTION "Paired screencast and input capture agent"
 !define VERSIONMAJOR 0
 !define VERSIONMINOR 1
 !define VERSIONBUILD 0
-!define HELPURL "https://github.com/crowdcast/crowd-cast"
-!define UPDATEURL "https://github.com/crowdcast/crowd-cast/releases"
-!define ABOUTURL "https://crowdcast.dev"
+!define HELPURL "https://github.com/crowd-cast/crowd-cast"
+!define UPDATEURL "https://github.com/crowd-cast/crowd-cast/releases"
 
 ; Installer attributes
 Name "${APPNAME}"
-OutFile "CrowdCast-Setup.exe"
+OutFile "crowd-cast-Setup.exe"
 InstallDir "$PROGRAMFILES64\${APPNAME}"
 InstallDirRegKey HKLM "Software\${APPNAME}" "Install_Dir"
 RequestExecutionLevel admin
 
 ; Modern UI settings
 !define MUI_ABORTWARNING
-!define MUI_ICON "..\..\resources\icons\crowdcast.ico"
-!define MUI_UNICON "..\..\resources\icons\crowdcast.ico"
+!define MUI_ICON "..\..\resources\icons\crowd-cast.ico"
+!define MUI_UNICON "..\..\resources\icons\crowd-cast.ico"
 
 ; Pages
 !insertmacro MUI_PAGE_WELCOME
@@ -45,21 +44,21 @@ Section "Install"
     SetOutPath $INSTDIR
     
     ; Install main executable
-    File "..\..\agent\target\release\crowdcast-agent.exe"
+    File "..\..\agent\target\release\crowd-cast-agent.exe"
     
     ; Install OBS plugin
-    File "..\..\obs-crowdcast-plugin\build\obs-crowdcast.dll"
+    File "..\..\obs-crowd-cast-plugin\build\obs-crowd-cast.dll"
     
     ; Install resources
     SetOutPath "$INSTDIR\data\locale"
-    File "..\..\obs-crowdcast-plugin\data\locale\en-US.ini"
+    File "..\..\obs-crowd-cast-plugin\data\locale\en-US.ini"
     
     ; Create uninstaller
     WriteUninstaller "$INSTDIR\Uninstall.exe"
     
     ; Create Start Menu shortcuts
     CreateDirectory "$SMPROGRAMS\${APPNAME}"
-    CreateShortcut "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk" "$INSTDIR\crowdcast-agent.exe"
+    CreateShortcut "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk" "$INSTDIR\crowd-cast-agent.exe"
     CreateShortcut "$SMPROGRAMS\${APPNAME}\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
     
     ; Registry entries for Add/Remove Programs
@@ -98,23 +97,23 @@ Section "Install"
     
     ; Install OBS plugin to user's OBS plugins directory
     SetOutPath "$APPDATA\obs-studio\obs-plugins\64bit"
-    File "..\..\obs-crowdcast-plugin\build\obs-crowdcast.dll"
+    File "..\..\obs-crowd-cast-plugin\build\obs-crowd-cast.dll"
     
-    SetOutPath "$APPDATA\obs-studio\data\obs-plugins\obs-crowdcast\locale"
-    File "..\..\obs-crowdcast-plugin\data\locale\en-US.ini"
+    SetOutPath "$APPDATA\obs-studio\data\obs-plugins\obs-crowd-cast\locale"
+    File "..\..\obs-crowd-cast-plugin\data\locale\en-US.ini"
     
 SectionEnd
 
 ; Post-install: Run setup wizard
 Section "Run Setup"
-    ExecWait '"$INSTDIR\crowdcast-agent.exe" --setup --non-interactive'
+    ExecWait '"$INSTDIR\crowd-cast-agent.exe" --setup --non-interactive'
 SectionEnd
 
 ; Uninstaller Section
 Section "Uninstall"
     ; Remove files
-    Delete "$INSTDIR\crowdcast-agent.exe"
-    Delete "$INSTDIR\obs-crowdcast.dll"
+    Delete "$INSTDIR\crowd-cast-agent.exe"
+    Delete "$INSTDIR\obs-crowd-cast.dll"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir /r "$INSTDIR\data"
     RMDir "$INSTDIR"
@@ -132,7 +131,7 @@ Section "Uninstall"
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}"
     
     ; Remove OBS plugin
-    Delete "$APPDATA\obs-studio\obs-plugins\64bit\obs-crowdcast.dll"
-    RMDir /r "$APPDATA\obs-studio\data\obs-plugins\obs-crowdcast"
+    Delete "$APPDATA\obs-studio\obs-plugins\64bit\obs-crowd-cast.dll"
+    RMDir /r "$APPDATA\obs-studio\data\obs-plugins\obs-crowd-cast"
     
 SectionEnd

@@ -5,8 +5,8 @@
  * is currently the focused/frontmost application on the system.
  */
 
-#ifndef CROWDCAST_PLATFORM_H
-#define CROWDCAST_PLATFORM_H
+#ifndef CROWD_CAST_PLATFORM_H
+#define CROWD_CAST_PLATFORM_H
 
 #include <stdbool.h>
 
@@ -51,4 +51,4 @@ bool platform_app_ids_match(const char *frontmost_id, const char *target_id);
 }
 #endif
 
-#endif /* CROWDCAST_PLATFORM_H */
+#endif /* CROWD_CAST_PLATFORM_H */

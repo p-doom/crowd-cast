@@ -1,4 +1,4 @@
-//! CrowdCast Agent
+//! crowd-cast Agent
 //!
 //! Captures paired screencast and input data for dataset collection.
 //! Coordinates with OBS Studio via WebSocket and uploads to S3 via pre-signed URLs.
@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("CrowdCast Agent starting...");
+    info!("crowd-cast Agent starting...");
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
@@ -131,16 +131,16 @@ async fn main() -> Result<()> {
     // Cleanup - abort the sync engine task
     sync_handle.abort();
     
-    info!("CrowdCast Agent shutting down");
+    info!("crowd-cast Agent shutting down");
 
     Ok(())
 }
 
 fn print_help() {
-    println!("CrowdCast Agent - Paired screencast and input capture");
+    println!("crowd-cast Agent - Paired screencast and input capture");
     println!();
     println!("USAGE:");
-    println!("    crowdcast-agent [OPTIONS]");
+    println!("    crowd-cast-agent [OPTIONS]");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help            Print this help message");
@@ -150,5 +150,5 @@ fn print_help() {
     println!("ENVIRONMENT:");
     println!("    RUST_LOG              Set log level (e.g., debug, info, warn)");
     println!();
-    println!("For more information, visit: https://github.com/crowdcast/crowd-cast");
+    println!("For more information, visit: https://github.com/crowd-cast/crowd-cast");
 }

@@ -20,7 +20,7 @@ pub struct AutostartConfig {
 impl Default for AutostartConfig {
     fn default() -> Self {
         Self {
-            app_name: "CrowdCast".to_string(),
+            app_name: "crowd-cast".to_string(),
             app_path: std::env::current_exe().unwrap_or_default(),
             args: vec![],
             start_minimized: true,
@@ -95,7 +95,7 @@ fn is_autostart_enabled_windows() -> bool {
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
             "/v",
-            "CrowdCast",
+            "crowd-cast",
         ])
         .output();
     
@@ -150,7 +150,7 @@ fn disable_autostart_windows() -> Result<()> {
             "delete",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
             "/v",
-            "CrowdCast",
+            "crowd-cast",
             "/f",
         ])
         .status()
@@ -176,7 +176,7 @@ fn get_launch_agent_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home)
         .join("Library")
         .join("LaunchAgents")
-        .join("dev.crowdcast.agent.plist"))
+        .join("dev.crowd-cast.agent.plist"))
 }
 
 #[cfg(target_os = "macos")]
@@ -214,7 +214,7 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>dev.crowdcast.agent</string>
+    <string>dev.crowd-cast.agent</string>
     <key>ProgramArguments</key>
     <array>
 {program_args}    </array>
@@ -278,7 +278,7 @@ fn get_autostart_path() -> Result<PathBuf> {
     
     Ok(PathBuf::from(config_home)
         .join("autostart")
-        .join("crowdcast.desktop"))
+        .join("crowd-cast.desktop"))
 }
 
 #[cfg(target_os = "linux")]
@@ -314,7 +314,7 @@ Exec={exe}{args}
 Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true
-Comment=CrowdCast data collection agent
+Comment=crowd-cast data collection agent
 "#,
         name = config.app_name,
         exe = exe_path,
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn test_autostart_config_default() {
         let config = AutostartConfig::default();
-        assert_eq!(config.app_name, "CrowdCast");
+        assert_eq!(config.app_name, "crowd-cast");
         assert!(config.start_minimized);
     }
     

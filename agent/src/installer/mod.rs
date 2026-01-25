@@ -1,4 +1,4 @@
-//! Installer and setup wizard components for CrowdCast
+//! Installer and setup wizard components for crowd-cast
 //!
 //! This module handles:
 //! - OBS detection and installation

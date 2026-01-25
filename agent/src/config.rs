@@ -1,4 +1,4 @@
-//! Configuration management for CrowdCast Agent
+//! Configuration management for crowd-cast Agent
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -119,7 +119,7 @@ fn default_max_uploads() -> usize {
 }
 
 fn default_recording_output_directory() -> PathBuf {
-    std::env::temp_dir().join("crowdcast-recordings")
+    std::env::temp_dir().join("crowd-cast-recordings")
 }
 
 fn default_recording_output_directory_option() -> Option<PathBuf> {
@@ -232,7 +232,7 @@ impl Config {
 
     /// Get default config path
     fn default_config_path() -> Result<PathBuf> {
-        let proj_dirs = directories::ProjectDirs::from("dev", "crowdcast", "agent")
+        let proj_dirs = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
             .context("Failed to determine config directory")?;
 
         Ok(proj_dirs.config_dir().join("config.toml"))

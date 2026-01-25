@@ -1,9 +1,9 @@
 {
-    "current_program_scene": "CrowdCast Capture",
-    "current_scene": "CrowdCast Capture",
-    "name": "CrowdCast Capture",
+    "current_program_scene": "crowd-cast Capture",
+    "current_scene": "crowd-cast Capture",
+    "name": "crowd-cast Capture",
     "scene_order": [
-        {"name": "CrowdCast Capture"}
+        {"name": "crowd-cast Capture"}
     ],
     "sources": [
         {
@@ -15,7 +15,7 @@
             "id": "scene",
             "mixers": 0,
             "muted": false,
-            "name": "CrowdCast Capture",
+            "name": "crowd-cast Capture",
             "prev_ver": 503316480,
             "private_settings": {},
             "push-to-mute": false,
