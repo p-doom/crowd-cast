@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use super::obs_detector::OBSInstallation;
 
 /// Name of our OBS plugin
-const PLUGIN_NAME: &str = "obs-crowdcast";
+const PLUGIN_NAME: &str = "obs-crowd-cast";
 
 /// GitHub repository for plugin releases
 const GITHUB_REPO: &str = "your-org/crowd-cast"; // TODO: Update with actual repo
@@ -32,13 +32,13 @@ const PLUGIN_EXT: &str = "so";
 
 /// Platform-specific artifact name for download
 #[cfg(target_os = "windows")]
-const PLUGIN_ARTIFACT: &str = "obs-crowdcast-windows-x64.dll";
+const PLUGIN_ARTIFACT: &str = "obs-crowd-cast-windows-x64.dll";
 
 #[cfg(target_os = "macos")]
-const PLUGIN_ARTIFACT: &str = "obs-crowdcast-macos-universal.zip"; // Zip containing .plugin bundle
+const PLUGIN_ARTIFACT: &str = "obs-crowd-cast-macos-universal.zip"; // Zip containing .plugin bundle
 
 #[cfg(target_os = "linux")]
-const PLUGIN_ARTIFACT: &str = "obs-crowdcast-linux-x64.so";
+const PLUGIN_ARTIFACT: &str = "obs-crowd-cast-linux-x64.so";
 
 /// Result of plugin installation check
 #[derive(Debug)]
@@ -51,7 +51,7 @@ pub struct PluginStatus {
     pub version: Option<String>,
 }
 
-/// Check if the CrowdCast plugin is installed
+/// Check if the crowd-cast plugin is installed
 pub fn check_plugin_installed(obs: &OBSInstallation) -> PluginStatus {
     let plugin_path = get_plugin_install_path(obs);
     
@@ -114,7 +114,7 @@ fn get_bundled_plugin_path() -> Option<PathBuf> {
             // Same directory as executable
             exe_dir.join(&bundle_name),
             // Development: build output (look for the .plugin bundle)
-            exe_dir.join("../../obs-crowdcast-plugin/build/artifact").join(&bundle_name),
+            exe_dir.join("../../obs-crowd-cast-plugin/build/artifact").join(&bundle_name),
         ];
         
         for path in possible_paths {
@@ -144,7 +144,7 @@ fn get_bundled_plugin_path() -> Option<PathBuf> {
             // plugins subdirectory
             exe_dir.join("plugins").join(PLUGIN_ARTIFACT),
             // Development: build output
-            exe_dir.join("../../obs-crowdcast-plugin/build").join(format!("{}.{}", PLUGIN_NAME, PLUGIN_EXT)),
+            exe_dir.join("../../obs-crowd-cast-plugin/build").join(format!("{}.{}", PLUGIN_NAME, PLUGIN_EXT)),
         ];
         
         for path in possible_paths {
@@ -158,7 +158,7 @@ fn get_bundled_plugin_path() -> Option<PathBuf> {
     }
 }
 
-/// Install the CrowdCast plugin to OBS
+/// Install the crowd-cast plugin to OBS
 pub fn install_plugin(obs: &OBSInstallation) -> Result<PathBuf> {
     // First try bundled plugin
     if let Some(bundled_path) = get_bundled_plugin_path() {
@@ -171,7 +171,7 @@ pub fn install_plugin(obs: &OBSInstallation) -> Result<PathBuf> {
     install_from_github(obs)
 }
 
-/// Install the CrowdCast plugin (async version with download support)
+/// Install the crowd-cast plugin (async version with download support)
 pub async fn install_plugin_async(obs: &OBSInstallation) -> Result<PathBuf> {
     // First try bundled plugin
     if let Some(bundled_path) = get_bundled_plugin_path() {
@@ -212,7 +212,7 @@ fn install_from_path(source_path: &Path, obs: &OBSInstallation) -> Result<PathBu
         install_plugin_data(obs)?;
     }
     
-    info!("Installed CrowdCast plugin to {:?}", install_path);
+    info!("Installed crowd-cast plugin to {:?}", install_path);
     
     Ok(install_path)
 }
@@ -268,7 +268,7 @@ async fn download_and_install_plugin(obs: &OBSInstallation) -> Result<PathBuf> {
     let client = reqwest::Client::new();
     let response = client
         .get(&download_url)
-        .header("User-Agent", "crowdcast-agent")
+        .header("User-Agent", "crowd-cast-agent")
         .send()
         .await
         .context("Failed to download plugin")?;
@@ -378,7 +378,7 @@ async fn get_latest_release_url() -> Result<String> {
     let client = reqwest::Client::new();
     let response = client
         .get(&api_url)
-        .header("User-Agent", "crowdcast-agent")
+        .header("User-Agent", "crowd-cast-agent")
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
@@ -437,7 +437,7 @@ fn install_plugin_data(obs: &OBSInstallation) -> Result<()> {
     let locale_sources = [
         exe_dir.join("data/locale"),
         exe_dir.join("../Resources/data/locale"),
-        exe_dir.join("../../obs-crowdcast-plugin/data/locale"),
+        exe_dir.join("../../obs-crowd-cast-plugin/data/locale"),
     ];
     
     let locale_dest = get_plugin_data_path(obs);
@@ -518,7 +518,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Uninstall the CrowdCast plugin from OBS
+/// Uninstall the crowd-cast plugin from OBS
 pub fn uninstall_plugin(obs: &OBSInstallation) -> Result<()> {
     let install_path = get_plugin_install_path(obs);
     
@@ -542,7 +542,7 @@ pub fn uninstall_plugin(obs: &OBSInstallation) -> Result<()> {
             }
         }
         
-        info!("Uninstalled CrowdCast plugin from {:?}", install_path);
+        info!("Uninstalled crowd-cast plugin from {:?}", install_path);
     } else {
         debug!("Plugin not installed, nothing to uninstall");
     }

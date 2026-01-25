@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>CrowdCast</string>
+    <string>crowd-cast</string>
     
     <key>CFBundleDisplayName</key>
-    <string>CrowdCast</string>
+    <string>crowd-cast</string>
     
     <key>CFBundleIdentifier</key>
-    <string>dev.crowdcast.agent</string>
+    <string>dev.crowd-cast.agent</string>
     
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
@@ -21,7 +21,7 @@
     <string>APPL</string>
     
     <key>CFBundleExecutable</key>
-    <string>crowdcast-agent</string>
+    <string>crowd-cast-agent</string>
     
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
@@ -36,13 +36,13 @@
     <true/>
     
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2024 CrowdCast. MIT License.</string>
+    <string>Copyright © 2024 crowd-cast. MIT License.</string>
     
     <key>NSAppleEventsUsageDescription</key>
-    <string>CrowdCast needs to control OBS Studio for screen recording.</string>
+    <string>crowd-cast needs to control OBS Studio for screen recording.</string>
     
     <key>NSSystemAdministrationUsageDescription</key>
-    <string>CrowdCast may need elevated privileges for certain operations.</string>
+    <string>crowd-cast may need elevated privileges for certain operations.</string>
     
     <key>CFBundleDocumentTypes</key>
     <array/>

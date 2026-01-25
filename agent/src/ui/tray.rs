@@ -1,6 +1,6 @@
 //! System tray application using dmikushin/tray FFI
 //!
-//! Provides a system tray UI for controlling the CrowdCast agent.
+//! Provides a system tray UI for controlling the crowd-cast agent.
 
 use anyhow::Result;
 use image::imageops::FilterType;
@@ -86,7 +86,7 @@ impl TrayApp {
         let icon_paths = get_icon_paths()?;
         let icons = TrayIconSet::new(&icon_paths)?;
 
-        let tooltip = CString::new("CrowdCast Agent")?;
+        let tooltip = CString::new("crowd-cast Agent")?;
 
         // Create menu items
         // Menu strings must be kept alive
@@ -400,7 +400,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 /// Get the paths to the tray icons for each capture state
 fn get_icon_paths() -> Result<TrayIconPaths> {
-    let icon_dir = directories::ProjectDirs::from("dev", "crowdcast", "agent")
+    let icon_dir = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
         .map(|p| p.cache_dir().to_path_buf())
         .unwrap_or_else(|| std::env::temp_dir());
 

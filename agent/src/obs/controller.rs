@@ -30,7 +30,7 @@ pub enum OBSEvent {
     HookedSourcesChanged { any_hooked: bool },
 }
 
-/// State of window capture sources from the CrowdCast OBS plugin
+/// State of window capture sources from the crowd-cast OBS plugin
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookedSourcesResponse {
     /// List of tracked sources
@@ -237,7 +237,7 @@ impl OBSController {
         Ok(())
     }
 
-    /// Query the CrowdCast plugin for hooked sources state
+    /// Query the crowd-cast plugin for hooked sources state
     async fn get_hooked_sources(&self) -> Result<HookedSourcesResponse> {
         let client = self.client.read().await;
 
@@ -247,12 +247,12 @@ impl OBSController {
         let response = client
             .general()
             .call_vendor_request(obws::requests::general::CallVendorRequest {
-                vendor_name: "crowdcast",
+                vendor_name: "crowd-cast",
                 request_type: "GetHookedSources",
                 request_data: &empty_data,
             })
             .await
-            .context("Failed to call crowdcast.GetHookedSources vendor request")?;
+            .context("Failed to call crowd-cast.GetHookedSources vendor request")?;
 
         let hooked_response: HookedSourcesResponse = serde_json::from_value(response.response_data)
             .context("Failed to parse hooked sources response")?;
@@ -271,12 +271,12 @@ impl OBSController {
         let response: obws::responses::general::VendorResponse<serde_json::Value> = client
             .general()
             .call_vendor_request(obws::requests::general::CallVendorRequest {
-                vendor_name: "crowdcast",
+                vendor_name: "crowd-cast",
                 request_type: "SetCaptureEnabled",
                 request_data: &request_data,
             })
             .await
-            .context("Failed to call crowdcast.SetCaptureEnabled vendor request")?;
+            .context("Failed to call crowd-cast.SetCaptureEnabled vendor request")?;
 
         // Log the response for debugging
         debug!("SetCaptureEnabled response: {:?}", response.response_data);
@@ -427,7 +427,7 @@ impl OBSController {
                         event_type,
                         event_data,
                     } => {
-                        if vendor_name == "crowdcast" && event_type == "HookedSourcesChanged" {
+                        if vendor_name == "crowd-cast" && event_type == "HookedSourcesChanged" {
                             match serde_json::from_value::<HookedSourcesChangedEvent>(event_data) {
                                 Ok(payload) => {
                                     let mut capture = state.write().await;

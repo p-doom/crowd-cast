@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 env:
-  PLUGIN_NAME: obs-crowdcast
+  PLUGIN_NAME: obs-crowd-cast
   OBS_VERSION: "31.0.0"
 
 jobs:
@@ -29,15 +29,15 @@ jobs:
             libobs-dev
       
       - name: Configure
-        working-directory: obs-crowdcast-plugin
+        working-directory: obs-crowd-cast-plugin
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       
       - name: Build
-        working-directory: obs-crowdcast-plugin
+        working-directory: obs-crowd-cast-plugin
         run: cmake --build build
       
       - name: Package
-        working-directory: obs-crowdcast-plugin
+        working-directory: obs-crowd-cast-plugin
         run: |
           mkdir -p artifact
           cp build/${{ env.PLUGIN_NAME }}.so artifact/${{ env.PLUGIN_NAME }}-linux-x64.so
@@ -47,7 +47,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PLUGIN_NAME }}-linux-x64
-          path: obs-crowdcast-plugin/artifact/
+          path: obs-crowd-cast-plugin/artifact/
 
   build-macos:
     runs-on: macos-14
@@ -66,7 +66,7 @@ jobs:
         run: brew install --cask obs
       
       - name: Configure
-        working-directory: obs-crowdcast-plugin
+        working-directory: obs-crowd-cast-plugin
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -74,11 +74,11 @@ jobs:
             -DOBS_SOURCE_DIR="${{ github.workspace }}/obs-source"
       
       - name: Build
-        working-directory: obs-crowdcast-plugin
+        working-directory: obs-crowd-cast-plugin
         run: cmake --build build
       
       - name: Package as macOS .plugin bundle
-        working-directory: obs-crowdcast-plugin
+        working-directory: obs-crowd-cast-plugin
         run: |
           # Create .plugin bundle structure
           BUNDLE_DIR="artifact/${{ env.PLUGIN_NAME }}.plugin"
@@ -98,11 +98,11 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>CFBundleExecutable</key>
-            <string>obs-crowdcast</string>
+            <string>obs-crowd-cast</string>
             <key>CFBundleIdentifier</key>
-            <string>com.crowdcast.obs-plugin</string>
+            <string>com.crowd-cast.obs-plugin</string>
             <key>CFBundleName</key>
-            <string>obs-crowdcast</string>
+            <string>obs-crowd-cast</string>
             <key>CFBundlePackageType</key>
             <string>BNDL</string>
             <key>CFBundleShortVersionString</key>
@@ -121,8 +121,8 @@ jobs:
         with:
           name: ${{ env.PLUGIN_NAME }}-macos-universal
           path: |
-            obs-crowdcast-plugin/artifact/${{ env.PLUGIN_NAME }}.plugin/
-            obs-crowdcast-plugin/artifact/${{ env.PLUGIN_NAME }}-macos-universal.zip
+            obs-crowd-cast-plugin/artifact/${{ env.PLUGIN_NAME }}.plugin/
+            obs-crowd-cast-plugin/artifact/${{ env.PLUGIN_NAME }}-macos-universal.zip
 
   build-windows:
     runs-on: windows-2022
@@ -148,7 +148,7 @@ jobs:
           Expand-Archive -Path obs-windows.zip -DestinationPath obs-installed
       
       - name: Configure
-        working-directory: obs-crowdcast-plugin
+        working-directory: obs-crowd-cast-plugin
         shell: pwsh
         run: |
           cmake -B build -G Ninja `
@@ -157,11 +157,11 @@ jobs:
             -DOBS_INSTALLED_DIR="${{ github.workspace }}/obs-installed"
       
       - name: Build
-        working-directory: obs-crowdcast-plugin
+        working-directory: obs-crowd-cast-plugin
         run: cmake --build build
       
       - name: Package
-        working-directory: obs-crowdcast-plugin
+        working-directory: obs-crowd-cast-plugin
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifact
@@ -172,7 +172,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PLUGIN_NAME }}-windows-x64
-          path: obs-crowdcast-plugin/artifact/
+          path: obs-crowd-cast-plugin/artifact/
 
   release:
     needs: [build-linux, build-macos, build-windows]

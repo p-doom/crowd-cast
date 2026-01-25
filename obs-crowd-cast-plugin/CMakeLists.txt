@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.16...3.26)
 
-project(obs-crowdcast VERSION 1.0.0)
-set(PROJECT_FULL_NAME "OBS CrowdCast Plugin")
+project(obs-crowd-cast VERSION 1.0.0)
+set(PROJECT_FULL_NAME "OBS crowd-cast Plugin")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-set(PLUGIN_AUTHOR "CrowdCast Team")
+set(PLUGIN_AUTHOR "crowd-cast Team")
 
 # Options for CI builds
 set(OBS_SOURCE_DIR "" CACHE PATH "Path to OBS source tree (for headers)")

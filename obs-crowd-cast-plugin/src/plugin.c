@@ -1,18 +1,18 @@
 /*
- * OBS CrowdCast Plugin
+ * OBS crowd-cast Plugin
  * 
  * Exposes window capture functionality via obs-websocket vendor requests:
  * 
- * 1. crowdcast.GetHookedSources
+ * 1. crowd-cast.GetHookedSources
  *    Returns the "hooked" state of window capture sources (whether OBS is 
  *    actively capturing a window vs showing a black frame).
  *    Response: { "sources": [...], "any_hooked": true }
  * 
- * 2. crowdcast.GetAvailableWindows
+ * 2. crowd-cast.GetAvailableWindows
  *    Enumerates all available windows that can be captured.
  *    Response: { "windows": [...], "suggested": [...], "source_type": "..." }
  * 
- * 3. crowdcast.CreateCaptureSources
+ * 3. crowd-cast.CreateCaptureSources
  *    Creates window capture sources for selected windows.
  *    Request: { "windows": [{"id": "...", "name": "..."}] }
  *    Response: { "success": true, "created_count": 3, ... }
@@ -34,11 +34,11 @@
 #include "platform.h"
 
 OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE("obs-crowdcast", "en-US")
+OBS_MODULE_USE_DEFAULT_LOCALE("obs-crowd-cast", "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-    return "CrowdCast Plugin - Window capture state, enumeration, and source creation via obs-websocket";
+    return "crowd-cast Plugin - Window capture state, enumeration, and source creation via obs-websocket";
 }
 
 /* ========================================================================== */
@@ -266,7 +266,7 @@ static void register_source_signals(obs_source_t *source)
         state->active = obs_source_active(source);
         state->hooked = false;
         update_source_target_app(state, source);
-        blog(LOG_INFO, "[crowdcast] Registered source '%s' with target app '%s'", 
+        blog(LOG_INFO, "[crowd-cast] Registered source '%s' with target app '%s'", 
              name, state->target_app);
     }
     pthread_mutex_unlock(&g_state_mutex);
@@ -487,7 +487,7 @@ static void get_available_windows_cb(obs_data_t *request_data, obs_data_t *respo
     const char *window_prop = get_window_property_name();
     
     int capture_type = get_capture_type();
-    blog(LOG_INFO, "[crowdcast] Enumerating using source type: %s, property: %s, capture_type: %d",
+    blog(LOG_INFO, "[crowd-cast] Enumerating using source type: %s, property: %s, capture_type: %d",
          source_id, window_prop, capture_type);
     
     /* Create a temporary source to access its properties */
@@ -498,11 +498,11 @@ static void get_available_windows_cb(obs_data_t *request_data, obs_data_t *respo
     /* Show hidden windows and applications for better enumeration */
     obs_data_set_bool(settings, "show_hidden_windows", true);
 #endif
-    obs_source_t *temp_source = obs_source_create_private(source_id, "crowdcast_temp", settings);
+    obs_source_t *temp_source = obs_source_create_private(source_id, "crowd-cast_temp", settings);
     obs_data_release(settings);
     
     if (!temp_source) {
-        blog(LOG_WARNING, "[crowdcast] Failed to create temporary source for window enumeration");
+        blog(LOG_WARNING, "[crowd-cast] Failed to create temporary source for window enumeration");
         obs_data_set_array(response_data, "windows", windows_array);
         obs_data_set_array(response_data, "suggested", suggested_array);
         obs_data_array_release(windows_array);
@@ -513,7 +513,7 @@ static void get_available_windows_cb(obs_data_t *request_data, obs_data_t *respo
     /* Get the properties object from the source */
     obs_properties_t *props = obs_source_properties(temp_source);
     if (!props) {
-        blog(LOG_WARNING, "[crowdcast] Failed to get source properties");
+        blog(LOG_WARNING, "[crowd-cast] Failed to get source properties");
         obs_source_release(temp_source);
         obs_data_set_array(response_data, "windows", windows_array);
         obs_data_set_array(response_data, "suggested", suggested_array);
@@ -534,7 +534,7 @@ static void get_available_windows_cb(obs_data_t *request_data, obs_data_t *respo
     
     if (window_property && obs_property_get_type(window_property) == OBS_PROPERTY_LIST) {
         size_t count = obs_property_list_item_count(window_property);
-        blog(LOG_INFO, "[crowdcast] Found %zu windows", count);
+        blog(LOG_INFO, "[crowd-cast] Found %zu windows", count);
         
         for (size_t i = 0; i < count; i++) {
             const char *item_name = obs_property_list_item_name(window_property, i);
@@ -593,7 +593,7 @@ static void get_available_windows_cb(obs_data_t *request_data, obs_data_t *respo
             obs_data_release(window_obj);
         }
     } else {
-        blog(LOG_WARNING, "[crowdcast] Window property not found or not a list");
+        blog(LOG_WARNING, "[crowd-cast] Window property not found or not a list");
     }
     
     obs_properties_destroy(props);
@@ -607,7 +607,7 @@ static void get_available_windows_cb(obs_data_t *request_data, obs_data_t *respo
     obs_data_array_release(windows_array);
     obs_data_array_release(suggested_array);
     
-    blog(LOG_INFO, "[crowdcast] GetAvailableWindows completed");
+    blog(LOG_INFO, "[crowd-cast] GetAvailableWindows completed");
 }
 
 /* ========================================================================== */
@@ -630,7 +630,7 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
     /* Get the windows array from the request */
     obs_data_array_t *windows = obs_data_get_array(request_data, "windows");
     if (!windows) {
-        blog(LOG_WARNING, "[crowdcast] CreateCaptureSources: no 'windows' array in request");
+        blog(LOG_WARNING, "[crowd-cast] CreateCaptureSources: no 'windows' array in request");
         obs_data_set_bool(response_data, "success", false);
         obs_data_set_string(response_data, "error", "Missing 'windows' array in request");
         obs_data_set_array(response_data, "created", created_array);
@@ -640,23 +640,23 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
         return;
     }
     
-    /* Get or create the CrowdCast scene */
-    obs_source_t *scene_source = obs_get_source_by_name("CrowdCast Capture");
+    /* Get or create the crowd-cast scene */
+    obs_source_t *scene_source = obs_get_source_by_name("crowd-cast Capture");
     obs_scene_t *scene = NULL;
     
     if (!scene_source) {
         /* Create the scene if it doesn't exist */
-        scene = obs_scene_create("CrowdCast Capture");
+        scene = obs_scene_create("crowd-cast Capture");
         if (scene) {
             scene_source = obs_scene_get_source(scene);
-            blog(LOG_INFO, "[crowdcast] Created 'CrowdCast Capture' scene");
+            blog(LOG_INFO, "[crowd-cast] Created 'crowd-cast Capture' scene");
         }
     } else {
         scene = obs_scene_from_source(scene_source);
     }
     
     if (!scene) {
-        blog(LOG_ERROR, "[crowdcast] Failed to get or create CrowdCast scene");
+        blog(LOG_ERROR, "[crowd-cast] Failed to get or create crowd-cast scene");
         obs_data_set_bool(response_data, "success", false);
         obs_data_set_string(response_data, "error", "Failed to get or create scene");
         obs_data_set_array(response_data, "created", created_array);
@@ -668,7 +668,7 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
     }
     
     size_t count = obs_data_array_count(windows);
-    blog(LOG_INFO, "[crowdcast] Creating %zu capture sources", count);
+    blog(LOG_INFO, "[crowd-cast] Creating %zu capture sources", count);
     
     for (size_t i = 0; i < count; i++) {
         obs_data_t *window = obs_data_array_item(windows, i);
@@ -683,7 +683,7 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
         /* Check if source already exists */
         obs_source_t *existing = obs_get_source_by_name(source_name);
         if (existing) {
-            blog(LOG_INFO, "[crowdcast] Source '%s' already exists, skipping", source_name);
+            blog(LOG_INFO, "[crowd-cast] Source '%s' already exists, skipping", source_name);
             obs_source_release(existing);
             obs_data_release(window);
             continue;
@@ -725,7 +725,7 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
             obs_data_release(created_obj);
             
             success_count++;
-            blog(LOG_INFO, "[crowdcast] Created source '%s'", source_name);
+            blog(LOG_INFO, "[crowd-cast] Created source '%s'", source_name);
         } else {
             obs_data_t *failed_obj = obs_data_create();
             obs_data_set_string(failed_obj, "name", source_name);
@@ -734,7 +734,7 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
             obs_data_release(failed_obj);
             
             fail_count++;
-            blog(LOG_WARNING, "[crowdcast] Failed to create source '%s'", source_name);
+            blog(LOG_WARNING, "[crowd-cast] Failed to create source '%s'", source_name);
         }
         
         obs_data_release(window);
@@ -752,7 +752,7 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
     obs_data_array_release(created_array);
     obs_data_array_release(failed_array);
     
-    blog(LOG_INFO, "[crowdcast] CreateCaptureSources completed: %d created, %d failed",
+    blog(LOG_INFO, "[crowd-cast] CreateCaptureSources completed: %d created, %d failed",
          success_count, fail_count);
 }
 
@@ -767,10 +767,10 @@ static void *poll_thread_func(void *param)
     /* Check if we're on Wayland (Linux only) - if so, use manual mode */
     if (platform_is_wayland()) {
         g_using_manual_mode = true;
-        blog(LOG_INFO, "[crowdcast] Wayland detected - using manual capture mode");
+        blog(LOG_INFO, "[crowd-cast] Wayland detected - using manual capture mode");
     }
     
-    blog(LOG_INFO, "[crowdcast] Capture state polling thread started (200ms interval)");
+    blog(LOG_INFO, "[crowd-cast] Capture state polling thread started (200ms interval)");
     
     while (g_poll_running) {
         bool old_any_hooked, new_any_hooked;
@@ -811,7 +811,7 @@ static void *poll_thread_func(void *param)
         
         /* Emit event only if state changed */
         if (new_any_hooked != old_any_hooked) {
-            blog(LOG_INFO, "[crowdcast] Capture state changed: any_hooked=%d", new_any_hooked);
+            blog(LOG_INFO, "[crowd-cast] Capture state changed: any_hooked=%d", new_any_hooked);
             emit_hooked_sources_event("_poll", false, false, new_any_hooked);
         }
         
@@ -819,7 +819,7 @@ static void *poll_thread_func(void *param)
         os_sleep_ms(200);
     }
     
-    blog(LOG_INFO, "[crowdcast] Capture state polling thread stopped");
+    blog(LOG_INFO, "[crowd-cast] Capture state polling thread stopped");
     return NULL;
 }
 
@@ -858,7 +858,7 @@ static void set_capture_enabled_cb(obs_data_t *request_data, obs_data_t *respons
     obs_data_set_bool(response_data, "enabled", enabled);
     obs_data_set_bool(response_data, "manual_mode", g_using_manual_mode);
     
-    blog(LOG_INFO, "[crowdcast] SetCaptureEnabled: enabled=%d (manual_mode=%d)", 
+    blog(LOG_INFO, "[crowd-cast] SetCaptureEnabled: enabled=%d (manual_mode=%d)", 
          enabled, g_using_manual_mode);
 }
 
@@ -868,7 +868,7 @@ static void set_capture_enabled_cb(obs_data_t *request_data, obs_data_t *respons
 
 bool obs_module_load(void)
 {
-    blog(LOG_INFO, "[crowdcast] Plugin loading...");
+    blog(LOG_INFO, "[crowd-cast] Plugin loading...");
     
     /* Initialize state */
     memset(g_sources, 0, sizeof(g_sources));
@@ -890,13 +890,13 @@ bool obs_module_load(void)
     /* Enumerate existing sources */
     enumerate_existing_sources();
     
-    blog(LOG_INFO, "[crowdcast] Plugin loaded successfully");
+    blog(LOG_INFO, "[crowd-cast] Plugin loaded successfully");
     return true;
 }
 
 void obs_module_post_load(void)
 {
-    blog(LOG_INFO, "[crowdcast] Post-load: registering vendor requests...");
+    blog(LOG_INFO, "[crowd-cast] Post-load: registering vendor requests...");
     
     /* 
      * Use the official obs-websocket API (proc_handler based).
@@ -905,19 +905,19 @@ void obs_module_post_load(void)
      */
     unsigned int api_version = obs_websocket_get_api_version();
     if (api_version == 0) {
-        blog(LOG_WARNING, "[crowdcast] obs-websocket not available (API version 0)");
+        blog(LOG_WARNING, "[crowd-cast] obs-websocket not available (API version 0)");
         return;
     }
     
-    blog(LOG_INFO, "[crowdcast] obs-websocket API version: %u", api_version);
+    blog(LOG_INFO, "[crowd-cast] obs-websocket API version: %u", api_version);
     
-    g_vendor = obs_websocket_register_vendor("crowdcast");
+    g_vendor = obs_websocket_register_vendor("crowd-cast");
     if (!g_vendor) {
-        blog(LOG_WARNING, "[crowdcast] Failed to register vendor");
+        blog(LOG_WARNING, "[crowd-cast] Failed to register vendor");
         return;
     }
     
-    blog(LOG_INFO, "[crowdcast] Registered vendor 'crowdcast'");
+    blog(LOG_INFO, "[crowd-cast] Registered vendor 'crowd-cast'");
     
     /* Register our vendor requests */
     bool ok1 = obs_websocket_vendor_register_request(g_vendor, "GetHookedSources", 
@@ -930,10 +930,10 @@ void obs_module_post_load(void)
                                                      set_capture_enabled_cb, NULL);
     
     if (ok1 && ok2 && ok3 && ok4) {
-        blog(LOG_INFO, "[crowdcast] Registered all vendor requests: "
+        blog(LOG_INFO, "[crowd-cast] Registered all vendor requests: "
                        "GetHookedSources, GetAvailableWindows, CreateCaptureSources, SetCaptureEnabled");
     } else {
-        blog(LOG_WARNING, "[crowdcast] Some vendor requests failed to register: "
+        blog(LOG_WARNING, "[crowd-cast] Some vendor requests failed to register: "
                           "GetHookedSources=%d, GetAvailableWindows=%d, CreateCaptureSources=%d, SetCaptureEnabled=%d",
                           ok1, ok2, ok3, ok4);
     }
@@ -941,14 +941,14 @@ void obs_module_post_load(void)
     /* Start the capture state polling thread */
     g_poll_running = true;
     if (pthread_create(&g_poll_thread, NULL, poll_thread_func, NULL) != 0) {
-        blog(LOG_WARNING, "[crowdcast] Failed to create polling thread");
+        blog(LOG_WARNING, "[crowd-cast] Failed to create polling thread");
         g_poll_running = false;
     }
 }
 
 void obs_module_unload(void)
 {
-    blog(LOG_INFO, "[crowdcast] Plugin unloading...");
+    blog(LOG_INFO, "[crowd-cast] Plugin unloading...");
     
     /* Stop the capture state polling thread first */
     if (g_poll_running) {
@@ -969,5 +969,5 @@ void obs_module_unload(void)
     g_source_count = 0;
     pthread_mutex_unlock(&g_state_mutex);
     
-    blog(LOG_INFO, "[crowdcast] Plugin unloaded");
+    blog(LOG_INFO, "[crowd-cast] Plugin unloaded");
 }

@@ -8,11 +8,11 @@ use tracing::{info, warn};
 
 use super::obs_detector::OBSInstallation;
 
-/// CrowdCast profile name
-const PROFILE_NAME: &str = "CrowdCast";
+/// crowd-cast profile name
+const PROFILE_NAME: &str = "crowd-cast";
 
-/// CrowdCast scene collection name  
-const SCENE_COLLECTION_NAME: &str = "CrowdCast Capture";
+/// crowd-cast scene collection name  
+const SCENE_COLLECTION_NAME: &str = "crowd-cast Capture";
 
 /// Hardware encoder types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +179,7 @@ fn has_vaapi() -> bool {
         || std::path::Path::new("/dev/dri/renderD128").exists()
 }
 
-/// Create the CrowdCast profile in OBS
+/// Create the crowd-cast profile in OBS
 pub fn create_profile(obs: &OBSInstallation, encoder: HardwareEncoder) -> Result<PathBuf> {
     let profile_dir = obs.data_dir.join("basic").join("profiles").join(PROFILE_NAME);
     
@@ -349,7 +349,7 @@ fn generate_encoder_json(encoder: HardwareEncoder) -> String {
     }
 }
 
-/// Create a basic scene collection for CrowdCast
+/// Create a basic scene collection for crowd-cast
 pub fn create_scene_collection(obs: &OBSInstallation) -> Result<PathBuf> {
     let scenes_dir = obs.data_dir.join("basic").join("scenes");
     fs::create_dir_all(&scenes_dir)?;
@@ -367,11 +367,11 @@ pub fn create_scene_collection(obs: &OBSInstallation) -> Result<PathBuf> {
 /// Generate a basic scene collection JSON
 fn generate_scene_collection() -> String {
     r#"{
-    "current_program_scene": "CrowdCast Capture",
-    "current_scene": "CrowdCast Capture",
-    "name": "CrowdCast Capture",
+    "current_program_scene": "crowd-cast Capture",
+    "current_scene": "crowd-cast Capture",
+    "name": "crowd-cast Capture",
     "scene_order": [
-        {"name": "CrowdCast Capture"}
+        {"name": "crowd-cast Capture"}
     ],
     "sources": [],
     "transitions": [],
@@ -382,7 +382,7 @@ fn generate_scene_collection() -> String {
 }"#.to_string()
 }
 
-/// Check if the CrowdCast profile exists
+/// Check if the crowd-cast profile exists
 pub fn profile_exists(obs: &OBSInstallation) -> bool {
     obs.data_dir
         .join("basic")
