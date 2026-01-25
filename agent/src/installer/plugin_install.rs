@@ -455,6 +455,7 @@ fn install_plugin_data(obs: &OBSInstallation) -> Result<()> {
 }
 
 /// Get the path for plugin data files
+#[cfg(not(target_os = "macos"))]
 fn get_plugin_data_path(obs: &OBSInstallation) -> PathBuf {
     #[cfg(target_os = "windows")]
     {

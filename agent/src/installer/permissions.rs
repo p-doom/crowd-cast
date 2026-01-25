@@ -3,7 +3,7 @@
 #[allow(unused_imports)]
 use anyhow::{Context, Result};
 use std::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Permission status for all required permissions
 #[derive(Debug, Clone)]
@@ -126,16 +126,16 @@ fn check_screen_recording_macos() -> PermissionState {
 fn request_permissions_macos() -> Result<PermissionStatus> {
     use std::ffi::c_void;
     
-    // Opaque type for CFDictionary callbacks
-    #[repr(C)]
-    struct CFDictionaryCallBacks {
-        _data: [u8; 0],
-        _marker: std::marker::PhantomData<(*mut u8, std::marker::PhantomPinned)>,
-    }
+    // CoreFoundation types
+    type CFAllocatorRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFBooleanRef = *const c_void;
+    type CFIndex = isize;
     
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
-        fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+        fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
     }
     
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -145,52 +145,72 @@ fn request_permissions_macos() -> Result<PermissionStatus> {
     
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
+        static kCFAllocatorDefault: CFAllocatorRef;
+        static kCFBooleanTrue: CFBooleanRef;
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+        
+        fn CFStringCreateWithCString(
+            alloc: CFAllocatorRef,
+            c_str: *const i8,
+            encoding: u32,
+        ) -> CFStringRef;
+        
         fn CFDictionaryCreate(
-            allocator: *const c_void,
+            allocator: CFAllocatorRef,
             keys: *const *const c_void,
             values: *const *const c_void,
-            num_values: isize,
-            key_callbacks: *const CFDictionaryCallBacks,
-            value_callbacks: *const CFDictionaryCallBacks,
-        ) -> *const c_void;
+            num_values: CFIndex,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CFDictionaryRef;
+        
         fn CFRelease(cf: *const c_void);
-        static kCFBooleanTrue: *const c_void;
-        static kAXTrustedCheckOptionPrompt: *const c_void;
-        static kCFTypeDictionaryKeyCallBacks: CFDictionaryCallBacks;
-        static kCFTypeDictionaryValueCallBacks: CFDictionaryCallBacks;
     }
+    
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
     
     // Request accessibility permission with prompt
     info!("Requesting Accessibility permission...");
     let accessibility = unsafe {
-        let key = kAXTrustedCheckOptionPrompt;
-        let value = kCFBooleanTrue;
-        let dict = CFDictionaryCreate(
-            std::ptr::null(),
-            &key as *const *const c_void,
-            &value as *const *const c_void,
-            1,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks,
-        );
+        // Create the key string "AXTrustedCheckOptionPrompt"
+        let key_cstr = b"AXTrustedCheckOptionPrompt\0".as_ptr() as *const i8;
+        let key = CFStringCreateWithCString(kCFAllocatorDefault, key_cstr, K_CF_STRING_ENCODING_UTF8);
         
-        let trusted = if !dict.is_null() {
-            let result = AXIsProcessTrustedWithOptions(dict);
-            CFRelease(dict);
-            result
-        } else {
-            // Fallback: try without options (won't prompt but will check status)
-            AXIsProcessTrustedWithOptions(std::ptr::null())
-        };
-        
-        if trusted {
-            PermissionState::Granted
-        } else {
-            // On macOS, accessibility permission requires manual intervention
-            // Open System Settings to the Accessibility pane
-            info!("Opening Accessibility settings for manual permission grant...");
-            let _ = open_accessibility_settings();
+        if key.is_null() {
+            warn!("Failed to create CFString for AXTrustedCheckOptionPrompt");
             PermissionState::Denied
+        } else {
+            let keys: [*const c_void; 1] = [key];
+            let values: [*const c_void; 1] = [kCFBooleanTrue];
+            
+            let dict = CFDictionaryCreate(
+                kCFAllocatorDefault,
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+            );
+            
+            let trusted = if !dict.is_null() {
+                let result = AXIsProcessTrustedWithOptions(dict);
+                CFRelease(dict);
+                result
+            } else {
+                warn!("Failed to create options dictionary");
+                false
+            };
+            
+            CFRelease(key);
+            
+            if trusted {
+                PermissionState::Granted
+            } else {
+                // Open System Preferences to the Accessibility pane
+                let _ = open_accessibility_settings();
+                PermissionState::Denied
+            }
         }
     };
     

@@ -45,10 +45,32 @@ else()
         "  macOS/Windows: Set OBS_SOURCE_DIR to OBS source tree")
 endif()
 
-# Plugin source files
-add_library(${PROJECT_NAME} MODULE
-    src/plugin.c
-)
+# Plugin source files (common)
+set(PLUGIN_SOURCES src/plugin.c)
+
+# Platform-specific sources
+if(APPLE)
+    list(APPEND PLUGIN_SOURCES src/platform_macos.m)
+    # Enable ARC for Objective-C
+    set_source_files_properties(src/platform_macos.m PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+elseif(WIN32)
+    list(APPEND PLUGIN_SOURCES src/platform_windows.c)
+else()
+    # Linux
+    list(APPEND PLUGIN_SOURCES src/platform_linux.c)
+    
+    # Try to find X11 for active window detection
+    find_package(X11 QUIET)
+    if(X11_FOUND)
+        message(STATUS "X11 found - enabling frontmost app detection for X11")
+    else()
+        message(STATUS "X11 not found - frontmost app detection disabled (Wayland fallback only)")
+    endif()
+endif()
+
+add_library(${PROJECT_NAME} MODULE ${PLUGIN_SOURCES})
 
 # Include directories
 if(USE_SYSTEM_LIBOBS)
@@ -66,7 +88,7 @@ else()
     )
 endif()
 
-# Linking
+# Linking - libobs
 if(USE_SYSTEM_LIBOBS)
     target_link_libraries(${PROJECT_NAME} OBS::libobs)
 elseif(APPLE)
@@ -90,6 +112,22 @@ elseif(WIN32)
         else()
             message(WARNING "Could not find obs library in OBS_INSTALLED_DIR")
         endif()
+    endif()
+endif()
+
+# Platform-specific linking
+if(APPLE)
+    # macOS: Link AppKit framework for NSWorkspace
+    target_link_libraries(${PROJECT_NAME} "-framework AppKit")
+elseif(WIN32)
+    # Windows: Link user32 for GetForegroundWindow, psapi for process info
+    target_link_libraries(${PROJECT_NAME} user32 psapi)
+else()
+    # Linux: Link X11 if found
+    if(X11_FOUND)
+        target_include_directories(${PROJECT_NAME} PRIVATE ${X11_INCLUDE_DIR})
+        target_link_libraries(${PROJECT_NAME} ${X11_LIBRARIES})
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_X11)
     endif()
 endif()
 

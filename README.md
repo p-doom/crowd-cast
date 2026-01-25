@@ -221,6 +221,20 @@ Input logs are stored in MessagePack format with the following structure:
 }
 ```
 
+## Utilities
+
+Overlay keylogs on top of a screen capture:
+
+```bash
+python scripts/overlay_keylogs.py --video capture.mp4 --input input.msgpack --output capture_with_keys.mp4
+```
+
+To just generate subtitles (ASS):
+
+```bash
+python scripts/overlay_keylogs.py --input input.msgpack --ass-out keylogs.ass
+```
+
 ## Backend Setup
 
 The agent expects a Lambda endpoint that returns pre-signed S3 URLs. Example Lambda handler:

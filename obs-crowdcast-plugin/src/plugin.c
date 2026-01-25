@@ -22,11 +22,16 @@
 #include <obs-frontend-api.h>
 #include <util/dstr.h>
 #include <util/threading.h>
+#include <util/platform.h>
 #include <ctype.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Official obs-websocket vendor API header (uses proc_handler, not dlsym) */
 #include "obs-websocket-api/obs-websocket-api.h"
+
+/* Platform-specific frontmost app detection */
+#include "platform.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-crowdcast", "en-US")
@@ -44,8 +49,9 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 typedef struct source_state {
     char name[256];
-    bool hooked;
-    bool active;
+    char target_app[512];  /* Target app ID (bundle ID, exe name, or WM_CLASS) */
+    bool hooked;           /* True if frontmost app matches this source's target */
+    bool active;           /* True if source is being rendered to output */
     bool in_use;
 } source_state_t;
 
@@ -53,6 +59,39 @@ static source_state_t g_sources[MAX_TRACKED_SOURCES];
 static size_t g_source_count = 0;
 static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static obs_websocket_vendor g_vendor = NULL;
+
+/* Polling thread state */
+static pthread_t g_poll_thread;
+static volatile bool g_poll_running = false;
+
+/* Manual capture override for Wayland (where we can't detect frontmost app) */
+static volatile bool g_manual_capture_enabled = true;
+static volatile bool g_using_manual_mode = false;
+
+static bool compute_any_hooked_locked(void)
+{
+    for (size_t i = 0; i < g_source_count; i++) {
+        if (!g_sources[i].in_use)
+            continue;
+        if (g_sources[i].hooked && g_sources[i].active)
+            return true;
+    }
+    return false;
+}
+
+static void emit_hooked_sources_event(const char *name, bool hooked, bool active, bool any_hooked)
+{
+    if (!g_vendor || !name)
+        return;
+
+    obs_data_t *event_data = obs_data_create();
+    obs_data_set_string(event_data, "name", name);
+    obs_data_set_bool(event_data, "hooked", hooked);
+    obs_data_set_bool(event_data, "active", active);
+    obs_data_set_bool(event_data, "any_hooked", any_hooked);
+    obs_websocket_vendor_emit_event(g_vendor, "HookedSourcesChanged", event_data);
+    obs_data_release(event_data);
+}
 
 /* Find or create a source state entry */
 static source_state_t *find_or_create_source(const char *name)
@@ -102,45 +141,8 @@ static void remove_source(const char *name)
 /* Signal Handlers                                                             */
 /* ========================================================================== */
 
-static void on_source_hooked(void *data, calldata_t *cd)
-{
-    UNUSED_PARAMETER(data);
-    obs_source_t *source = calldata_ptr(cd, "source");
-    if (!source)
-        return;
-    
-    const char *name = obs_source_get_name(source);
-    if (!name)
-        return;
-    
-    pthread_mutex_lock(&g_state_mutex);
-    source_state_t *state = find_source(name);
-    if (state) {
-        state->hooked = true;
-        blog(LOG_DEBUG, "[crowdcast] Source '%s' hooked", name);
-    }
-    pthread_mutex_unlock(&g_state_mutex);
-}
-
-static void on_source_unhooked(void *data, calldata_t *cd)
-{
-    UNUSED_PARAMETER(data);
-    obs_source_t *source = calldata_ptr(cd, "source");
-    if (!source)
-        return;
-    
-    const char *name = obs_source_get_name(source);
-    if (!name)
-        return;
-    
-    pthread_mutex_lock(&g_state_mutex);
-    source_state_t *state = find_source(name);
-    if (state) {
-        state->hooked = false;
-        blog(LOG_DEBUG, "[crowdcast] Source '%s' unhooked", name);
-    }
-    pthread_mutex_unlock(&g_state_mutex);
-}
+/* Note: on_source_hooked/on_source_unhooked removed - these are Windows-specific
+ * signals that don't fire on macOS. We now use frontmost app detection instead. */
 
 static void on_source_activate(void *data, calldata_t *cd)
 {
@@ -152,13 +154,14 @@ static void on_source_activate(void *data, calldata_t *cd)
     const char *name = obs_source_get_name(source);
     if (!name)
         return;
-    
+
     pthread_mutex_lock(&g_state_mutex);
     source_state_t *state = find_source(name);
     if (state) {
         state->active = true;
     }
     pthread_mutex_unlock(&g_state_mutex);
+    /* Polling thread will emit event on next iteration if any_hooked changed */
 }
 
 static void on_source_deactivate(void *data, calldata_t *cd)
@@ -171,13 +174,14 @@ static void on_source_deactivate(void *data, calldata_t *cd)
     const char *name = obs_source_get_name(source);
     if (!name)
         return;
-    
+
     pthread_mutex_lock(&g_state_mutex);
     source_state_t *state = find_source(name);
     if (state) {
         state->active = false;
     }
     pthread_mutex_unlock(&g_state_mutex);
+    /* Polling thread will emit event on next iteration if any_hooked changed */
 }
 
 /* ========================================================================== */
@@ -190,12 +194,61 @@ static bool is_window_capture_source(obs_source_t *source)
     if (!id)
         return false;
     
-    /* Check for various window capture source types across platforms */
+    /* Check for various window/screen capture source types across platforms */
     return strcmp(id, "window_capture") == 0 ||           /* Windows */
            strcmp(id, "xcomposite_input") == 0 ||         /* Linux X11 */
            strcmp(id, "pipewire-screen-capture-source") == 0 || /* Linux PipeWire */
-           strcmp(id, "coreaudio_input_capture") == 0 ||  /* macOS */
+           strcmp(id, "screen_capture") == 0 ||           /* macOS ScreenCaptureKit */
            strstr(id, "window") != NULL;                  /* Fallback */
+}
+
+/* Get the target application identifier from a source's settings.
+ * Returns the property name that contains the target app/window ID. */
+static const char *get_target_app_property(obs_source_t *source)
+{
+    const char *id = obs_source_get_id(source);
+    if (!id) return NULL;
+    
+#ifdef __APPLE__
+    if (strcmp(id, "screen_capture") == 0) {
+        return "application";  /* Bundle ID */
+    }
+#elif defined(_WIN32)
+    if (strcmp(id, "window_capture") == 0) {
+        return "window";  /* Window title/class */
+    }
+#else
+    /* Linux */
+    if (strcmp(id, "xcomposite_input") == 0) {
+        return "capture_window";
+    }
+    if (strcmp(id, "pipewire-screen-capture-source") == 0) {
+        return "window";
+    }
+#endif
+    return "window";  /* Fallback */
+}
+
+/* Extract the target app ID from a source and store it in the state */
+static void update_source_target_app(source_state_t *state, obs_source_t *source)
+{
+    if (!state || !source) return;
+    
+    state->target_app[0] = '\0';
+    
+    const char *prop = get_target_app_property(source);
+    if (!prop) return;
+    
+    obs_data_t *settings = obs_source_get_settings(source);
+    if (!settings) return;
+    
+    const char *target = obs_data_get_string(settings, prop);
+    if (target && strlen(target) > 0) {
+        strncpy(state->target_app, target, sizeof(state->target_app) - 1);
+        state->target_app[sizeof(state->target_app) - 1] = '\0';
+    }
+    
+    obs_data_release(settings);
 }
 
 static void register_source_signals(obs_source_t *source)
@@ -211,22 +264,19 @@ static void register_source_signals(obs_source_t *source)
     source_state_t *state = find_or_create_source(name);
     if (state) {
         state->active = obs_source_active(source);
-        /* Initial hooked state - assume hooked if source exists and is configured */
         state->hooked = false;
+        update_source_target_app(state, source);
+        blog(LOG_INFO, "[crowdcast] Registered source '%s' with target app '%s'", 
+             name, state->target_app);
     }
     pthread_mutex_unlock(&g_state_mutex);
     
     signal_handler_t *sh = obs_source_get_signal_handler(source);
     if (sh) {
-        /* Note: "hooked" and "unhooked" signals are specific to window capture on Windows.
-         * On other platforms, we may need to use different detection methods.
-         * For now, we register for these signals and also track activate/deactivate. */
-        signal_handler_connect(sh, "hooked", on_source_hooked, NULL);
-        signal_handler_connect(sh, "unhooked", on_source_unhooked, NULL);
+        /* Only register activate/deactivate - hooked/unhooked are Windows-specific
+         * and we now use frontmost app detection instead */
         signal_handler_connect(sh, "activate", on_source_activate, NULL);
         signal_handler_connect(sh, "deactivate", on_source_deactivate, NULL);
-        
-        blog(LOG_INFO, "[crowdcast] Registered signals for source '%s'", name);
     }
 }
 
@@ -238,8 +288,6 @@ static void unregister_source_signals(obs_source_t *source)
     
     signal_handler_t *sh = obs_source_get_signal_handler(source);
     if (sh) {
-        signal_handler_disconnect(sh, "hooked", on_source_hooked, NULL);
-        signal_handler_disconnect(sh, "unhooked", on_source_unhooked, NULL);
         signal_handler_disconnect(sh, "activate", on_source_activate, NULL);
         signal_handler_disconnect(sh, "deactivate", on_source_deactivate, NULL);
     }
@@ -399,8 +447,11 @@ static void get_hooked_sources_cb(obs_data_t *request_data, obs_data_t *response
         if (!g_sources[i].in_use)
             continue;
         
+        /* Use the hooked state maintained by the polling thread
+         * (based on frontmost app matching) */
         obs_data_t *source_obj = obs_data_create();
         obs_data_set_string(source_obj, "name", g_sources[i].name);
+        obs_data_set_string(source_obj, "target_app", g_sources[i].target_app);
         obs_data_set_bool(source_obj, "hooked", g_sources[i].hooked);
         obs_data_set_bool(source_obj, "active", g_sources[i].active);
         obs_data_array_push_back(sources_array, source_obj);
@@ -415,6 +466,7 @@ static void get_hooked_sources_cb(obs_data_t *request_data, obs_data_t *response
     
     obs_data_set_array(response_data, "sources", sources_array);
     obs_data_set_bool(response_data, "any_hooked", any_hooked);
+    obs_data_set_bool(response_data, "manual_mode", g_using_manual_mode);
     obs_data_array_release(sources_array);
 }
 
@@ -705,6 +757,112 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
 }
 
 /* ========================================================================== */
+/* Capture State Polling Thread                                                */
+/* ========================================================================== */
+
+static void *poll_thread_func(void *param)
+{
+    UNUSED_PARAMETER(param);
+    
+    /* Check if we're on Wayland (Linux only) - if so, use manual mode */
+    if (platform_is_wayland()) {
+        g_using_manual_mode = true;
+        blog(LOG_INFO, "[crowdcast] Wayland detected - using manual capture mode");
+    }
+    
+    blog(LOG_INFO, "[crowdcast] Capture state polling thread started (200ms interval)");
+    
+    while (g_poll_running) {
+        bool old_any_hooked, new_any_hooked;
+        
+        pthread_mutex_lock(&g_state_mutex);
+        old_any_hooked = compute_any_hooked_locked();
+        
+        if (g_using_manual_mode) {
+            /* Wayland fallback: use manual override flag */
+            for (size_t i = 0; i < g_source_count; i++) {
+                if (!g_sources[i].in_use)
+                    continue;
+                /* In manual mode, hooked follows the manual override */
+                g_sources[i].hooked = g_manual_capture_enabled;
+            }
+        } else {
+            /* Normal mode: check if frontmost app matches any tracked source */
+            char *frontmost = platform_get_frontmost_app_id();
+            
+            for (size_t i = 0; i < g_source_count; i++) {
+                if (!g_sources[i].in_use)
+                    continue;
+                
+                if (frontmost && g_sources[i].target_app[0] != '\0') {
+                    g_sources[i].hooked = platform_app_ids_match(frontmost, g_sources[i].target_app);
+                } else {
+                    g_sources[i].hooked = false;
+                }
+            }
+            
+            if (frontmost) {
+                free(frontmost);
+            }
+        }
+        
+        new_any_hooked = compute_any_hooked_locked();
+        pthread_mutex_unlock(&g_state_mutex);
+        
+        /* Emit event only if state changed */
+        if (new_any_hooked != old_any_hooked) {
+            blog(LOG_INFO, "[crowdcast] Capture state changed: any_hooked=%d", new_any_hooked);
+            emit_hooked_sources_event("_poll", false, false, new_any_hooked);
+        }
+        
+        /* Sleep 200ms using OBS portable helper */
+        os_sleep_ms(200);
+    }
+    
+    blog(LOG_INFO, "[crowdcast] Capture state polling thread stopped");
+    return NULL;
+}
+
+/* ========================================================================== */
+/* SetCaptureEnabled Vendor Request (Wayland Manual Toggle)                    */
+/* ========================================================================== */
+
+static void set_capture_enabled_cb(obs_data_t *request_data, obs_data_t *response_data,
+                                    void *priv_data)
+{
+    UNUSED_PARAMETER(priv_data);
+    
+    bool enabled = obs_data_get_bool(request_data, "enabled");
+    
+    g_manual_capture_enabled = enabled;
+    
+    /* If we're in manual mode, trigger an immediate update */
+    if (g_using_manual_mode) {
+        bool any_hooked = false;
+        
+        pthread_mutex_lock(&g_state_mutex);
+        for (size_t i = 0; i < g_source_count; i++) {
+            if (!g_sources[i].in_use)
+                continue;
+            g_sources[i].hooked = enabled;
+            if (enabled && g_sources[i].active) {
+                any_hooked = true;
+            }
+        }
+        pthread_mutex_unlock(&g_state_mutex);
+        
+        emit_hooked_sources_event("_manual", enabled, true, any_hooked);
+    }
+    
+    obs_data_set_bool(response_data, "success", true);
+    obs_data_set_bool(response_data, "enabled", enabled);
+    obs_data_set_bool(response_data, "manual_mode", g_using_manual_mode);
+    
+    blog(LOG_INFO, "[crowdcast] SetCaptureEnabled: enabled=%d (manual_mode=%d)", 
+         enabled, g_using_manual_mode);
+}
+
+/* ========================================================================== */
 /* Module Load/Unload                                                          */
 /* ========================================================================== */
 
@@ -768,20 +926,35 @@ void obs_module_post_load(void)
                                                      get_available_windows_cb, NULL);
     bool ok3 = obs_websocket_vendor_register_request(g_vendor, "CreateCaptureSources",
                                                      create_capture_sources_cb, NULL);
+    bool ok4 = obs_websocket_vendor_register_request(g_vendor, "SetCaptureEnabled",
+                                                     set_capture_enabled_cb, NULL);
     
-    if (ok1 && ok2 && ok3) {
+    if (ok1 && ok2 && ok3 && ok4) {
         blog(LOG_INFO, "[crowdcast] Registered all vendor requests: "
-                       "GetHookedSources, GetAvailableWindows, CreateCaptureSources");
+                       "GetHookedSources, GetAvailableWindows, CreateCaptureSources, SetCaptureEnabled");
     } else {
         blog(LOG_WARNING, "[crowdcast] Some vendor requests failed to register: "
-                          "GetHookedSources=%d, GetAvailableWindows=%d, CreateCaptureSources=%d",
-                          ok1, ok2, ok3);
+                          "GetHookedSources=%d, GetAvailableWindows=%d, CreateCaptureSources=%d, SetCaptureEnabled=%d",
+                          ok1, ok2, ok3, ok4);
+    }
+    
+    /* Start the capture state polling thread */
+    g_poll_running = true;
+    if (pthread_create(&g_poll_thread, NULL, poll_thread_func, NULL) != 0) {
+        blog(LOG_WARNING, "[crowdcast] Failed to create polling thread");
+        g_poll_running = false;
     }
 }
 
 void obs_module_unload(void)
 {
     blog(LOG_INFO, "[crowdcast] Plugin unloading...");
+    
+    /* Stop the capture state polling thread first */
+    if (g_poll_running) {
+        g_poll_running = false;
+        pthread_join(g_poll_thread, NULL);
+    }
     
     /* Disconnect global signals */
     signal_handler_t *sh = obs_get_signal_handler();

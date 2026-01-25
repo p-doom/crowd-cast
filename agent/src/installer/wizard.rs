@@ -4,14 +4,16 @@
 //! 1. Detect/Install OBS
 //! 2. Install Plugin
 //! 3. Create Profile
-//! 4. Launch OBS (so plugin loads)
-//! 5. Select Applications (requires OBS running)
-//! 6. Request Permissions
-//! 7. Setup Autostart
+//! 4. Configure OBS WebSocket
+//! 5. Launch OBS (so plugin loads)
+//! 6. Select Applications (requires OBS running)
+//! 7. Request Permissions
+//! 8. Setup Autostart
 
 use anyhow::Result;
 use obws::Client;
 use std::io::{self, Write};
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -101,7 +103,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
     println!();
 
     // Step 1: Check for OBS
-    println!("Step 1/7: Checking for OBS Studio...");
+    println!("Step 1/8: Checking for OBS Studio...");
     let obs = match detect_obs() {
         Some(obs) => {
             println!("  [✓] OBS Studio found at {:?}", obs.executable);
@@ -133,7 +135,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
 
     // Step 2: Install plugin
     println!();
-    println!("Step 2/7: Installing CrowdCast plugin...");
+    println!("Step 2/8: Installing CrowdCast plugin...");
     
     let plugin_status = check_plugin_installed(&obs);
     let mut plugin_installed_now = false;
@@ -158,7 +160,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
 
     // Step 3: Create/configure profile
     println!();
-    println!("Step 3/7: Configuring OBS profile...");
+    println!("Step 3/8: Configuring OBS profile...");
     
     if profile_exists(&obs) && !config.force_profile_recreate {
         println!("  [✓] CrowdCast profile already exists");
@@ -190,12 +192,37 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
         }
     }
 
-    // Step 4: Launch OBS
+    // Step 4: Configure OBS WebSocket
     println!();
-    println!("Step 4/7: Launching OBS Studio...");
+    println!("Step 4/8: Configuring OBS WebSocket...");
     
     let mut obs_manager: Option<OBSManager> = None;
     let obs_was_running = is_obs_running();
+    let mut needs_obs_restart = false;
+    let mut restart_reasons = Vec::new();
+    
+    let mut agent_config = Config::load().unwrap_or_default();
+    match super::obs_websocket::ensure_obs_websocket_config(&obs, &mut agent_config) {
+        Ok(config_result) => {
+            if config_result.updated {
+                println!("  [✓] WebSocket server enabled with authentication");
+                if obs_was_running {
+                    needs_obs_restart = true;
+                    restart_reasons.push("WebSocket settings updated".to_string());
+                }
+            } else {
+                println!("  [✓] WebSocket configuration already set");
+            }
+        }
+        Err(e) => {
+            println!("  [✗] Failed to configure OBS WebSocket: {}", e);
+            result.notes.push(format!("WebSocket config failed: {}", e));
+        }
+    }
+
+    // Step 5: Launch OBS
+    println!();
+    println!("Step 5/8: Launching OBS Studio...");
     
     // Helper function to launch OBS (returns error message if failed)
     fn try_launch_obs() -> Result<OBSManager, String> {
@@ -217,22 +244,38 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
         Ok(manager)
     }
     
+    if plugin_installed_now && obs_was_running {
+        needs_obs_restart = true;
+        restart_reasons.push("CrowdCast plugin installed".to_string());
+    }
+    
     if obs_was_running {
         println!("  [✓] OBS is already running");
-        if plugin_installed_now {
-            println!("  [!] Plugin was installed while OBS is running");
-            println!("      Please restart OBS so the plugin can load.");
-            result.notes.push("OBS restart needed to load plugin".to_string());
+        if needs_obs_restart {
+            println!("  [!] OBS restart required: {}", restart_reasons.join(", "));
+            result.notes
+                .push(format!("OBS restart required: {}", restart_reasons.join(", ")));
             if !config.non_interactive {
-                println!("      Press Enter after restarting OBS to continue...");
-                wait_for_enter()?;
-                if !is_obs_running() {
-                    match try_launch_obs() {
-                        Ok(manager) => obs_manager = Some(manager),
-                        Err(e) => {
-                            println!("  [✗] {}", e);
-                            result.notes.push(e);
-                        }
+                println!("      Attempting to close OBS...");
+                if let Some(ref mut manager) = obs_manager {
+                    if let Err(e) = manager.stop() {
+                        println!("      [!] Failed to stop OBS we launched: {}", e);
+                    }
+                } else if let Err(e) = request_obs_close() {
+                    println!("      [!] Could not close OBS automatically: {}", e);
+                    println!("      Please close OBS manually to continue...");
+                }
+
+                if let Err(e) = wait_for_obs_close(config.websocket_timeout).await {
+                    println!("  [✗] {}", e);
+                    result.notes.push(e.to_string());
+                }
+
+                match try_launch_obs() {
+                    Ok(manager) => obs_manager = Some(manager),
+                    Err(e) => {
+                        println!("  [✗] {}", e);
+                        result.notes.push(e);
                     }
                 }
             }
@@ -250,7 +293,6 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
     // Wait for WebSocket connection
     println!("  Waiting for OBS WebSocket...");
     
-    let agent_config = Config::load().unwrap_or_default();
     let client = match wait_for_obs_websocket(&agent_config, config.websocket_timeout).await {
         Ok(client) => {
             println!("  [✓] Connected to OBS WebSocket");
@@ -266,7 +308,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
 
     // Step 5: Select applications
     println!();
-    println!("Step 5/7: Selecting applications to capture...");
+    println!("Step 6/8: Selecting applications to capture...");
     
     if config.skip_app_selection {
         println!("  [!] Skipping application selection");
@@ -412,7 +454,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
 
     // Step 6: Request permissions
     println!();
-    println!("Step 6/7: Checking permissions...");
+    println!("Step 7/8: Checking permissions...");
     
     if config.skip_permissions {
         println!("  [!] Skipping permission checks");
@@ -477,23 +519,32 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
         if perm_status.accessibility == PermissionState::Denied 
             || perm_status.screen_recording == PermissionState::Denied 
         {
-            if !config.non_interactive {
-                println!();
-                println!("  Permission dialogs may appear. Please click 'Allow' when prompted.");
-                println!("  Press Enter to continue...");
-                wait_for_enter()?;
-            }
-            
+            // First, trigger the permission dialogs
             match request_permissions() {
-                Ok(new_status) => {
-                    result.permissions_granted = new_status.accessibility.is_granted()
-                        && new_status.screen_recording.is_granted()
-                        && new_status.input_group.is_granted();
+                Ok(_) => {
+                    // Dialogs have been triggered, now wait for user to grant them
+                    if !config.non_interactive {
+                        println!();
+                        println!("  Please grant the permissions in System Settings, then press Enter...");
+                        wait_for_enter()?;
+                    }
+                    
+                    // Re-check permissions after user has had time to grant them
+                    let final_status = check_permissions();
+                    result.permissions_granted = final_status.accessibility.is_granted()
+                        && final_status.screen_recording.is_granted()
+                        && final_status.input_group.is_granted();
                     
                     if result.permissions_granted {
                         println!("  [✓] All permissions granted");
                     } else {
                         println!("  [!] Some permissions not granted - you may need to grant them manually");
+                        if !final_status.accessibility.is_granted() {
+                            result.notes.push("Accessibility permission not granted".to_string());
+                        }
+                        if !final_status.screen_recording.is_granted() {
+                            result.notes.push("Screen Recording permission not granted".to_string());
+                        }
                     }
                 }
                 Err(e) => {
@@ -510,7 +561,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
 
     // Step 7: Setup autostart
     println!();
-    println!("Step 7/7: Setting up autostart...");
+    println!("Step 8/8: Setting up autostart...");
     
     if config.skip_autostart {
         println!("  [!] Skipping autostart setup");
@@ -645,6 +696,66 @@ async fn wait_for_obs_restart(timeout: Duration) -> Result<()> {
         print!(".");
         io::stdout().flush().ok();
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_for_obs_close(timeout: Duration) -> Result<()> {
+    if !is_obs_running() {
+        return Ok(());
+    }
+
+    let start = Instant::now();
+    println!("      Waiting for OBS to close...");
+    loop {
+        if !is_obs_running() {
+            println!();
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            println!();
+            return Err(anyhow::anyhow!("Timeout waiting for OBS to close"));
+        }
+        print!(".");
+        io::stdout().flush().ok();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn request_obs_close() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("osascript")
+            .args(["-e", "tell application \"OBS\" to quit"])
+            .status()
+            .map_err(|e| format!("Failed to run osascript: {}", e))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err("osascript returned a non-zero status".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = Command::new("taskkill")
+            .args(["/IM", "obs64.exe", "/T"])
+            .status()
+            .map_err(|e| format!("Failed to run taskkill: {}", e))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err("taskkill returned a non-zero status".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = Command::new("pkill")
+            .args(["-x", "obs"])
+            .status()
+            .map_err(|e| format!("Failed to run pkill: {}", e))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err("pkill returned a non-zero status".to_string());
     }
 }
 

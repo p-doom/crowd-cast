@@ -26,7 +26,8 @@ use tracing::{debug, error, info, warn};
 pub struct EvdevBackend {
     devices: Vec<Device>,
     capturing: Arc<AtomicBool>,
-    thread_handles: Vec<thread::JoinHandle<()>>,
+    /// The instant when the backend was started, used for timestamp calculation
+    start_time: Option<Instant>,
 }
 
 #[cfg(target_os = "linux")]
@@ -70,7 +71,7 @@ impl EvdevBackend {
         Ok(Self {
             devices,
             capturing: Arc::new(AtomicBool::new(false)),
-            thread_handles: Vec::new(),
+            start_time: None,
         })
     }
 }
@@ -84,6 +85,7 @@ impl InputBackend for EvdevBackend {
         
         self.capturing.store(true, Ordering::SeqCst);
         let start_time = Instant::now();
+        self.start_time = Some(start_time);
         
         // Take ownership of devices for the threads
         let devices = std::mem::take(&mut self.devices);
@@ -96,9 +98,6 @@ impl InputBackend for EvdevBackend {
             let handle = thread::spawn(move || {
                 let device_name = device.name().unwrap_or("Unknown").to_string();
                 info!("Started evdev capture for: {}", device_name);
-                
-                let mut mouse_x = 0.0f64;
-                let mut mouse_y = 0.0f64;
                 
                 loop {
                     if !capturing.load(Ordering::SeqCst) {
@@ -129,34 +128,33 @@ impl InputBackend for EvdevBackend {
                                     InputEventKind::RelAxis(axis) => {
                                         use evdev::RelativeAxisType;
                                         match axis {
+                                            // Emit raw delta values directly (true relative motion)
                                             RelativeAxisType::REL_X => {
-                                                mouse_x += ev.value() as f64;
                                                 Some(EventType::MouseMove(MouseMoveEvent {
-                                                    x: mouse_x,
-                                                    y: mouse_y,
+                                                    delta_x: ev.value() as f64,
+                                                    delta_y: 0.0,
                                                 }))
                                             }
                                             RelativeAxisType::REL_Y => {
-                                                mouse_y += ev.value() as f64;
                                                 Some(EventType::MouseMove(MouseMoveEvent {
-                                                    x: mouse_x,
-                                                    y: mouse_y,
+                                                    delta_x: 0.0,
+                                                    delta_y: ev.value() as f64,
                                                 }))
                                             }
                                             RelativeAxisType::REL_WHEEL => {
                                                 Some(EventType::MouseScroll(MouseScrollEvent {
                                                     delta_x: 0,
                                                     delta_y: ev.value() as i64,
-                                                    x: mouse_x,
-                                                    y: mouse_y,
+                                                    x: 0.0,
+                                                    y: 0.0,
                                                 }))
                                             }
                                             RelativeAxisType::REL_HWHEEL => {
                                                 Some(EventType::MouseScroll(MouseScrollEvent {
                                                     delta_x: ev.value() as i64,
                                                     delta_y: 0,
-                                                    x: mouse_x,
-                                                    y: mouse_y,
+                                                    x: 0.0,
+                                                    y: 0.0,
                                                 }))
                                             }
                                             _ => None,
@@ -187,25 +185,13 @@ impl InputBackend for EvdevBackend {
                 info!("Stopped evdev capture for: {}", device_name);
             });
             
-            self.thread_handles.push(handle);
+            let _ = handle;
         }
         
         Ok(())
     }
     
-    fn stop(&mut self) -> Result<()> {
-        self.capturing.store(false, Ordering::SeqCst);
-        
-        // Wait for threads to finish
-        for handle in self.thread_handles.drain(..) {
-            let _ = handle.join();
-        }
-        
-        info!("evdev backend stopped");
-        Ok(())
-    }
-    
-    fn is_capturing(&self) -> bool {
-        self.capturing.load(Ordering::SeqCst)
+    fn current_timestamp(&self) -> Option<u64> {
+        self.start_time.map(|t| t.elapsed().as_micros() as u64)
     }
 }

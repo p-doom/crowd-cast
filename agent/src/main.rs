@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
     let (status_tx, status_rx) = broadcast::channel::<EngineStatus>(16);
 
     // Initialize sync engine with channels
-    let sync_engine = SyncEngine::new(config.clone(), obs, cmd_rx, status_tx).await?;
+    let sync_engine = SyncEngine::new(config.clone(), obs, obs_manager, cmd_rx, status_tx).await?;
 
     // Initialize tray app with channels
     let tray = match TrayApp::new(cmd_tx, status_rx) {
@@ -130,11 +130,6 @@ async fn main() -> Result<()> {
 
     // Cleanup - abort the sync engine task
     sync_handle.abort();
-    
-    // Stop OBS if we started it
-    if let Err(e) = obs_manager.stop() {
-        warn!("Failed to stop OBS: {}", e);
-    }
     
     info!("CrowdCast Agent shutting down");
 

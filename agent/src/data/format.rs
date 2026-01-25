@@ -14,10 +14,13 @@ pub struct InputChunk {
     /// Chunk identifier (matches video chunk filename)
     pub chunk_id: String,
     
-    /// Start timestamp (Unix epoch microseconds)
+    /// Start timestamp in microseconds since backend start.
+    /// This represents when video recording started and is used as the
+    /// reference point (t=0) for aligning input events with video.
     pub start_time_us: u64,
     
-    /// End timestamp (Unix epoch microseconds)
+    /// End timestamp in microseconds since backend start.
+    /// Set to the timestamp of the last event in the chunk.
     pub end_time_us: u64,
     
     /// Input events in this chunk
@@ -65,11 +68,19 @@ impl InputChunk {
         }
     }
     
+    /// Set the recording start timestamp.
+    /// This should be called when OBS recording starts to synchronize
+    /// input events with the video timeline.
+    /// Only sets the timestamp if it hasn't been set yet (is still 0),
+    /// to avoid overwriting on resume after pause.
+    pub fn set_recording_start(&mut self, timestamp_us: u64) {
+        if self.start_time_us == 0 {
+            self.start_time_us = timestamp_us;
+        }
+    }
+    
     /// Add an event to the chunk
     pub fn add_event(&mut self, event: InputEvent) {
-        if self.events.is_empty() {
-            self.start_time_us = event.timestamp_us;
-        }
         self.end_time_us = event.timestamp_us;
         self.events.push(event);
     }
@@ -79,20 +90,6 @@ impl InputChunk {
         Ok(rmp_serde::to_vec(self)?)
     }
     
-    /// Deserialize from MessagePack bytes
-    pub fn from_msgpack(data: &[u8]) -> Result<Self> {
-        Ok(rmp_serde::from_slice(data)?)
-    }
-    
-    /// Serialize to JSON string
-    pub fn to_json(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(self)?)
-    }
-    
-    /// Deserialize from JSON string
-    pub fn from_json(data: &str) -> Result<Self> {
-        Ok(serde_json::from_str(data)?)
-    }
 }
 
 /// Information about a completed recording chunk ready for upload

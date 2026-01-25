@@ -70,11 +70,11 @@ pub enum MouseButton {
 /// Mouse movement event data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MouseMoveEvent {
-    /// X coordinate
-    pub x: f64,
+    /// Relative X movement (device units, true delta on supported platforms)
+    pub delta_x: f64,
     
-    /// Y coordinate
-    pub y: f64,
+    /// Relative Y movement (device units, true delta on supported platforms)
+    pub delta_y: f64,
 }
 
 /// Mouse scroll event data
@@ -118,6 +118,18 @@ impl From<rdev::Key> for KeyEvent {
             rdev::Key::F10 => (19, "F10".to_string()),
             rdev::Key::F11 => (20, "F11".to_string()),
             rdev::Key::F12 => (21, "F12".to_string()),
+            rdev::Key::F13 => (200, "F13".to_string()),
+            rdev::Key::F14 => (201, "F14".to_string()),
+            rdev::Key::F15 => (202, "F15".to_string()),
+            rdev::Key::F16 => (203, "F16".to_string()),
+            rdev::Key::F17 => (204, "F17".to_string()),
+            rdev::Key::F18 => (205, "F18".to_string()),
+            rdev::Key::F19 => (206, "F19".to_string()),
+            rdev::Key::F20 => (207, "F20".to_string()),
+            rdev::Key::F21 => (208, "F21".to_string()),
+            rdev::Key::F22 => (209, "F22".to_string()),
+            rdev::Key::F23 => (210, "F23".to_string()),
+            rdev::Key::F24 => (211, "F24".to_string()),
             rdev::Key::Home => (22, "Home".to_string()),
             rdev::Key::LeftArrow => (23, "LeftArrow".to_string()),
             rdev::Key::MetaLeft => (24, "MetaLeft".to_string()),
@@ -201,6 +213,15 @@ impl From<rdev::Key> for KeyEvent {
             rdev::Key::Kp9 => (102, "Kp9".to_string()),
             rdev::Key::KpDelete => (103, "KpDelete".to_string()),
             rdev::Key::Function => (104, "Function".to_string()),
+            rdev::Key::VolumeUp => (220, "VolumeUp".to_string()),
+            rdev::Key::VolumeDown => (221, "VolumeDown".to_string()),
+            rdev::Key::VolumeMute => (222, "VolumeMute".to_string()),
+            rdev::Key::BrightnessUp => (223, "BrightnessUp".to_string()),
+            rdev::Key::BrightnessDown => (224, "BrightnessDown".to_string()),
+            rdev::Key::PreviousTrack => (225, "PreviousTrack".to_string()),
+            rdev::Key::PlayPause => (226, "PlayPause".to_string()),
+            rdev::Key::PlayCd => (227, "PlayCd".to_string()),
+            rdev::Key::NextTrack => (228, "NextTrack".to_string()),
             rdev::Key::Unknown(code) => (code as u32 + 1000, format!("Unknown({})", code)),
         };
         

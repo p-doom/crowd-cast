@@ -86,6 +86,7 @@ pub struct UploadConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingConfig {
     /// Directory to watch for OBS recording chunks
+    #[serde(default = "default_recording_output_directory_option")]
     pub output_directory: Option<PathBuf>,
 
     /// Session ID (auto-generated if not set)
@@ -115,6 +116,14 @@ fn default_true() -> bool {
 
 fn default_max_uploads() -> usize {
     2
+}
+
+fn default_recording_output_directory() -> PathBuf {
+    std::env::temp_dir().join("crowdcast-recordings")
+}
+
+fn default_recording_output_directory_option() -> Option<PathBuf> {
+    Some(default_recording_output_directory())
 }
 
 impl Default for ObsConfig {
@@ -153,7 +162,7 @@ impl Default for UploadConfig {
 impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
-            output_directory: None,
+            output_directory: Some(default_recording_output_directory()),
             session_id: None,
         }
     }
