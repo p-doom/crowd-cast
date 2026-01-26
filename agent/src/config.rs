@@ -44,10 +44,6 @@ pub struct ObsConfig {
     /// Polling interval for hooked state (ms)
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
-
-    /// Sanity check interval (seconds) - for blackscreen fallback
-    #[serde(default = "default_sanity_interval")]
-    pub sanity_check_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,10 +102,6 @@ fn default_poll_interval() -> u64 {
     150 // 150ms for responsive capture state changes
 }
 
-fn default_sanity_interval() -> u64 {
-    300 // 5 minutes
-}
-
 fn default_true() -> bool {
     true
 }
@@ -133,7 +125,6 @@ impl Default for ObsConfig {
             port: default_obs_port(),
             password: None,
             poll_interval_ms: default_poll_interval(),
-            sanity_check_interval_secs: default_sanity_interval(),
         }
     }
 }

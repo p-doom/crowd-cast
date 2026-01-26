@@ -68,6 +68,10 @@ static volatile bool g_poll_running = false;
 static volatile bool g_manual_capture_enabled = true;
 static volatile bool g_using_manual_mode = false;
 
+/* Stale capture check interval (every N polling cycles = N * 200ms) */
+#define STALE_CHECK_INTERVAL_CYCLES 50  /* 50 * 200ms = 10 seconds */
+static volatile uint32_t g_stale_check_counter = 0;
+
 static bool compute_any_hooked_locked(void)
 {
     for (size_t i = 0; i < g_source_count; i++) {
@@ -757,6 +761,45 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
 }
 
 /* ========================================================================== */
+/* Auto-restart Stale Screen Captures (macOS only)                             */
+/* ========================================================================== */
+
+/* Check and restart stale screen captures (macOS only) */
+static void check_and_restart_stale_captures(void)
+{
+#ifdef __APPLE__
+    pthread_mutex_lock(&g_state_mutex);
+    for (size_t i = 0; i < g_source_count; i++) {
+        if (!g_sources[i].in_use)
+            continue;
+        
+        obs_source_t *source = obs_get_source_by_name(g_sources[i].name);
+        if (!source)
+            continue;
+        
+        const char *id = obs_source_get_id(source);
+        if (!id || strcmp(id, "screen_capture") != 0) {
+            obs_source_release(source);
+            continue;
+        }
+        
+        obs_properties_t *props = obs_source_properties(source);
+        if (props) {
+            obs_property_t *restart_btn = obs_properties_get(props, "restart_capture");
+            if (restart_btn && obs_property_enabled(restart_btn)) {
+                obs_property_button_clicked(restart_btn, source);
+                blog(LOG_INFO, "[crowd-cast] Auto-restarted stale capture: %s", 
+                     g_sources[i].name);
+            }
+            obs_properties_destroy(props);
+        }
+        obs_source_release(source);
+    }
+    pthread_mutex_unlock(&g_state_mutex);
+#endif
+}
+
+/* ========================================================================== */
 /* Capture State Polling Thread                                                */
 /* ========================================================================== */
 
@@ -813,6 +856,12 @@ static void *poll_thread_func(void *param)
         if (new_any_hooked != old_any_hooked) {
             blog(LOG_INFO, "[crowd-cast] Capture state changed: any_hooked=%d", new_any_hooked);
             emit_hooked_sources_event("_poll", false, false, new_any_hooked);
+        }
+        
+        /* Check for stale captures every STALE_CHECK_INTERVAL_CYCLES (macOS only) */
+        if (++g_stale_check_counter >= STALE_CHECK_INTERVAL_CYCLES) {
+            g_stale_check_counter = 0;
+            check_and_restart_stale_captures();
         }
         
         /* Sleep 200ms using OBS portable helper */

@@ -229,7 +229,7 @@ pub async fn run_setup_wizard_async(config: WizardConfig) -> Result<SetupResult>
         println!("  Starting OBS minimized...");
         
         let manager_config = OBSManagerConfig {
-            use_crowd-cast_profile: true,
+            use_crowd_cast_profile: true,
             auto_start_recording: false,
             ..Default::default()
         };

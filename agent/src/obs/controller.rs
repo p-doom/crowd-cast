@@ -1,14 +1,11 @@
 //! OBS WebSocket controller implementation
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use futures::StreamExt;
 use obws::events::{Event, OutputState};
 use obws::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info};
@@ -298,43 +295,6 @@ impl OBSController {
         client.recording().stop().await?;
         info!("Stopped OBS recording");
         Ok(())
-    }
-
-
-    /// Get a screenshot of the current program output (for sanity check)
-    pub async fn get_screenshot(&self) -> Result<Vec<u8>> {
-        let client = self.client.read().await;
-        let scene = client.scenes().current_program_scene().await?;
-        
-        let screenshot = client
-            .sources()
-            .take_screenshot(obws::requests::sources::TakeScreenshot {
-                source: scene.id.name.as_str().into(),
-                width: Some(320),  // Small size for quick analysis
-                height: Some(180),
-                format: "png",
-                compression_quality: Some(50),
-            })
-            .await?;
-
-        // Decode base64
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&screenshot)
-            .context("Failed to decode screenshot")?;
-
-        Ok(bytes)
-    }
-
-    /// Hash the current program output in pixel space for stale-frame detection.
-    pub async fn screenshot_luma_hash(&self) -> Result<u64> {
-        let screenshot_bytes = self.get_screenshot().await?;
-        let img = image::load_from_memory(&screenshot_bytes)
-            .context("Failed to load screenshot image")?;
-
-        let gray = img.to_luma8();
-        let mut hasher = DefaultHasher::new();
-        gray.as_raw().hash(&mut hasher);
-        Ok(hasher.finish())
     }
 
     /// Get the current scene name

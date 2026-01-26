@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, error, info, warn};
@@ -75,12 +75,6 @@ struct SharedState {
     /// Whether OBS is connected
     obs_connected: AtomicBool,
 
-    /// Last screenshot hash used for stale-frame detection
-    last_screenshot_hash: RwLock<Option<u64>>,
-
-    /// Count of consecutive identical screenshots
-    stale_screenshot_count: AtomicUsize,
-
     /// Keys currently pressed while capture is enabled
     pressed_keys: RwLock<HashMap<String, crate::data::KeyEvent>>,
 }
@@ -120,8 +114,6 @@ impl SyncEngine {
             chunk_counter: RwLock::new(0),
             event_count: AtomicUsize::new(0),
             obs_connected: AtomicBool::new(true),
-            last_screenshot_hash: RwLock::new(None),
-            stale_screenshot_count: AtomicUsize::new(0),
             pressed_keys: RwLock::new(HashMap::new()),
         });
         
@@ -235,8 +227,6 @@ impl SyncEngine {
         
         // Main event loop using tokio::select!
         let poll_interval = Duration::from_millis(self.config.obs.poll_interval_ms);
-        let sanity_interval = Duration::from_secs(self.config.obs.sanity_check_interval_secs);
-        let mut last_sanity_check = StdInstant::now();
         let mut poll_timer = tokio::time::interval(poll_interval);
         let mut reconnect_backoff = Duration::from_secs(1);
         let max_reconnect_backoff = Duration::from_secs(10);
@@ -308,12 +298,6 @@ impl SyncEngine {
                             info!("OBS connection restored");
                         }
                         self.reconcile_capture_state().await;
-                    }
-                    
-                    // Periodic sanity check
-                    if last_sanity_check.elapsed() >= sanity_interval {
-                        last_sanity_check = StdInstant::now();
-                        self.run_sanity_check().await;
                     }
                 }
                 
@@ -454,9 +438,6 @@ impl SyncEngine {
     async fn stop_capture(&self) {
         if self.state.capture_enabled.swap(false, Ordering::SeqCst) {
             info!("Input capture disabled");
-
-            self.state.stale_screenshot_count.store(0, Ordering::SeqCst);
-            *self.state.last_screenshot_hash.write().await = None;
 
             let pressed_keys = {
                 let mut pressed = self.state.pressed_keys.write().await;
@@ -615,43 +596,5 @@ impl SyncEngine {
 
         self.send_status(EngineStatus::WaitingForOBS);
         was_connected
-    }
-    
-    /// Run periodic sanity check
-    async fn run_sanity_check(&self) {
-        if self.state.capture_enabled.load(Ordering::SeqCst) {
-            const STALE_SCREENSHOT_THRESHOLD: usize = 2;
-
-            let screenshot_hash = match self.obs.screenshot_luma_hash().await {
-                Ok(hash) => hash,
-                Err(e) => {
-                    debug!("Sanity check failed: {}", e);
-                    return;
-                }
-            };
-
-            let mut last_hash = self.state.last_screenshot_hash.write().await;
-            if let Some(previous_hash) = *last_hash {
-                if previous_hash == screenshot_hash {
-                    let count = self
-                        .state
-                        .stale_screenshot_count
-                        .fetch_add(1, Ordering::SeqCst)
-                        + 1;
-                    if count == STALE_SCREENSHOT_THRESHOLD {
-                        warn!(
-                            "Sanity check: OBS output appears frozen ({} identical frames)",
-                            count
-                        );
-                    }
-                    return;
-                }
-            }
-
-            *last_hash = Some(screenshot_hash);
-            self.state
-                .stale_screenshot_count
-                .store(0, Ordering::SeqCst);
-        }
     }
 }
