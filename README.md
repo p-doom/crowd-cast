@@ -106,7 +106,6 @@ After setup, simply run `crowd-cast-agent` and it will automatically:
 ### macOS
 
 1. Grant **Accessibility** permission to the agent (System Settings → Privacy & Security → Accessibility)
-2. Grant **Screen Recording** permission if using screenshot-based features
 
 ### Linux (Wayland)
 
