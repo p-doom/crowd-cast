@@ -764,38 +764,64 @@ static void create_capture_sources_cb(obs_data_t *request_data, obs_data_t *resp
 /* Auto-restart Stale Screen Captures (macOS only)                             */
 /* ========================================================================== */
 
+#ifdef __APPLE__
+/* Property name for the restart button in OBS's macOS screen_capture source.
+ * From OBS source (plugins/mac-capture/mac-sck-common.m):
+ *   obs_properties_add_button2(props, "reactivate_capture", ..., reactivate_capture, sc);
+ */
+static const char *REACTIVATE_CAPTURE_PROPERTY = "reactivate_capture";
+
+/* Callback for enumerating sources to check for stale captures */
+static bool check_source_for_stale_capture(void *param, obs_source_t *source)
+{
+    UNUSED_PARAMETER(param);
+    
+    if (!source)
+        return true;
+    
+    const char *id = obs_source_get_id(source);
+    if (!id || strcmp(id, "screen_capture") != 0)
+        return true;
+    
+    const char *name = obs_source_get_name(source);
+    obs_properties_t *props = obs_source_properties(source);
+    if (!props) {
+        blog(LOG_DEBUG, "[crowd-cast] screen_capture '%s': no properties available", 
+             name ? name : "(unnamed)");
+        return true;
+    }
+    
+    obs_property_t *reactivate_btn = obs_properties_get(props, REACTIVATE_CAPTURE_PROPERTY);
+    if (reactivate_btn) {
+        bool enabled = obs_property_enabled(reactivate_btn);
+        blog(LOG_DEBUG, "[crowd-cast] screen_capture '%s': reactivate_capture enabled=%d", 
+             name ? name : "(unnamed)", enabled);
+        if (enabled) {
+            obs_property_button_clicked(reactivate_btn, source);
+            blog(LOG_INFO, "[crowd-cast] Auto-restarted stale capture '%s'", 
+                 name ? name : "(unnamed)");
+        }
+    } else {
+        blog(LOG_DEBUG, "[crowd-cast] screen_capture '%s': reactivate_capture property not found", 
+             name ? name : "(unnamed)");
+    }
+    
+    obs_properties_destroy(props);
+    return true;
+}
+#endif
+
 /* Check and restart stale screen captures (macOS only) */
 static void check_and_restart_stale_captures(void)
 {
 #ifdef __APPLE__
-    pthread_mutex_lock(&g_state_mutex);
-    for (size_t i = 0; i < g_source_count; i++) {
-        if (!g_sources[i].in_use)
-            continue;
-        
-        obs_source_t *source = obs_get_source_by_name(g_sources[i].name);
-        if (!source)
-            continue;
-        
-        const char *id = obs_source_get_id(source);
-        if (!id || strcmp(id, "screen_capture") != 0) {
-            obs_source_release(source);
-            continue;
-        }
-        
-        obs_properties_t *props = obs_source_properties(source);
-        if (props) {
-            obs_property_t *restart_btn = obs_properties_get(props, "restart_capture");
-            if (restart_btn && obs_property_enabled(restart_btn)) {
-                obs_property_button_clicked(restart_btn, source);
-                blog(LOG_INFO, "[crowd-cast] Auto-restarted stale capture: %s", 
-                     g_sources[i].name);
-            }
-            obs_properties_destroy(props);
-        }
-        obs_source_release(source);
+    static bool first_run = true;
+    if (first_run) {
+        blog(LOG_INFO, "[crowd-cast] Stale capture check enabled (runs every %d seconds)", 
+             STALE_CHECK_INTERVAL_CYCLES * 200 / 1000);
+        first_run = false;
     }
-    pthread_mutex_unlock(&g_state_mutex);
+    obs_enum_sources(check_source_for_stale_capture, NULL);
 #endif
 }
 
