@@ -215,8 +215,7 @@ impl OBSController {
         state.hooked_sources = self.get_hooked_sources().await.ok();
 
         // Determine if we should capture
-        let is_recording_or_streaming = matches!(state.recording, RecordingState::Recording)
-            || matches!(state.streaming, StreamingState::Streaming);
+        let is_recording = matches!(state.recording, RecordingState::Recording);
 
         let any_hooked = state
             .hooked_sources
@@ -224,7 +223,7 @@ impl OBSController {
             .map(|h| h.any_hooked)
             .unwrap_or(true); // Default to true if plugin not available
 
-        state.should_capture = is_recording_or_streaming && any_hooked;
+        state.should_capture = is_recording && any_hooked;
 
         debug!(
             "OBS state: recording={:?}, streaming={:?}, any_hooked={}, should_capture={}",
