@@ -12,11 +12,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
 
-# Embedded libobs (local fork with application capture support)
-libobs = { path = "libobs-rs/libobs" }
-libobs-wrapper = { path = "libobs-rs/libobs-wrapper" }
-libobs-simple = { path = "libobs-rs/libobs-simple" }
-libobs-bootstrapper = { path = "libobs-rs/libobs-bootstrapper" }
+# Embedded libobs
+libobs = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+libobs-wrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+libobs-simple = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
 
 # Input capture
 rdev = { git = "https://github.com/p-doom/rdev" }
