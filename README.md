@@ -392,7 +392,7 @@ pub fn new_window_capture(ctx: &ObsContext, window_name: &str) -> Result<ObsSour
 
 ## License
 
-MIT License - see [LICENSE.md](LICENSE.md)
+MIT License, see [LICENSE.md](LICENSE.md)
 
 ## Contributing
 
