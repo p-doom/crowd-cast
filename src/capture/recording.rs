@@ -14,6 +14,41 @@ use libobs_wrapper::utils::ObsPath;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
+/// Calculate output dimensions with aspect-preserving downscale
+///
+/// Downscales to max_height while preserving aspect ratio.
+/// Ensures dimensions are even (required by most video encoders).
+///
+/// # Arguments
+/// * `base_width` - Source width in pixels
+/// * `base_height` - Source height in pixels
+/// * `max_height` - Maximum output height (0 = no limit, use native)
+///
+/// # Returns
+/// Tuple of (output_width, output_height), both guaranteed to be even
+pub fn calculate_output_dimensions(base_width: u32, base_height: u32, max_height: u32) -> (u32, u32) {
+    // If max_height is 0 or source is already at/below max, use native (but ensure even)
+    if max_height == 0 || base_height <= max_height {
+        return (make_even(base_width), make_even(base_height));
+    }
+
+    // Calculate aspect-preserving dimensions
+    let aspect = base_width as f64 / base_height as f64;
+    let output_height = max_height;
+    let output_width = (output_height as f64 * aspect).round() as u32;
+
+    (make_even(output_width), make_even(output_height))
+}
+
+/// Ensure a value is even (required by most video encoders)
+fn make_even(v: u32) -> u32 {
+    if v % 2 == 0 {
+        v
+    } else {
+        v + 1
+    }
+}
+
 /// Recording state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecordingState {
@@ -53,13 +88,19 @@ pub struct RecordingConfig {
     pub quality_preset: HardwarePreset,
     /// Output format
     pub format: OutputFormat,
+    /// Maximum output height in pixels (width auto-calculated to preserve aspect ratio)
+    /// Set to 0 to use native resolution
+    pub max_output_height: u32,
+    /// Frames per second
+    pub fps: u32,
 }
 
 impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
-            // 8 Mbps - good quality for screen capture
-            video_bitrate: 8000,
+            // 3 Mbps, assuming 720p30 screen capture with HEVC
+            // Good balance between storage efficiency and text legibility
+            video_bitrate: 3000,
             // 160 Kbps - good quality for system audio (if enabled)
             audio_bitrate: 160,
             // Audio disabled by default - video only
@@ -70,12 +111,17 @@ impl Default for RecordingConfig {
             quality_preset: HardwarePreset::Balanced,
             // Hybrid MP4 - recoverable and widely compatible
             format: OutputFormat::HybridMP4,
+            // 720p max height
+            max_output_height: 720,
+            // 30 FPS
+            fps: 30,
         }
     }
 }
 
 impl RecordingConfig {
     /// Create config optimized for high quality recording (with audio)
+    /// Uses native resolution (no downscaling)
     pub fn high_quality() -> Self {
         Self {
             video_bitrate: 15000,
@@ -84,30 +130,39 @@ impl RecordingConfig {
             codec_preference: VideoCodecPreference::HevcPreferred,
             quality_preset: HardwarePreset::Quality,
             format: OutputFormat::HybridMP4,
+            // 0 = native resolution
+            max_output_height: 0,
+            fps: 30,
         }
     }
 
     /// Create config optimized for smaller file sizes (video only)
+    /// Uses 720p with minimum viable bitrate for legible text
     pub fn compact() -> Self {
         Self {
-            video_bitrate: 4000,
+            video_bitrate: 2500,
             audio_bitrate: 128,
             enable_audio: false,
             codec_preference: VideoCodecPreference::HevcPreferred,
             quality_preset: HardwarePreset::Speed,
             format: OutputFormat::HybridMP4,
+            max_output_height: 720,
+            fps: 30,
         }
     }
 
     /// Create config optimized for maximum compatibility (video only)
+    /// Uses H.264 which requires higher bitrate than HEVC
     pub fn compatible() -> Self {
         Self {
-            video_bitrate: 6000,
+            video_bitrate: 4000,
             audio_bitrate: 160,
             enable_audio: false,
             codec_preference: VideoCodecPreference::H264Preferred,
             quality_preset: HardwarePreset::Balanced,
             format: OutputFormat::Mpeg4,
+            max_output_height: 720,
+            fps: 30,
         }
     }
 

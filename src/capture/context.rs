@@ -10,13 +10,14 @@
 use anyhow::{Context as _, Result};
 use libobs_bootstrapper::{ObsBootstrapper, ObsBootstrapperOptions, ObsBootstrapperResult};
 use libobs_wrapper::context::ObsContext;
+use libobs_wrapper::data::video::ObsVideoInfoBuilder;
 use libobs_wrapper::scenes::ObsSceneRef;
 use libobs_wrapper::utils::StartupInfo;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
-use super::recording::{RecordingConfig, RecordingOutput};
+use super::recording::{calculate_output_dimensions, RecordingConfig, RecordingOutput};
 use super::sources::{get_main_display_uuid, ScreenCaptureSource};
 use super::CaptureState;
 
@@ -95,6 +96,10 @@ impl CaptureContext {
     }
 
     /// Initialize the libobs context (must be called from main thread on some platforms)
+    ///
+    /// This configures the video output based on `recording_config`:
+    /// - Output resolution is downscaled to max_output_height while preserving aspect ratio
+    /// - FPS is set from recording_config.fps
     pub fn initialize(&mut self) -> Result<()> {
         if self.context.is_some() {
             debug!("libobs context already initialized");
@@ -103,7 +108,32 @@ impl CaptureContext {
 
         info!("Initializing libobs context...");
 
-        let startup_info = StartupInfo::default();
+        // Build default video info to get native display dimensions
+        let default_video_info = ObsVideoInfoBuilder::new().build();
+        let base_width = default_video_info.get_base_width();
+        let base_height = default_video_info.get_base_height();
+
+        // Calculate output dimensions (aspect-preserving, max height from config)
+        let (output_width, output_height) = calculate_output_dimensions(
+            base_width,
+            base_height,
+            self.recording_config.max_output_height,
+        );
+
+        info!(
+            "Video config: {}x{} (native) -> {}x{} (output), {} fps",
+            base_width, base_height, output_width, output_height, self.recording_config.fps
+        );
+
+        // Build custom video info with configured settings
+        let video_info = ObsVideoInfoBuilder::new()
+            .fps_num(self.recording_config.fps)
+            .fps_den(1)
+            .output_width(output_width)
+            .output_height(output_height)
+            .build();
+
+        let startup_info = StartupInfo::default().set_video_info(video_info);
         let context =
             ObsContext::new(startup_info).context("Failed to create OBS context")?;
 
