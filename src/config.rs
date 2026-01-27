@@ -87,6 +87,10 @@ pub struct RecordingConfig {
     #[serde(default = "default_recording_output_directory_option")]
     pub output_directory: Option<PathBuf>,
 
+    /// Whether to start recording automatically on launch
+    #[serde(default = "default_autostart_on_launch")]
+    pub autostart_on_launch: bool,
+
     /// Session ID (auto-generated if not set)
     pub session_id: Option<String>,
 }
@@ -110,6 +114,10 @@ fn default_recording_output_directory() -> PathBuf {
 
 fn default_recording_output_directory_option() -> Option<PathBuf> {
     Some(default_recording_output_directory())
+}
+
+fn default_autostart_on_launch() -> bool {
+    true
 }
 
 impl Default for CaptureConfig {
@@ -148,6 +156,7 @@ impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
             output_directory: Some(default_recording_output_directory()),
+            autostart_on_launch: default_autostart_on_launch(),
             session_id: None,
         }
     }

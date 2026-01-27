@@ -160,6 +160,7 @@ delete_after_upload = true
 
 [recording]
 output_directory = "/tmp/crowd-cast-recordings"
+autostart_on_launch = true
 ```
 
 ## Usage
