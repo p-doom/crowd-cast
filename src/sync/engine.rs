@@ -92,6 +92,16 @@ impl SyncEngine {
         // Broadcast initial status
         let _ = self.status_tx.send(EngineStatus::Idle);
 
+        if self.config.recording.autostart_on_launch {
+            info!("Autostart recording on launch enabled");
+            if let Err(e) = self.start_recording().await {
+                error!("Failed to autostart recording: {}", e);
+                let _ = self
+                    .status_tx
+                    .send(EngineStatus::Error("Autostart recording failed".to_string()));
+            }
+        }
+
         loop {
             tokio::select! {
                 // Handle commands

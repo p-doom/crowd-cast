@@ -1,3 +1,4 @@
-obs-source/
-agent/target/
+obs-build/
+target/
 build/
+.venv/

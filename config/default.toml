@@ -35,5 +35,8 @@ max_concurrent_uploads = 2
 # Directory where OBS saves recordings (defaults to an OS temp dir)
 # output_directory = "/path/to/recordings"
 
+# Start recording automatically on launch
+autostart_on_launch = true
+
 # Session ID (auto-generated if not set)
 # session_id = "my-session-id"
