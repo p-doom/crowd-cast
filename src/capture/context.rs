@@ -14,7 +14,6 @@ use libobs_wrapper::scenes::ObsSceneRef;
 use libobs_wrapper::utils::StartupInfo;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::recording::{RecordingConfig, RecordingOutput};
@@ -250,9 +249,6 @@ impl CaptureContext {
             .context("Failed to get main display UUID for refresh")?;
 
         info!("Refreshing capture sources with display UUID: {}", display_uuid);
-
-        // Brief delay for system to stabilize after display change
-        std::thread::sleep(Duration::from_millis(100));
 
         // Update each source's display UUID in-place
         let mut success_count = 0;
