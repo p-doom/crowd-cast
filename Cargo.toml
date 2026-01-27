@@ -1,0 +1,92 @@
+[package]
+name = "crowd-cast-agent"
+version = "0.1.0"
+edition = "2021"
+description = "crowd-cast data collection agent - captures paired screencast and input data"
+license = "MIT"
+repository = "https://github.com/crowd-cast/crowd-cast"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# Embedded libobs
+libobs = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+libobs-wrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+libobs-simple = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+
+# Input capture
+rdev = { git = "https://github.com/p-doom/rdev" }
+
+# HTTP client for pre-signed URL uploads
+reqwest = { version = "0.12", features = ["json"] }
+
+# Base64 encoding for OBS screenshots
+base64 = "0.22"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+
+# Configuration
+toml = "0.8"
+directories = "5"
+
+# File watching
+notify = "6"
+
+
+# Image analysis
+image = "0.25"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Ctrl+C handling (cross-platform)
+ctrlc = "3"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID for session IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+# Unix signal handling
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux evdev fallback for Wayland
+evdev = "0.12"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS-specific (for permissions)
+objc = "0.2"
+# Zip extraction for plugin bundles
+zip = "2"
+# Display detection for capture recovery
+core-graphics = "0.24"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows-specific
+windows = { version = "0.58", features = ["Win32_Foundation"] }
+
+[build-dependencies]
+cc = "1"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+pkg-config = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

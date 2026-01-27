@@ -1,0 +1,46 @@
+//! Build script for crowd-cast agent
+//!
+//! On macOS, this sets up the necessary rpath for finding libobs at runtime
+//! and compiles the tray icon C/Objective-C sources.
+
+fn main() {
+    // Tell Cargo about the no_tray cfg
+    println!("cargo::rustc-check-cfg=cfg(no_tray)");
+    // macOS: Set rpath for finding libobs.framework and dylibs at runtime
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/..");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/..");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../Frameworks");
+        
+        // Build the tray Objective-C library
+        cc::Build::new()
+            .file("src/ui/tray_darwin.m")
+            .flag("-fobjc-arc")
+            .include("src/ui")
+            .compile("tray");
+        
+        // Link Cocoa framework for tray
+        println!("cargo:rustc-link-lib=framework=Cocoa");
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, we need GTK for the tray
+        // For now, disable tray on Linux until we add the C sources
+        println!("cargo:rustc-cfg=no_tray");
+    }
+    
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, we need shell32 for the tray
+        // For now, disable tray on Windows until we add the C sources
+        println!("cargo:rustc-cfg=no_tray");
+    }
+    
+    println!("cargo:rerun-if-changed=src/ui/tray.h");
+    println!("cargo:rerun-if-changed=src/ui/tray_darwin.m");
+}

@@ -23,64 +23,79 @@
 
 # `crowd-cast`:  Crowd-Sourcing Months-Long Trajectories of Human Computer Work 
 
-A cross-platform infrastructure for capturing paired screencast and keyboard/mouse input data.
+Cross-platform infrastructure for capturing paired screencast and keyboard/mouse input data.
 
 ## Overview
 
-crowd-cast consists of two components:
+crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsproject/obs-studio) for screen capture and recording, eliminating the need to install OBS Studio separately.
 
-1. **OBS Plugin** (`obs-crowd-cast-plugin/`) - A C plugin for OBS Studio that exposes window capture state and provides window enumeration via obs-websocket vendor requests
-2. **Agent** (`agent/`) - A Rust application that coordinates with OBS, captures input events, and uploads paired data to S3
+**Key components:**
+- **Embedded libobs** - Screen/window capture with hardware encoding (via [libobs-rs](https://github.com/joshprk/libobs-rs))
+- **Sync Engine** - Coordinates recording with input capture, filters by frontmost app
+- **Input Capture** - Cross-platform keyboard/mouse capture (rdev/evdev)
+- **System Tray** - Control recording from the menu bar
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                        crowd-cast Agent (Rust)                 │
-│  ┌──────────┐  ┌───────────────┐  ┌──────────┐  ┌───────────┐  │
-│  │ Tray UI  │  │ OBS Controller│  │  Sync    │  │ Uploader  │  │
-│  └──────────┘  └───────┬───────┘  │  Engine  │  └─────┬─────┘  │
-│                        │          └────┬─────┘        │        │
-│                        │               │              │        │
-│                   obs-websocket        │         pre-signed    │
-│                        │          ┌────┴─────┐       URLs      │
-│                        │          │  rdev/   │        │        │
-│                        │          │  evdev   │        │        │
-└────────────────────────┼──────────┴──────────┴────────┼────────┘
-                         │                              │
-                         ▼                              ▼
-┌─────────────────────────────────────┐        ┌───────────────┐
-│           OBS Studio                │        │  Lambda + S3  │
-│  ┌───────────────────────────────┐  │        └───────────────┘
-│  │  crowd-cast Plugin (C)        │  │
-│  │  - Tracks hooked state        │  │
-│  │  - Window enumeration         │  │
-│  │  - Source creation            │  │
-│  └───────────────────────────────┘  │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                     crowd-cast Agent (Rust)                     │
+│  ┌──────────┐  ┌────────────────┐  ┌─────────────────────────┐  │
+│  │ Tray UI  │  │ Embedded libobs│  │      Sync Engine        │  │
+│  │          │  │ (libobs-rs)    │  │  - Frontmost app detect │  │
+│  └──────────┘  │                │  │  - Input filtering      │  │
+│                │  ┌───────────┐ │  │  - Event buffering      │  │
+│                │  │mac-capture│ │  └───────────┬─────────────┘  │
+│                │  │obs-x264   │ │              │                │
+│                │  │obs-ffmpeg │ │        ┌─────┴─────┐          │
+│                │  └───────────┘ │        │ rdev/evdev│          │
+│                └────────────────┘        └───────────┘          │
+│                        │                       │                │
+│                   Video Output            Input Events          │
+│                        │                       │                │
+│                        └───────────┬───────────┘                │
+│                                    │                            │
+│                              ┌─────┴─────┐                      │
+│                              │ Uploader  │                      │
+│                              └─────┬─────┘                      │
+└────────────────────────────────────┼────────────────────────────┘
+                                     │
+                                     ▼
+                              ┌─────────────┐
+                              │ Lambda + S3 │
+                              └─────────────┘
 ```
 
 ## Features
 
-- **Privacy-aware capture**: Only logs input when OBS is actively capturing a window (not during blackscreen)
+- **Single binary**: No external OBS installation required - libobs is embedded
+- **Privacy-aware capture**: Only logs input when selected applications are in the foreground
 - **Cross-platform**: Windows, macOS, Linux (X11 and Wayland best-effort)
-- **Hardware acceleration**: Uses OBS's native encoding (NVENC, VAAPI, QSV, VideoToolbox)
+- **Hardware acceleration**: Uses libobs native encoding (NVENC, VAAPI, QSV, VideoToolbox)
 - **Efficient uploads**: Chunked uploads via pre-signed S3 URLs
-- **Minimal storage burden**: Upload and delete locally or stream to YouTube
-- **Plug-and-play installation**: Setup wizard handles OBS detection, plugin installation, profile configuration, and permissions
+- **Easy setup**: Wizard handles permissions and application selection
 
 ## Quick Start
 
 ### Prerequisites
 
-- [OBS Studio](https://obsproject.com/) 28.0 or later
-- Rust toolchain (for building the agent)
+- Rust toolchain (for building from source)
+- macOS: Homebrew with `brew install simde` (for ARM builds)
 
 ### Installation
 
 ```bash
+# Install cargo-obs-build tool
+cargo install cargo-obs-build
+
+# Clone the repository
+git clone https://github.com/p-doom/crowd-cast.git
+cd crowd-cast
+
+# Download OBS binaries (required for linking)
+cargo obs-build build --out-dir target/release
+
 # Build the agent
-cd agent
 cargo build --release
 
 # Run the setup wizard
@@ -88,25 +103,21 @@ cargo build --release
 ```
 
 The setup wizard will:
-1. Detect or prompt you to install OBS Studio
-2. **Automatically download and install** the crowd-cast OBS plugin
-3. Create an optimized OBS profile with hardware encoding
-4. Launch OBS (so the plugin loads)
-5. Let you select which applications to capture (browsers, IDEs, etc.)
-6. Request necessary OS permissions (Accessibility, Screen Recording)
-7. Optionally configure autostart
+1. Check and request OS permissions (Accessibility, Screen Recording)
+2. Let you select which applications to capture (browsers, IDEs, etc.)
+3. Optionally configure autostart
 
-After setup, simply run `crowd-cast-agent` and it will automatically:
-- Launch OBS minimized to the system tray
-- Start capturing input when you begin recording
-- Upload paired data to your configured endpoint
+After setup, simply run `crowd-cast-agent` and it will:
+- Show in the system tray
+- Automatically download OBS libraries if needed (via libobs-bootstrapper)
+- Capture input only when selected apps are in the foreground
+- Upload paired video + input data to your configured endpoint
 
 ## Platform-Specific Setup
 
 ### macOS
 
 1. Grant **Accessibility** permission to the agent (System Settings → Privacy & Security → Accessibility)
-2. Grant **Screen Recording** permission if using screenshot-based features
 
 ### Linux (Wayland)
 
@@ -131,11 +142,11 @@ Configuration is stored at:
 Example configuration:
 
 ```toml
-[obs]
-host = "localhost"
-port = 4455
-password = "your-password"  # Optional
-poll_interval_ms = 150
+[capture]
+# Apps to capture (bundle IDs on macOS, process names on Linux/Windows)
+target_apps = ["com.apple.Safari", "com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92"]
+capture_all = false  # Set true to capture all apps
+poll_interval_ms = 100  # Frontmost app detection interval
 
 [input]
 capture_keyboard = true
@@ -146,6 +157,9 @@ capture_mouse_scroll = true
 [upload]
 lambda_endpoint = "https://your-api.amazonaws.com/presign"
 delete_after_upload = true
+
+[recording]
+output_directory = "/tmp/crowd-cast-recordings"
 ```
 
 ## Usage
@@ -165,10 +179,10 @@ crowd-cast-agent
 ```
 
 The agent will:
-1. Launch OBS minimized (if not already running)
-2. Connect via WebSocket
+1. Bootstrap OBS libraries (downloads if needed)
+2. Initialize embedded libobs for capture
 3. Show in your system tray
-4. Capture input when OBS is recording
+4. Capture input when selected apps are in foreground
 
 ### Command Line Options
 
@@ -176,9 +190,11 @@ The agent will:
 crowd-cast-agent [OPTIONS]
 
 OPTIONS:
-    -h, --help            Print help message
-    -s, --setup           Run the setup wizard
-    --non-interactive     Run setup without prompts (use defaults)
+    -h, --help    Print help message
+    -s, --setup   Run the setup wizard (re-select apps, etc.)
+
+ENVIRONMENT:
+    RUST_LOG      Set log level (e.g., debug, info, warn)
 ```
 
 ### Application Selection
@@ -186,34 +202,37 @@ OPTIONS:
 During setup, you'll be prompted to select which applications to capture:
 
 ```
-Step 5/7: Selecting applications to capture...
-  Found 8 windows (3 suggested)
+Step 2: Select applications to capture
 
-Suggested applications:
-  [x] 1. Firefox (Mozilla Firefox - Google Search)
-  [x] 2. Cursor (main.rs - crowd-cast)
-  [ ] 3. Preview (document.pdf)
+Input will only be captured when one of the selected
+applications is in the foreground.
 
-Other open windows:
-  [ ] 4. Slack (general - Slack)
-  [ ] 5. Discord
+Capture input for ALL applications? [y/N]: n
 
-> 3
-  [x] 3. Preview (document.pdf)
+Available applications:
 
-> [Enter]
-Creating 3 capture sources...
-  [✓] Created 3 window capture sources
+    1. Cursor (Cursor)
+    2. Discord (Discord)
+    3. Firefox (firefox)
+    4. Google Chrome (Google Chrome)
+    5. Slack (Slack)
+    6. Terminal (Terminal)
+
+Enter application numbers to select (comma-separated)
+Example: 1,3,5 or 'all' for all apps, 'none' to skip
+
+Selection: 1,3,4
+  Selected: Cursor (Cursor)
+  Selected: Firefox (firefox)
+  Selected: Google Chrome (Google Chrome)
 ```
-
-Suggested apps (browsers, IDEs, PDF viewers, terminals) are pre-selected. Toggle with numbers, or use `a` for all suggested, `n` for none.
 
 ### Input Capture Behavior
 
 Input capture automatically:
-- **Starts** when OBS is recording/streaming AND at least one window capture source is hooked
-- **Pauses** when no window capture sources are hooked (e.g., captured app not in foreground)
-- **Stops** when OBS stops recording/streaming
+- **Enabled** when a selected application is the frontmost (active) window
+- **Disabled** when a non-selected application is in foreground
+- **Synced** with video recording timestamps for perfect alignment
 
 ## Data Format
 
@@ -299,117 +318,81 @@ def handler(event, context):
 
 This section is for contributors who want to modify crowd-cast.
 
-### Building the OBS Plugin
+### Project Structure
 
-The plugin is automatically built by CI and distributed via GitHub Releases. If you need to build it locally for development:
-
-**Note:** The plugin uses the official [obs-websocket vendor API](https://github.com/obsproject/obs-websocket/blob/master/lib/obs-websocket-api.h). The header is included in `deps/obs-websocket-api/`.
-
-#### Linux
-
-```bash
-# Install OBS development package
-sudo apt install obs-studio libobs-dev  # Ubuntu/Debian
-sudo dnf install obs-studio obs-studio-devel  # Fedora
-
-# Build
-cd obs-crowd-cast-plugin
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+```
+crowd-cast/
+├── src/
+│   ├── capture/       # libobs integration, frontmost app detection
+│   ├── input/         # Keyboard/mouse capture backends
+│   ├── sync/          # Sync engine coordinating capture + input
+│   ├── installer/     # Setup wizard, permissions
+│   └── ui/            # System tray
+├── Cargo.toml
+├── libobs-rs/             # Fork of libobs-rs with macOS support
+└── scripts/               # Utility scripts
 ```
 
-#### macOS
+### Building from Source
 
-macOS plugins require a `.plugin` bundle format. The CI workflow produces this automatically.
+#### Prerequisites
 
+**macOS (Apple Silicon):**
 ```bash
-# Clone OBS source (for headers only)
-git clone --depth 1 --branch 31.0.0 https://github.com/obsproject/obs-studio.git obs-source
-
-# Build (requires OBS.app installed)
-cd obs-crowd-cast-plugin
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
-  -DOBS_SOURCE_DIR="../obs-source"
-cmake --build build
-
-# Create the .plugin bundle
-mkdir -p build/obs-crowd-cast.plugin/Contents/{MacOS,Resources/locale}
-cp build/obs-crowd-cast.so build/obs-crowd-cast.plugin/Contents/MacOS/obs-crowd-cast
-cp data/locale/*.ini build/obs-crowd-cast.plugin/Contents/Resources/locale/
-cat > build/obs-crowd-cast.plugin/Contents/Info.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleExecutable</key>
-  <string>obs-crowd-cast</string>
-  <key>CFBundleIdentifier</key>
-  <string>com.crowd-cast.obs-plugin</string>
-  <key>CFBundleName</key>
-  <string>obs-crowd-cast</string>
-  <key>CFBundlePackageType</key>
-  <string>BNDL</string>
-  <key>CFBundleVersion</key>
-  <string>1</string>
-</dict>
-</plist>
-EOF
-
-# Install to OBS plugins directory
-cp -r build/obs-crowd-cast.plugin ~/Library/Application\ Support/obs-studio/plugins/
+brew install simde  # Required for ARM builds
 ```
 
-#### Windows
-
+**Linux:**
 ```bash
-# Clone OBS source
-git clone --depth 1 --branch 31.0.0 https://github.com/obsproject/obs-studio.git ../obs-source
+# Ubuntu/Debian
+sudo apt install libgtk-3-dev libayatana-appindicator3-dev
 
-# Download pre-built OBS
-# Extract to ../obs-installed
-
-cd obs-crowd-cast-plugin
-cmake -B build -G "Visual Studio 17 2022" ^
-  -DOBS_SOURCE_DIR="../obs-source" ^
-  -DOBS_INSTALLED_DIR="../obs-installed"
-cmake --build build --config Release
+# Fedora
+sudo dnf install gtk3-devel libappindicator-gtk3-devel
 ```
 
-### Building Installers
-
-#### Windows (NSIS)
+#### Build Steps
 
 ```bash
-cd agent && cargo build --release
-makensis installer/windows/crowd-cast.nsi
+# 1. Clone with submodules
+git clone --recursive https://github.com/p-doom/crowd-cast.git
+cd crowd-cast
+
+# 2. Download OBS binaries for linking
+cargo build --release --package cargo-obs-build
+./target/release/cargo-obs-build build --out-dir target/debug
+
+# 3. Build the agent
+cargo build
+
+# 4. Run tests
+cargo test
 ```
 
-#### macOS (DMG)
+### libobs-rs Integration
 
-```bash
-./installer/macos/build-dmg.sh
+The agent uses [libobs-rs](https://github.com/joshprk/libobs-rs) to embed OBS functionality. Key crates:
+
+- `libobs` - Raw FFI bindings to libobs
+- `libobs-wrapper` - Safe Rust wrapper
+- `libobs-bootstrapper` - Downloads OBS binaries at runtime (macOS)
+- `cargo-obs-build` - Downloads OBS binaries at build time
+
+The fork at `libobs-rs/` includes macOS support from [PR #53](https://github.com/joshprk/libobs-rs/pull/53).
+
+### Adding New Capture Sources
+
+To add support for new capture types, implement them in `src/capture/sources.rs`:
+
+```rust
+pub fn new_window_capture(ctx: &ObsContext, window_name: &str) -> Result<ObsSourceRef> {
+    // Use libobs-wrapper to create window capture source
+}
 ```
-
-#### Linux (AppImage)
-
-```bash
-./installer/linux/build-appimage.sh
-```
-
-### CI/CD
-
-The OBS plugin is built automatically for all platforms via GitHub Actions. Tagged releases (e.g., `v1.0.0`) trigger artifact uploads to GitHub Releases.
-
-- **Linux**: `.so` file
-- **macOS**: `.zip` containing a `.plugin` bundle (required format for macOS OBS)
-- **Windows**: `.dll` file
-
-The agent's setup wizard will automatically download and install the appropriate plugin for the user's platform. On macOS, this includes extracting the `.plugin` bundle to `~/Library/Application Support/obs-studio/plugins/`.
 
 ## License
 
-- OBS Plugin: GPL-2.0 (required for OBS plugins)
-- Agent: MIT
+MIT License, see [LICENSE.md](LICENSE.md)
 
 ## Contributing
 
