@@ -260,6 +260,7 @@ DEFAULT_CURSOR_GAIN = 1.0
 def build_ass(
     key_events: list[tuple[float, float, str]],
     mouse_moves: list[tuple[float, float, float]],
+    mouse_scrolls: list[tuple[float, float, float]],
     font: str,
     font_size: int,
     anchor: str,
@@ -271,6 +272,7 @@ def build_ass(
     spark_size: int,
     spark_bucket_s: float,
     spark_offset_x: int,
+    scroll_spark_offset_x: int,
     spark_min_len: int,
     spark_gain: float,
     cursor_box_w: int,
@@ -346,6 +348,26 @@ def build_ass(
         end = format_ass_time(end_ts)
         lines.append(f"Dialogue: 0,{start},{end},Sparks,,0,0,0,,{text}")
 
+    scroll_spark_events = build_spark_events(
+        mouse_moves=mouse_scrolls,
+        anchor=anchor,
+        margin_l=margin_l,
+        margin_r=margin_r,
+        margin_v=margin_v,
+        width=width,
+        height=height,
+        font_size=font_size,
+        spark_size=spark_size,
+        spark_bucket_s=spark_bucket_s,
+        spark_offset_x=scroll_spark_offset_x,
+        spark_min_len=spark_min_len,
+        spark_gain=spark_gain,
+    )
+    for start_ts, end_ts, text in scroll_spark_events:
+        start = format_ass_time(start_ts)
+        end = format_ass_time(end_ts)
+        lines.append(f"Dialogue: 0,{start},{end},Sparks,,0,0,0,,{text}")
+
     cursor_events = build_cursor_events(
         mouse_moves=mouse_moves,
         anchor=anchor,
@@ -398,6 +420,31 @@ def extract_mouse_moves(chunk: dict) -> list[tuple[float, float, float]]:
         event = entry.get("event", {})
         event_type = event.get("type")
         if event_type != "MouseMove":
+            continue
+        data = event.get("data", {})
+        delta_x = data.get("delta_x")
+        delta_y = data.get("delta_y")
+        if delta_x is None or delta_y is None:
+            continue
+        timestamp_us = entry.get("timestamp_us")
+        assert timestamp_us is not None, "Event missing timestamp_us."
+        t = (timestamp_us - start_time_us) / 1_000_000.0
+        if t < 0:
+            continue
+        events.append((t, float(delta_x), float(delta_y)))
+    return events
+
+
+def extract_mouse_scrolls(chunk: dict) -> list[tuple[float, float, float]]:
+    events = []
+    assert "events" in chunk, "Input log missing events array."
+    assert "start_time_us" in chunk, "Input log missing start_time_us."
+
+    start_time_us = chunk["start_time_us"]
+    for entry in chunk["events"]:
+        event = entry.get("event", {})
+        event_type = event.get("type")
+        if event_type != "MouseScroll":
             continue
         data = event.get("data", {})
         delta_x = data.get("delta_x")
@@ -730,6 +777,11 @@ def main() -> int:
         help="Horizontal offset from key text anchor to spark hub (defaults to max(spark_size, font_size * 4)).",
     )
     parser.add_argument(
+        "--scroll-spark-offset-x",
+        type=int,
+        help="Horizontal offset from key text anchor to scroll spark hub (defaults to 2 * spark offset).",
+    )
+    parser.add_argument(
         "--spark-min-len",
         type=int,
         default=DEFAULT_SPARK_MIN_LEN,
@@ -803,6 +855,7 @@ def main() -> int:
         strict_keys=args.strict_keys,
     )
     mouse_moves = extract_mouse_moves(chunk)
+    mouse_scrolls = extract_mouse_scrolls(chunk)
 
     if not key_events:
         parser.error("No KeyPress events found in input log.")
@@ -817,6 +870,7 @@ def main() -> int:
     ass_text = build_ass(
         key_events=key_events,
         mouse_moves=mouse_moves,
+        mouse_scrolls=mouse_scrolls,
         font=args.font,
         font_size=args.font_size,
         anchor=args.anchor,
@@ -831,6 +885,18 @@ def main() -> int:
             args.spark_offset_x
             if args.spark_offset_x is not None
             else max(args.spark_size, int(args.font_size * 4))
+        ),
+        scroll_spark_offset_x=(
+            args.scroll_spark_offset_x
+            if args.scroll_spark_offset_x is not None
+            else (
+                (
+                    args.spark_offset_x
+                    if args.spark_offset_x is not None
+                    else max(args.spark_size, int(args.font_size * 4))
+                )
+                * 2
+            )
         ),
         spark_min_len=args.spark_min_len,
         spark_gain=args.spark_gain,
