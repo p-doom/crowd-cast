@@ -21,7 +21,7 @@ use config::Config;
 use installer::{needs_setup, run_wizard_async};
 use sync::{create_engine_channels, EngineCommand, SyncEngine};
 
-/// Main entry point - runs tray on main thread (required for macOS)
+/// Main entry point, runs tray on main thread (required for macOS)
 fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::registry()
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     let mut config = Config::load()?;
     info!("Configuration loaded from {:?}", config.config_path());
 
-    // Run setup wizard if needed (uses async)
+    // Run setup wizard if needed
     if force_setup || needs_setup(&config) {
         info!("Running setup wizard...");
         let result = runtime.block_on(run_wizard_async(&mut config))?;
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
         warn!("Screen Recording permission not granted - capture may not work");
     }
 
-    // Bootstrap OBS binaries if needed (async)
+    // Bootstrap OBS binaries if needed
     info!("Bootstrapping OBS binaries...");
     let mut capture_ctx = match runtime.block_on(capture::CaptureContext::new(get_output_directory(&config))) {
         Ok(ctx) => ctx,
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
     };
     info!("OBS binaries ready");
 
-    // Initialize libobs context (must be on main thread for macOS)
+    // Initialize libobs context
     if let Err(e) = capture_ctx.initialize() {
         error!("Failed to initialize libobs: {}", e);
         std::process::exit(1);
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     if target_apps.is_empty() {
-        info!("Capture sources configured (display capture - no apps selected)");
+        info!("Capture sources configured (display capture since no apps selected)");
     } else {
         info!(
             "Capture sources configured for {} applications: {:?}",
@@ -140,7 +140,7 @@ fn main() -> Result<()> {
         }
     })?;
 
-    // Run tray on main thread (required for macOS NSStatusBar)
+    // Run tray on main thread
     #[cfg(not(no_tray))]
     {
         let tray_cmd_tx = cmd_tx.clone();

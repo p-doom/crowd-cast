@@ -22,7 +22,10 @@ libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "m
 rdev = { git = "https://github.com/p-doom/rdev" }
 
 # HTTP client for pre-signed URL uploads
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Streaming utilities for efficient file uploads
+tokio-util = { version = "0.7", features = ["io"] }
 
 # Base64 encoding for OBS screenshots
 base64 = "0.22"

@@ -118,7 +118,8 @@ pub struct CompletedChunk {
 /// Buffer for collecting input events during capture
 #[derive(Debug, Default)]
 pub struct InputEventBuffer {
-    events: Vec<InputEvent>,
+    /// The buffered events (public for partial flush access)
+    pub events: Vec<InputEvent>,
 }
 
 impl InputEventBuffer {

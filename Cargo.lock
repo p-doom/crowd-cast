@@ -581,6 +581,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
@@ -1722,6 +1723,7 @@ dependencies = [
 [[package]]
 name = "libobs"
 version = "4.0.3+32.0.2"
+source = "git+https://github.com/p-doom/libobs-rs?branch=macos-support#aebe2d4de86a01234053af439162c2c74f21d249"
 dependencies = [
  "bindgen",
  "pkg-config",
@@ -1730,6 +1732,7 @@ dependencies = [
 [[package]]
 name = "libobs-bootstrapper"
 version = "0.2.6"
+source = "git+https://github.com/p-doom/libobs-rs?branch=macos-support#aebe2d4de86a01234053af439162c2c74f21d249"
 dependencies = [
  "async-stream",
  "futures-core",
@@ -1751,6 +1754,7 @@ dependencies = [
 [[package]]
 name = "libobs-simple"
 version = "6.0.1+32.0.2"
+source = "git+https://github.com/p-doom/libobs-rs?branch=macos-support#aebe2d4de86a01234053af439162c2c74f21d249"
 dependencies = [
  "display-info",
  "libobs",
@@ -1766,6 +1770,7 @@ dependencies = [
 [[package]]
 name = "libobs-simple-macro"
 version = "6.0.2"
+source = "git+https://github.com/p-doom/libobs-rs?branch=macos-support#aebe2d4de86a01234053af439162c2c74f21d249"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1775,6 +1780,7 @@ dependencies = [
 [[package]]
 name = "libobs-window-helper"
 version = "0.3.1"
+source = "git+https://github.com/p-doom/libobs-rs?branch=macos-support#aebe2d4de86a01234053af439162c2c74f21d249"
 dependencies = [
  "windows 0.62.2",
 ]
@@ -1782,6 +1788,7 @@ dependencies = [
 [[package]]
 name = "libobs-wrapper"
 version = "7.0.2+32.0.2"
+source = "git+https://github.com/p-doom/libobs-rs?branch=macos-support#aebe2d4de86a01234053af439162c2c74f21d249"
 dependencies = [
  "chrono",
  "colored",

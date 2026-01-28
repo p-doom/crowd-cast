@@ -1,9 +1,13 @@
 //! Pre-signed URL upload implementation
+//!
+//! Supports streaming uploads to minimize RAM usage for large video files.
 
 use anyhow::{Context, Result};
-use reqwest::Client;
+use reqwest::{Body, Client};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info};
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
+use tracing::{debug, info};
 
 use crate::config::Config;
 use crate::data::CompletedChunk;
@@ -25,10 +29,12 @@ struct PresignResponse {
 }
 
 /// Uploader for completed chunks
+///
+/// Uses streaming uploads to avoid loading entire video files into RAM.
+#[derive(Clone)]
 pub struct Uploader {
     client: Client,
     lambda_endpoint: Option<String>,
-    delete_after_upload: bool,
 }
 
 impl Uploader {
@@ -37,20 +43,23 @@ impl Uploader {
         Self {
             client: Client::new(),
             lambda_endpoint: config.upload.lambda_endpoint.clone(),
-            delete_after_upload: config.upload.delete_after_upload,
         }
     }
-    
-    /// Upload a completed chunk
+
+    /// Upload a completed chunk using streaming for video files
+    ///
+    /// This method streams video files directly from disk to the network,
+    /// avoiding the need to load the entire file into RAM. This is critical
+    /// for segments that can be several hundred MB.
     pub async fn upload(&self, chunk: &CompletedChunk) -> Result<()> {
         let endpoint = self.lambda_endpoint.as_ref()
             .context("Lambda endpoint not configured")?;
-        
+
         info!(
             "Uploading chunk {} for session {}",
             chunk.chunk_id, chunk.session_id
         );
-        
+
         // 1. Get pre-signed URLs from Lambda
         let presign_request = PresignRequest {
             session_id: chunk.session_id.clone(),
@@ -58,7 +67,7 @@ impl Uploader {
             video_content_type: "video/mp4".to_string(),
             input_content_type: "application/msgpack".to_string(),
         };
-        
+
         let presign_response: PresignResponse = self.client
             .post(endpoint)
             .json(&presign_request)
@@ -68,32 +77,48 @@ impl Uploader {
             .json()
             .await
             .context("Failed to parse pre-signed URL response")?;
-        
+
         debug!("Got pre-signed URLs for chunk {}", chunk.chunk_id);
-        
-        // 2. Upload video file (if path is available)
+
+        // 2. Upload video file using streaming (if path is available)
         if let Some(ref video_path) = chunk.video_path {
-            let video_bytes = tokio::fs::read(video_path)
+            // Get file size for Content-Length header
+            let metadata = tokio::fs::metadata(video_path)
                 .await
-                .with_context(|| format!("Failed to read video file: {:?}", video_path))?;
-            
+                .with_context(|| format!("Failed to get video file metadata: {:?}", video_path))?;
+            let file_size = metadata.len();
+
+            // Open file and create streaming body
+            let file = File::open(video_path)
+                .await
+                .with_context(|| format!("Failed to open video file: {:?}", video_path))?;
+
+            // Use ReaderStream to stream the file without loading it all into RAM
+            let stream = ReaderStream::new(file);
+            let body = Body::wrap_stream(stream);
+
             self.client
                 .put(&presign_response.video_url)
                 .header("Content-Type", "video/mp4")
-                .body(video_bytes)
+                .header("Content-Length", file_size)
+                .body(body)
                 .send()
                 .await
                 .context("Failed to upload video file")?
                 .error_for_status()
                 .context("Video upload returned error status")?;
-            
-            info!("Uploaded video for chunk {}", chunk.chunk_id);
+
+            info!(
+                "Uploaded video for chunk {} ({:.2} MB)",
+                chunk.chunk_id,
+                file_size as f64 / (1024.0 * 1024.0)
+            );
         }
-        
-        // 3. Upload input log
+
+        // 3. Upload input log (small enough to fit in RAM)
         let input_bytes = rmp_serde::to_vec(&chunk.events)
             .context("Failed to serialize input events")?;
-        
+
         self.client
             .put(&presign_response.input_url)
             .header("Content-Type", "application/msgpack")
@@ -103,21 +128,13 @@ impl Uploader {
             .context("Failed to upload input log")?
             .error_for_status()
             .context("Input log upload returned error status")?;
-        
-        info!("Uploaded input log for chunk {} ({} events)", 
-              chunk.chunk_id, chunk.events.len());
-        
-        // 4. Delete local files if configured
-        if self.delete_after_upload {
-            if let Some(ref video_path) = chunk.video_path {
-                if let Err(e) = tokio::fs::remove_file(video_path).await {
-                    error!("Failed to delete video file after upload: {}", e);
-                } else {
-                    debug!("Deleted local video file: {:?}", video_path);
-                }
-            }
-        }
-        
+
+        info!(
+            "Uploaded input log for chunk {} ({} events)",
+            chunk.chunk_id,
+            chunk.events.len()
+        );
+
         Ok(())
     }
 
@@ -125,7 +142,6 @@ impl Uploader {
     pub fn is_configured(&self) -> bool {
         self.lambda_endpoint.is_some()
     }
-    
 }
 
 #[cfg(test)]
