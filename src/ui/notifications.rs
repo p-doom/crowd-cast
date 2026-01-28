@@ -1,8 +1,7 @@
 //! macOS notification support using UNUserNotificationCenter
 //!
-//! Provides notifications with actionable buttons for display change alerts.
-//! When a display change is detected, the user can choose to switch to the
-//! new display or ignore the change.
+//! Provides informational notifications for display changes and recording state.
+//! Since display switching is now automatic, notifications are purely informational.
 
 use std::ffi::CString;
 use std::sync::OnceLock;
@@ -12,9 +11,7 @@ use tracing::{debug, error, info, warn};
 /// Actions that can be triggered from notifications
 #[derive(Debug, Clone)]
 pub enum NotificationAction {
-    /// User wants to switch to a specific display
-    SwitchToDisplay { display_id: u32 },
-    /// User dismissed or ignored the notification
+    /// User dismissed or tapped the notification (informational only)
     Dismissed,
 }
 
@@ -39,6 +36,9 @@ mod ffi {
             to_display_id: u32,
         );
         pub fn notifications_show_capture_resumed(display_name: *const c_char);
+        pub fn notifications_show_recording_started();
+        pub fn notifications_show_recording_stopped();
+        pub fn notifications_show_obs_download_started();
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -62,8 +62,7 @@ extern "C" fn notification_action_callback(action_id: *const std::ffi::c_char, d
     );
 
     let action = match action_str {
-        "switch" => NotificationAction::SwitchToDisplay { display_id },
-        "ignore" | "dismiss" | "default" => NotificationAction::Dismissed,
+        "dismiss" | "default" => NotificationAction::Dismissed,
         _ => {
             warn!("Unknown notification action: {}", action_str);
             NotificationAction::Dismissed
@@ -173,6 +172,54 @@ pub fn show_capture_resumed_notification(display_name: &str) {
 /// Show capture resumed notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_capture_resumed_notification(_display_name: &str) {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when recording starts
+#[cfg(target_os = "macos")]
+pub fn show_recording_started_notification() {
+    unsafe {
+        ffi::notifications_show_recording_started();
+    }
+
+    debug!("Showed recording started notification");
+}
+
+/// Show recording started notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_recording_started_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when recording stops
+#[cfg(target_os = "macos")]
+pub fn show_recording_stopped_notification() {
+    unsafe {
+        ffi::notifications_show_recording_stopped();
+    }
+
+    debug!("Showed recording stopped notification");
+}
+
+/// Show recording stopped notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_recording_stopped_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when OBS download starts
+#[cfg(target_os = "macos")]
+pub fn show_obs_download_started_notification() {
+    unsafe {
+        ffi::notifications_show_obs_download_started();
+    }
+
+    debug!("Showed OBS download started notification");
+}
+
+/// Show OBS download started notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_obs_download_started_notification() {
     debug!("Notifications not supported on this platform");
 }
 

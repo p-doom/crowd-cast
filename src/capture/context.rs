@@ -8,18 +8,23 @@
 //! (specific applications by bundle ID).
 
 use anyhow::{Context as _, Result};
-use libobs_bootstrapper::{ObsBootstrapper, ObsBootstrapperOptions, ObsBootstrapperResult};
+use libobs_bootstrapper::{
+    status_handler::ObsBootstrapStatusHandler, ObsBootstrapper, ObsBootstrapperOptions,
+    ObsBootstrapperResult,
+};
 use libobs_wrapper::context::ObsContext;
 use libobs_wrapper::data::video::ObsVideoInfoBuilder;
 use libobs_wrapper::scenes::ObsSceneRef;
 use libobs_wrapper::utils::StartupInfo;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::{convert::Infallible};
 use tracing::{debug, info, warn};
 
 use super::recording::{calculate_output_dimensions, RecordingConfig, RecordingOutput};
 use super::sources::{get_main_display_uuid, ScreenCaptureSource};
 use super::CaptureState;
+use crate::ui::{is_running_in_app_bundle, show_obs_download_started_notification};
 
 /// Session information for a recording
 #[derive(Debug, Clone)]
@@ -89,8 +94,12 @@ impl CaptureContext {
     /// Bootstrap OBS binaries
     async fn bootstrap_obs() -> Result<ObsBootstrapperResult> {
         let options = ObsBootstrapperOptions::default();
+        let notify_download = is_running_in_app_bundle();
 
-        ObsBootstrapper::bootstrap(&options)
+        ObsBootstrapper::bootstrap_with_handler(
+            &options,
+            Box::new(ObsBootstrapNotificationHandler::new(notify_download)),
+        )
             .await
             .context("Failed to bootstrap OBS binaries")
     }
@@ -261,7 +270,7 @@ impl CaptureContext {
         self.setup_capture(&[])
     }
 
-    /// Refresh capture sources after a display configuration change
+    /// Refresh capture sources after a display configuration change (in-place update)
     ///
     /// This is needed on macOS when displays are disconnected and reconnected,
     /// as ScreenCaptureKit caches display IDs that become stale.
@@ -269,6 +278,10 @@ impl CaptureContext {
     /// This method updates the display UUID on existing sources in-place,
     /// which is more efficient than destroying and recreating them.
     /// Returns the number of sources successfully refreshed.
+    /// 
+    /// NOTE: This may not work reliably when transitioning from clamshell mode
+    /// because SCK may not properly reinitialize the stream. Use 
+    /// `fully_recreate_sources()` for more reliable recovery.
     pub fn recreate_sources(&mut self) -> Result<usize> {
         if !self.is_initialized() {
             anyhow::bail!("OBS context not initialized");
@@ -298,6 +311,115 @@ impl CaptureContext {
         }
 
         Ok(success_count)
+    }
+
+    /// Fully destroy and recreate capture sources after a display configuration change
+    ///
+    /// Unlike `recreate_sources()` which updates settings in-place, this method
+    /// completely destroys all existing capture sources and creates new ones.
+    /// This forces ScreenCaptureKit to do a fresh initialization, which is more
+    /// reliable when transitioning between displays (e.g., clamshell mode).
+    ///
+    /// Returns the number of sources successfully created.
+    pub fn fully_recreate_sources(&mut self) -> Result<usize> {
+        if !self.is_initialized() {
+            anyhow::bail!("OBS context not initialized");
+        }
+
+        let target_apps = self.target_apps.clone();
+        
+        info!(
+            "Fully recreating capture sources for {} target app(s)",
+            target_apps.len()
+        );
+
+        // Drop all existing sources - this removes them from OBS
+        let old_count = self.capture_sources.len();
+        self.capture_sources.clear();
+        debug!("Cleared {} existing capture source(s)", old_count);
+
+        // Get the context and scene
+        let context = self
+            .context
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
+
+        // Get the existing scene (don't create a new one to avoid disrupting recording)
+        let mut scene = match &mut self.scene {
+            Some(s) => s.clone(),
+            None => anyhow::bail!("Scene not initialized - call setup_capture first"),
+        };
+
+        let capture_audio = self.recording_config.enable_audio;
+
+        if target_apps.is_empty() {
+            // Fallback to display capture if no apps specified
+            let capture_source = ScreenCaptureSource::new_display_capture(
+                context,
+                &mut scene,
+                "screen_capture",
+                capture_audio,
+            )
+            .context("Failed to create screen capture source")?;
+
+            debug!("Recreated display capture source (audio: {})", capture_audio);
+            self.capture_sources.push(capture_source);
+        } else {
+            // Get fresh display UUID
+            let display_uuid = get_main_display_uuid()
+                .context("Failed to get main display UUID for application capture")?;
+
+            debug!(
+                "Recreating app capture for {} apps (display: {})",
+                target_apps.len(),
+                display_uuid
+            );
+
+            // Create application capture source for each target app
+            for (i, bundle_id) in target_apps.iter().enumerate() {
+                let source_name = format!("app_capture_{}", i);
+
+                match ScreenCaptureSource::new_application_capture(
+                    context,
+                    &mut scene,
+                    &source_name,
+                    bundle_id,
+                    &display_uuid,
+                    capture_audio,
+                ) {
+                    Ok(source) => {
+                        debug!(
+                            "Recreated capture source '{}' for '{}'",
+                            source_name, bundle_id
+                        );
+                        self.capture_sources.push(source);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to recreate capture source for '{}': {}. Skipping.",
+                            bundle_id, e
+                        );
+                    }
+                }
+            }
+
+            if self.capture_sources.is_empty() {
+                anyhow::bail!(
+                    "Failed to recreate any capture sources for target apps: {:?}",
+                    target_apps
+                );
+            }
+        }
+
+        let new_count = self.capture_sources.len();
+        info!("Fully recreated {} capture source(s)", new_count);
+
+        // Update state
+        if let Ok(mut state) = self.state.write() {
+            state.any_source_active = !self.capture_sources.is_empty();
+        }
+
+        Ok(new_count)
     }
 
     /// Set the recording configuration
@@ -494,6 +616,37 @@ impl CaptureContext {
     /// Get information about capture sources
     pub fn capture_source_names(&self) -> Vec<&str> {
         self.capture_sources.iter().map(|s| s.name()).collect()
+    }
+}
+
+#[derive(Debug)]
+struct ObsBootstrapNotificationHandler {
+    notify_download: bool,
+    download_notified: bool,
+}
+
+impl ObsBootstrapNotificationHandler {
+    fn new(notify_download: bool) -> Self {
+        Self {
+            notify_download,
+            download_notified: false,
+        }
+    }
+}
+
+impl ObsBootstrapStatusHandler for ObsBootstrapNotificationHandler {
+    type Error = Infallible;
+
+    fn handle_downloading(&mut self, _progress: f32, _message: String) -> Result<(), Self::Error> {
+        if self.notify_download && !self.download_notified {
+            self.download_notified = true;
+            show_obs_download_started_notification();
+        }
+        Ok(())
+    }
+
+    fn handle_extraction(&mut self, _progress: f32, _message: String) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 

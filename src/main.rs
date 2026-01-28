@@ -14,6 +14,7 @@ mod upload;
 
 use anyhow::Result;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -43,6 +44,15 @@ fn main() -> Result<()> {
 
     // Create tokio runtime for async operations
     let runtime = tokio::runtime::Runtime::new()?;
+
+    // Initialize notifications early (best effort - non-fatal if it fails)
+    let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+    if let Err(e) = ui::init_notifications(notification_tx) {
+        warn!(
+            "Failed to initialize notifications: {}. Display change alerts will not be shown.",
+            e
+        );
+    }
 
     // Load configuration
     let mut config = Config::load()?;
@@ -108,7 +118,13 @@ fn main() -> Result<()> {
     let (cmd_tx, cmd_rx, status_tx, _status_rx) = create_engine_channels();
 
     // Create sync engine
-    let engine = SyncEngine::new(config.clone(), capture_ctx, cmd_rx, status_tx.clone());
+    let engine = SyncEngine::new(
+        config.clone(),
+        capture_ctx,
+        cmd_rx,
+        status_tx.clone(),
+        notification_rx,
+    );
 
     // Wrap runtime in Arc for sharing with signal handler
     let runtime = Arc::new(runtime);

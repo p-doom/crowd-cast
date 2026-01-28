@@ -14,10 +14,8 @@ typedef void (*NotificationActionCallback)(const char* action_id, uint32_t displ
 static NotificationActionCallback g_action_callback = NULL;
 static BOOL g_initialized = NO;
 
-// Category and action identifiers
+// Category identifiers
 static NSString* const CATEGORY_DISPLAY_CHANGE = @"DISPLAY_CHANGE";
-static NSString* const ACTION_SWITCH = @"SWITCH_DISPLAY";
-static NSString* const ACTION_IGNORE = @"IGNORE";
 
 // Notification delegate to handle user responses
 @interface CrowdCastNotificationDelegate : NSObject <UNUserNotificationCenterDelegate>
@@ -29,7 +27,7 @@ static NSString* const ACTION_IGNORE = @"IGNORE";
        willPresentNotification:(UNNotification *)notification
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
     // Show notification even when app is in foreground
-    completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound);
+    completionHandler(UNNotificationPresentationOptionBanner);
 }
 
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
@@ -46,13 +44,9 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
         displayId = [displayIdNum unsignedIntValue];
     }
     
-    // Call the Rust callback if set
+    // Call the Rust callback if set (informational notifications - just track dismissal)
     if (g_action_callback) {
-        if ([actionIdentifier isEqualToString:ACTION_SWITCH]) {
-            g_action_callback("switch", displayId);
-        } else if ([actionIdentifier isEqualToString:ACTION_IGNORE]) {
-            g_action_callback("ignore", displayId);
-        } else if ([actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier]) {
+        if ([actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier]) {
             // User tapped the notification itself
             g_action_callback("default", displayId);
         } else if ([actionIdentifier isEqualToString:UNNotificationDismissActionIdentifier]) {
@@ -84,21 +78,10 @@ int notifications_init(NotificationActionCallback callback) {
         g_delegate = [[CrowdCastNotificationDelegate alloc] init];
         center.delegate = g_delegate;
         
-        // Define actions for the display change category
-        UNNotificationAction *switchAction = [UNNotificationAction
-            actionWithIdentifier:ACTION_SWITCH
-            title:@"Switch Display"
-            options:UNNotificationActionOptionForeground];
-        
-        UNNotificationAction *ignoreAction = [UNNotificationAction
-            actionWithIdentifier:ACTION_IGNORE
-            title:@"Ignore"
-            options:UNNotificationActionOptionNone];
-        
-        // Create category with actions
+        // Create category for display change notifications (informational, no action buttons)
         UNNotificationCategory *displayChangeCategory = [UNNotificationCategory
             categoryWithIdentifier:CATEGORY_DISPLAY_CHANGE
-            actions:@[switchAction, ignoreAction]
+            actions:@[]  // No action buttons - auto-switch already happened
             intentIdentifiers:@[]
             options:UNNotificationCategoryOptionNone];
         
@@ -134,9 +117,8 @@ void notifications_show_display_change(const char* from_display, const char* to_
     @autoreleasepool {
         UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
         content.title = @"Display Changed";
-        content.body = [NSString stringWithFormat:@"Switched from %s to %s. Capture may be interrupted.",
-                        from_display, to_display];
-        content.sound = [UNNotificationSound defaultSound];
+        content.body = [NSString stringWithFormat:@"Now recording on %s (was %s).",
+                        to_display, from_display];
         content.categoryIdentifier = CATEGORY_DISPLAY_CHANGE;
         content.userInfo = @{
             @"display_id": @(to_display_id),
@@ -171,8 +153,6 @@ void notifications_show_capture_resumed(const char* display_name) {
         UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
         content.title = @"Capture Resumed";
         content.body = [NSString stringWithFormat:@"Recording on %s", display_name];
-        content.sound = [UNNotificationSound defaultSound];
-        
         // Create request with unique identifier
         NSString *identifier = [[NSUUID UUID] UUIDString];
         UNNotificationRequest *request = [UNNotificationRequest
@@ -180,6 +160,91 @@ void notifications_show_capture_resumed(const char* display_name) {
             content:content
             trigger:nil]; // Deliver immediately
         
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
+// Show a notification when recording starts
+void notifications_show_recording_started(void) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"";
+        content.body = @"Recording started";
+
+        // Create request with unique identifier
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil]; // Deliver immediately
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
+// Show a notification when recording stops
+void notifications_show_recording_stopped(void) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"";
+        content.body = @"Recording stopped";
+
+        // Create request with unique identifier
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil]; // Deliver immediately
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
+// Show a notification when OBS download starts
+void notifications_show_obs_download_started(void) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"Downloading OBS";
+        content.body = @"Preparing capture components. This may take a minute.";
+        // No sound for a lightweight notification
+
+        // Create request with unique identifier
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil]; // Deliver immediately
+
         UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
         [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
             if (error) {
