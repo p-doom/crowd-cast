@@ -13,6 +13,8 @@ pub enum EngineCommand {
     StopRecording,
     /// Set capture enabled state
     SetCaptureEnabled(bool),
+    /// User requested switch to a specific display (from notification action)
+    SwitchToDisplay { display_id: u32 },
     /// Shutdown the engine
     Shutdown,
 }

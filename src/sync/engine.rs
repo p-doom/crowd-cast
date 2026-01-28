@@ -18,10 +18,17 @@ use tokio::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::capture::{get_frontmost_app, CaptureContext, DisplayMonitor, RecordingSession};
+use crate::capture::{
+    get_frontmost_app, CaptureContext, DisplayChangeEvent, DisplayMonitor, RecordingSession,
+    get_display_uuid,
+};
 use crate::config::Config;
 use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
 use crate::input::{create_input_backend, InputBackend};
+use crate::ui::notifications::{
+    init_notifications, show_capture_resumed_notification, show_display_change_notification,
+    NotificationAction,
+};
 use crate::upload::Uploader;
 
 use super::{EngineCommand, EngineStatus};
@@ -120,6 +127,8 @@ pub struct SyncEngine {
     delete_after_upload: bool,
     /// Upload receiver (taken once when run() starts)
     upload_rx: Option<mpsc::UnboundedReceiver<UploadMessage>>,
+    /// Notification action receiver (taken once when run() starts)
+    notification_rx: Option<mpsc::UnboundedReceiver<NotificationAction>>,
 }
 
 impl SyncEngine {
@@ -138,6 +147,14 @@ impl SyncEngine {
         let uploader = Uploader::new(&config);
         let segment_duration_secs = config.recording.segment_duration_secs;
         let delete_after_upload = config.upload.delete_after_upload;
+
+        // Create notification action channel
+        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+        
+        // Initialize notifications (best effort - non-fatal if it fails)
+        if let Err(e) = init_notifications(notification_tx) {
+            warn!("Failed to initialize notifications: {}. Display change alerts will not be shown.", e);
+        }
 
         Self {
             config,
@@ -159,6 +176,7 @@ impl SyncEngine {
             segment_duration_secs,
             delete_after_upload,
             upload_rx: Some(upload_rx),
+            notification_rx: Some(notification_rx),
         }
     }
 
@@ -365,6 +383,9 @@ impl SyncEngine {
             Self::spawn_upload_task(upload_rx, self.uploader.clone(), self.delete_after_upload);
         }
 
+        // Take notification receiver for the main loop
+        let mut notification_rx = self.notification_rx.take();
+
         // Ensure output directory exists
         std::fs::create_dir_all(&self.output_dir)?;
 
@@ -422,10 +443,32 @@ impl SyncEngine {
                             info!("Manual capture override: {}", enabled);
                             self.capture_enabled = enabled;
                         }
+                        EngineCommand::SwitchToDisplay { display_id } => {
+                            info!("User requested switch to display {}", display_id);
+                            self.switch_to_display(display_id);
+                        }
                         EngineCommand::Shutdown => {
                             info!("Shutdown command received");
                             self.stop_recording().await?;
                             break;
+                        }
+                    }
+                }
+
+                // Handle notification actions (user clicked on notification button)
+                Some(action) = async {
+                    match notification_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match action {
+                        NotificationAction::SwitchToDisplay { display_id } => {
+                            info!("Notification action: switch to display {}", display_id);
+                            self.switch_to_display(display_id);
+                        }
+                        NotificationAction::Dismissed => {
+                            debug!("User dismissed display change notification");
                         }
                     }
                 }
@@ -664,6 +707,14 @@ impl SyncEngine {
         self.segment_index = 0;
         let _ = self.upload_tx.send(UploadMessage::StartSession(main_session_id.clone()));
 
+        // Record the current display as the "original" display for recovery purposes
+        let current_displays = self.display_monitor.current_display_ids();
+        if let Some(&display_id) = current_displays.first() {
+            if let Some(uuid) = get_display_uuid(display_id) {
+                self.display_monitor.set_original_display(display_id, uuid);
+            }
+        }
+
         // Generate segment ID for first segment
         let segment_id = self.current_segment_id();
 
@@ -769,35 +820,88 @@ impl SyncEngine {
         self.recording_start_ns = None;
         self.main_session_id = None;
         self.segment_index = 0;
+        
+        // Clear the original display since we're no longer recording
+        self.display_monitor.clear_original_display();
+        
         let _ = self.status_tx.send(EngineStatus::Idle);
 
         Ok(())
     }
 
-    /// Check for display configuration changes and recover if needed
-    ///
-    /// On macOS, when displays are disconnected and reconnected, ScreenCaptureKit
-    /// caches stale display IDs. This method detects such changes and recreates
-    /// the capture sources to get fresh display enumeration.
-    fn check_display_changes(&mut self) {
-        // Check if display configuration changed (macOS only, no-op on other platforms)
-        if self.display_monitor.check_for_changes() {
-            info!("Display configuration change detected, recreating capture sources...");
-
-            // Recreate sources with fresh display enumeration
-            // This runs synchronously because libobs operations must be on the OBS thread
+    /// Switch to a specific display (called from notification action or command)
+    fn switch_to_display(&mut self, display_id: u32) {
+        // Update the original display to the new one
+        if let Some(uuid) = get_display_uuid(display_id) {
+            self.display_monitor.set_original_display(display_id, uuid);
+            
+            // Recreate sources for the new display
             match self.capture_ctx.recreate_sources() {
                 Ok(count) => {
                     info!(
-                        "Successfully recovered {} capture source(s) after display change",
-                        count
+                        "Successfully switched to display {} ({} sources updated)",
+                        display_id, count
                     );
                 }
                 Err(e) => {
-                    error!("Failed to recover capture sources after display change: {}", e);
-                    // The capture may be broken, but we don't stop recording
-                    // User might reconnect the display again
+                    error!("Failed to switch to display {}: {}", display_id, e);
                 }
+            }
+        } else {
+            error!("Failed to get UUID for display {}", display_id);
+        }
+    }
+
+    /// Check for display configuration changes and handle appropriately
+    ///
+    /// On macOS, when displays are disconnected and reconnected, ScreenCaptureKit
+    /// caches stale display IDs. This method detects such changes and either:
+    /// - Auto-recovers if the original display returns
+    /// - Shows a notification to let the user decide if switching to a new display
+    fn check_display_changes(&mut self) {
+        // Check if display configuration changed (macOS only, no-op on other platforms)
+        let Some(event) = self.display_monitor.check_for_changes() else {
+            return;
+        };
+
+        match event {
+            DisplayChangeEvent::OriginalReturned { display_id, uuid, display_name } => {
+                // Original display came back - auto-recover
+                info!("Original display '{}' (id={}) returned, auto-recovering...", display_name, display_id);
+                
+                match self.capture_ctx.recreate_sources() {
+                    Ok(count) => {
+                        info!(
+                            "Successfully recovered {} capture source(s) after display return",
+                            count
+                        );
+                        // Show a notification that capture resumed
+                        show_capture_resumed_notification(&display_name);
+                    }
+                    Err(e) => {
+                        error!("Failed to recover capture sources: {}", e);
+                        // User might reconnect the display again
+                    }
+                }
+            }
+            
+            DisplayChangeEvent::SwitchedToNew { from_id, from_name, to_id, to_name, to_uuid } => {
+                // Switched to a different display - show notification to let user decide
+                info!(
+                    "Display changed: '{}' (id={}) -> '{}' (id={})",
+                    from_name, from_id, to_name, to_id
+                );
+                
+                // Don't auto-switch - show notification with action buttons
+                show_display_change_notification(&from_name, &to_name, to_id);
+                
+                // Note: capture may be broken until user clicks "Switch" or original returns
+            }
+            
+            DisplayChangeEvent::AllDisconnected => {
+                // All displays disconnected - just log and wait
+                info!("All displays disconnected, waiting for reconnection...");
+                // Don't spam notifications - just wait quietly
             }
         }
     }

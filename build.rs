@@ -23,8 +23,16 @@ fn main() {
             .include("src/ui")
             .compile("tray");
         
-        // Link Cocoa framework for tray
+        // Build the notifications Objective-C library
+        cc::Build::new()
+            .file("src/ui/notifications_darwin.m")
+            .flag("-fobjc-arc")
+            .include("src/ui")
+            .compile("notifications_darwin");
+        
+        // Link frameworks
         println!("cargo:rustc-link-lib=framework=Cocoa");
+        println!("cargo:rustc-link-lib=framework=UserNotifications");
     }
     
     #[cfg(target_os = "linux")]
@@ -43,4 +51,5 @@ fn main() {
     
     println!("cargo:rerun-if-changed=src/ui/tray.h");
     println!("cargo:rerun-if-changed=src/ui/tray_darwin.m");
+    println!("cargo:rerun-if-changed=src/ui/notifications_darwin.m");
 }

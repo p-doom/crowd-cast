@@ -1,0 +1,192 @@
+//! macOS notification support using UNUserNotificationCenter
+//!
+//! Provides notifications with actionable buttons for display change alerts.
+//! When a display change is detected, the user can choose to switch to the
+//! new display or ignore the change.
+
+use std::ffi::CString;
+use std::sync::OnceLock;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+
+/// Actions that can be triggered from notifications
+#[derive(Debug, Clone)]
+pub enum NotificationAction {
+    /// User wants to switch to a specific display
+    SwitchToDisplay { display_id: u32 },
+    /// User dismissed or ignored the notification
+    Dismissed,
+}
+
+/// Channel sender for notification actions (set once during init)
+static ACTION_SENDER: OnceLock<mpsc::UnboundedSender<NotificationAction>> = OnceLock::new();
+
+// FFI declarations for the Objective-C implementation
+#[cfg(target_os = "macos")]
+mod ffi {
+    use std::ffi::c_char;
+
+    /// Callback type for notification actions
+    pub type NotificationActionCallback =
+        extern "C" fn(action_id: *const c_char, display_id: u32);
+
+    #[link(name = "notifications_darwin", kind = "static")]
+    extern "C" {
+        pub fn notifications_init(callback: NotificationActionCallback) -> i32;
+        pub fn notifications_show_display_change(
+            from_display: *const c_char,
+            to_display: *const c_char,
+            to_display_id: u32,
+        );
+        pub fn notifications_show_capture_resumed(display_name: *const c_char);
+        pub fn notifications_is_authorized() -> i32;
+    }
+}
+
+/// Callback function called from Objective-C when user interacts with notification
+#[cfg(target_os = "macos")]
+extern "C" fn notification_action_callback(action_id: *const std::ffi::c_char, display_id: u32) {
+    let action_str = if action_id.is_null() {
+        ""
+    } else {
+        unsafe {
+            std::ffi::CStr::from_ptr(action_id)
+                .to_str()
+                .unwrap_or("")
+        }
+    };
+
+    debug!(
+        "Notification action received: action={}, display_id={}",
+        action_str, display_id
+    );
+
+    let action = match action_str {
+        "switch" => NotificationAction::SwitchToDisplay { display_id },
+        "ignore" | "dismiss" | "default" => NotificationAction::Dismissed,
+        _ => {
+            warn!("Unknown notification action: {}", action_str);
+            NotificationAction::Dismissed
+        }
+    };
+
+    if let Some(sender) = ACTION_SENDER.get() {
+        if let Err(e) = sender.send(action) {
+            error!("Failed to send notification action: {}", e);
+        }
+    }
+}
+
+/// Initialize the notification system and request permissions
+///
+/// Must be called before showing any notifications. The provided sender
+/// will receive notification actions when the user interacts with them.
+///
+/// Returns Ok(()) if initialization succeeded, Err if it failed.
+#[cfg(target_os = "macos")]
+pub fn init_notifications(
+    action_sender: mpsc::UnboundedSender<NotificationAction>,
+) -> Result<(), String> {
+    // Store the sender for the callback
+    ACTION_SENDER
+        .set(action_sender)
+        .map_err(|_| "Notification system already initialized")?;
+
+    let result = unsafe { ffi::notifications_init(notification_action_callback) };
+
+    if result == 0 {
+        info!("Notification system initialized");
+        Ok(())
+    } else {
+        Err("Failed to initialize notification system".to_string())
+    }
+}
+
+/// Initialize notifications (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn init_notifications(
+    _action_sender: mpsc::UnboundedSender<NotificationAction>,
+) -> Result<(), String> {
+    info!("Notifications not supported on this platform");
+    Ok(())
+}
+
+/// Show notification when display changes
+///
+/// Displays a notification with "Switch Display" and "Ignore" action buttons.
+/// The `to_display_id` is passed back in the callback when user clicks "Switch".
+#[cfg(target_os = "macos")]
+pub fn show_display_change_notification(from_display: &str, to_display: &str, to_display_id: u32) {
+    let from_c = match CString::new(from_display) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Invalid from_display string: {}", e);
+            return;
+        }
+    };
+    let to_c = match CString::new(to_display) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Invalid to_display string: {}", e);
+            return;
+        }
+    };
+
+    unsafe {
+        ffi::notifications_show_display_change(from_c.as_ptr(), to_c.as_ptr(), to_display_id);
+    }
+
+    debug!(
+        "Showed display change notification: {} -> {} (id: {})",
+        from_display, to_display, to_display_id
+    );
+}
+
+/// Show display change notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_display_change_notification(
+    _from_display: &str,
+    _to_display: &str,
+    _to_display_id: u32,
+) {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when capture resumes on original display
+#[cfg(target_os = "macos")]
+pub fn show_capture_resumed_notification(display_name: &str) {
+    let name_c = match CString::new(display_name) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Invalid display_name string: {}", e);
+            return;
+        }
+    };
+
+    unsafe {
+        ffi::notifications_show_capture_resumed(name_c.as_ptr());
+    }
+
+    debug!("Showed capture resumed notification: {}", display_name);
+}
+
+/// Show capture resumed notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_capture_resumed_notification(_display_name: &str) {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Check if notifications are authorized
+///
+/// Returns true if the user has granted notification permission.
+#[cfg(target_os = "macos")]
+pub fn is_authorized() -> bool {
+    let result = unsafe { ffi::notifications_is_authorized() };
+    result == 1
+}
+
+/// Check notification authorization (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn is_authorized() -> bool {
+    false
+}
