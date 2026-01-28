@@ -94,6 +94,10 @@ pub struct RecordingConfig {
     /// Session ID (auto-generated if not set)
     pub session_id: Option<String>,
 
+    /// Whether to show notifications on recording start/stop
+    #[serde(default = "default_true")]
+    pub notify_on_start_stop: bool,
+
     /// Segment duration in seconds (0 = no segmentation)
     /// Recordings will be split into segments of this duration for progressive upload
     #[serde(default = "default_segment_duration_secs")]
@@ -167,6 +171,7 @@ impl Default for RecordingConfig {
             output_directory: Some(default_recording_output_directory()),
             autostart_on_launch: default_autostart_on_launch(),
             session_id: None,
+            notify_on_start_stop: true,
             segment_duration_secs: default_segment_duration_secs(),
         }
     }

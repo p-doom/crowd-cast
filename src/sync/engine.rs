@@ -18,10 +18,18 @@ use tokio::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::capture::{get_frontmost_app, CaptureContext, DisplayMonitor, RecordingSession};
+use crate::capture::{
+    get_frontmost_app, CaptureContext, DisplayChangeEvent, DisplayMonitor, RecordingSession,
+    get_display_uuid,
+};
 use crate::config::Config;
 use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
 use crate::input::{create_input_backend, InputBackend};
+use crate::ui::notifications::{
+    is_authorized as notifications_authorized, show_capture_resumed_notification,
+    show_display_change_notification, show_recording_started_notification,
+    show_recording_stopped_notification, NotificationAction,
+};
 use crate::upload::Uploader;
 
 use super::{EngineCommand, EngineStatus};
@@ -80,6 +88,23 @@ impl PartialEq for RetryEntry {
 
 impl Eq for RetryEntry {}
 
+/// Pending display refresh retry state
+#[derive(Debug)]
+struct PendingDisplayRefresh {
+    /// Display name for logging
+    display_name: String,
+    /// Number of retry attempts made
+    attempt: u32,
+    /// When to attempt the next retry
+    next_retry_at: Instant,
+}
+
+/// Maximum number of display refresh retry attempts
+const MAX_DISPLAY_REFRESH_RETRIES: u32 = 5;
+
+/// Base delay between display refresh retries (doubles each attempt)
+const DISPLAY_REFRESH_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
     /// Configuration
@@ -120,6 +145,10 @@ pub struct SyncEngine {
     delete_after_upload: bool,
     /// Upload receiver (taken once when run() starts)
     upload_rx: Option<mpsc::UnboundedReceiver<UploadMessage>>,
+    /// Notification action receiver (taken once when run() starts)
+    notification_rx: Option<mpsc::UnboundedReceiver<NotificationAction>>,
+    /// Pending display refresh retry (for when SCK isn't ready immediately)
+    pending_display_refresh: Option<PendingDisplayRefresh>,
 }
 
 impl SyncEngine {
@@ -129,6 +158,7 @@ impl SyncEngine {
         capture_ctx: CaptureContext,
         cmd_rx: mpsc::Receiver<EngineCommand>,
         status_tx: broadcast::Sender<EngineStatus>,
+        notification_rx: mpsc::UnboundedReceiver<NotificationAction>,
     ) -> Self {
         let output_dir = config.recording.output_directory
             .clone()
@@ -159,6 +189,8 @@ impl SyncEngine {
             segment_duration_secs,
             delete_after_upload,
             upload_rx: Some(upload_rx),
+            notification_rx: Some(notification_rx),
+            pending_display_refresh: None,
         }
     }
 
@@ -365,6 +397,9 @@ impl SyncEngine {
             Self::spawn_upload_task(upload_rx, self.uploader.clone(), self.delete_after_upload);
         }
 
+        // Take notification receiver for the main loop
+        let mut notification_rx = self.notification_rx.take();
+
         // Ensure output directory exists
         std::fs::create_dir_all(&self.output_dir)?;
 
@@ -422,10 +457,28 @@ impl SyncEngine {
                             info!("Manual capture override: {}", enabled);
                             self.capture_enabled = enabled;
                         }
+                        EngineCommand::SwitchToDisplay { display_id } => {
+                            info!("User requested switch to display {}", display_id);
+                            self.switch_to_display(display_id);
+                        }
                         EngineCommand::Shutdown => {
                             info!("Shutdown command received");
                             self.stop_recording().await?;
                             break;
+                        }
+                    }
+                }
+
+                // Handle notification actions (informational only - display switch is automatic)
+                Some(action) = async {
+                    match notification_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match action {
+                        NotificationAction::Dismissed => {
+                            debug!("User acknowledged display change notification");
                         }
                     }
                 }
@@ -454,6 +507,16 @@ impl SyncEngine {
                             error!("Failed to rotate segment: {}", e);
                         }
                     }
+                }
+
+                // Handle pending display refresh retries (for when SCK isn't ready immediately)
+                _ = async {
+                    match &self.pending_display_refresh {
+                        Some(pending) => tokio::time::sleep_until(pending.next_retry_at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.retry_display_refresh();
                 }
             }
         }
@@ -664,6 +727,14 @@ impl SyncEngine {
         self.segment_index = 0;
         let _ = self.upload_tx.send(UploadMessage::StartSession(main_session_id.clone()));
 
+        // Record the current display as the "original" display for recovery purposes
+        let current_displays = self.display_monitor.current_display_ids();
+        if let Some(&display_id) = current_displays.first() {
+            if let Some(uuid) = get_display_uuid(display_id) {
+                self.display_monitor.set_original_display(display_id, uuid);
+            }
+        }
+
         // Generate segment ID for first segment
         let segment_id = self.current_segment_id();
 
@@ -690,6 +761,10 @@ impl SyncEngine {
         self.event_buffer.clear();
 
         let _ = self.status_tx.send(EngineStatus::Capturing { event_count: 0 });
+
+        if self.config.recording.notify_on_start_stop && notifications_authorized() {
+            show_recording_started_notification();
+        }
 
         Ok(())
     }
@@ -769,34 +844,163 @@ impl SyncEngine {
         self.recording_start_ns = None;
         self.main_session_id = None;
         self.segment_index = 0;
+        
+        // Clear the original display since we're no longer recording
+        self.display_monitor.clear_original_display();
+        
         let _ = self.status_tx.send(EngineStatus::Idle);
+
+        if self.config.recording.notify_on_start_stop && notifications_authorized() {
+            show_recording_stopped_notification();
+        }
 
         Ok(())
     }
 
-    /// Check for display configuration changes and recover if needed
-    ///
-    /// On macOS, when displays are disconnected and reconnected, ScreenCaptureKit
-    /// caches stale display IDs. This method detects such changes and recreates
-    /// the capture sources to get fresh display enumeration.
-    fn check_display_changes(&mut self) {
-        // Check if display configuration changed (macOS only, no-op on other platforms)
-        if self.display_monitor.check_for_changes() {
-            info!("Display configuration change detected, recreating capture sources...");
-
-            // Recreate sources with fresh display enumeration
-            // This runs synchronously because libobs operations must be on the OBS thread
-            match self.capture_ctx.recreate_sources() {
+    /// Switch to a specific display (called from notification action or command)
+    fn switch_to_display(&mut self, display_id: u32) {
+        // Update the original display to the new one
+        if let Some(uuid) = get_display_uuid(display_id) {
+            self.display_monitor.set_original_display(display_id, uuid);
+            
+            // Fully recreate sources for the new display (more reliable than in-place update)
+            match self.capture_ctx.fully_recreate_sources() {
                 Ok(count) => {
                     info!(
-                        "Successfully recovered {} capture source(s) after display change",
-                        count
+                        "Successfully switched to display {} ({} sources recreated)",
+                        display_id, count
                     );
                 }
                 Err(e) => {
-                    error!("Failed to recover capture sources after display change: {}", e);
-                    // The capture may be broken, but we don't stop recording
-                    // User might reconnect the display again
+                    error!("Failed to switch to display {}: {}", display_id, e);
+                }
+            }
+        } else {
+            error!("Failed to get UUID for display {}", display_id);
+        }
+    }
+
+    /// Check for display configuration changes and handle appropriately
+    ///
+    /// On macOS, when displays are disconnected and reconnected, ScreenCaptureKit
+    /// caches stale display IDs. This method detects such changes and either:
+    /// - Auto-recovers if the original display returns
+    /// - Shows a notification to let the user decide if switching to a new display
+    fn check_display_changes(&mut self) {
+        // Check if display configuration changed (macOS only, no-op on other platforms)
+        let Some(event) = self.display_monitor.check_for_changes() else {
+            return;
+        };
+
+        // Cancel any pending retry since display configuration changed again
+        if self.pending_display_refresh.is_some() {
+            debug!("Cancelling pending display refresh retry due to new display change");
+            self.pending_display_refresh = None;
+        }
+
+        match event {
+            DisplayChangeEvent::OriginalReturned { display_id, uuid, display_name } => {
+                // Original display came back - auto-recover
+                info!("Original display '{}' (id={}) returned, auto-recovering...", display_name, display_id);
+                self.try_recreate_sources_with_retry(&display_name, true);
+            }
+            
+            DisplayChangeEvent::SwitchedToNew { from_id, from_name, to_id, to_name, to_uuid } => {
+                // Switched to a different display - update sources to keep SCK stream valid
+                info!(
+                    "Display changed: '{}' (id={}) -> '{}' (id={})",
+                    from_name, from_id, to_name, to_id
+                );
+                
+                // MUST update sources to keep SCK stream valid, even if capturing different display
+                // If we don't do this, the SCK stream becomes invalid/dead and can't be recovered
+                // later by just updating the display UUID
+                self.try_recreate_sources_with_retry(&to_name, false);
+                
+                // Show notification to inform user about the display change
+                show_display_change_notification(&from_name, &to_name, to_id);
+            }
+            
+            DisplayChangeEvent::AllDisconnected => {
+                // All displays disconnected - just log and wait
+                info!("All displays disconnected, waiting for reconnection...");
+                // Don't spam notifications - just wait quietly
+            }
+        }
+    }
+
+    /// Try to recreate capture sources, scheduling a retry if it fails
+    ///
+    /// SCK sometimes isn't ready immediately after display changes (especially
+    /// when coming out of clamshell mode). This method handles that by scheduling
+    /// retries with exponential backoff.
+    ///
+    /// Uses `fully_recreate_sources()` which destroys and recreates sources
+    /// for more reliable recovery than just updating the display UUID.
+    fn try_recreate_sources_with_retry(&mut self, display_name: &str, show_resumed_notification: bool) {
+        match self.capture_ctx.fully_recreate_sources() {
+            Ok(count) => {
+                info!(
+                    "Successfully recreated {} capture source(s) for display '{}'",
+                    count, display_name
+                );
+                self.pending_display_refresh = None;
+                
+                if show_resumed_notification {
+                    show_capture_resumed_notification(display_name);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to recreate sources for display '{}': {} (will retry)", display_name, e);
+                
+                // Schedule a retry
+                self.pending_display_refresh = Some(PendingDisplayRefresh {
+                    display_name: display_name.to_string(),
+                    attempt: 1,
+                    next_retry_at: Instant::now() + DISPLAY_REFRESH_RETRY_BASE_DELAY,
+                });
+            }
+        }
+    }
+
+    /// Retry a pending display refresh
+    fn retry_display_refresh(&mut self) {
+        let Some(pending) = self.pending_display_refresh.take() else {
+            return;
+        };
+
+        info!(
+            "Retrying display refresh for '{}' (attempt {}/{})",
+            pending.display_name, pending.attempt + 1, MAX_DISPLAY_REFRESH_RETRIES
+        );
+
+        match self.capture_ctx.fully_recreate_sources() {
+            Ok(count) => {
+                info!(
+                    "Successfully recreated {} capture source(s) for display '{}' on retry",
+                    count, pending.display_name
+                );
+                // Success - don't reschedule
+            }
+            Err(e) => {
+                if pending.attempt >= MAX_DISPLAY_REFRESH_RETRIES {
+                    error!(
+                        "Failed to recreate sources for display '{}' after {} attempts: {}. Giving up.",
+                        pending.display_name, MAX_DISPLAY_REFRESH_RETRIES, e
+                    );
+                    // Don't reschedule - we've exhausted retries
+                } else {
+                    // Schedule another retry with exponential backoff
+                    let delay = DISPLAY_REFRESH_RETRY_BASE_DELAY * (1 << pending.attempt);
+                    warn!(
+                        "Retry failed for display '{}': {}. Will retry in {:?}",
+                        pending.display_name, e, delay
+                    );
+                    self.pending_display_refresh = Some(PendingDisplayRefresh {
+                        display_name: pending.display_name,
+                        attempt: pending.attempt + 1,
+                        next_retry_at: Instant::now() + delay,
+                    });
                 }
             }
         }
