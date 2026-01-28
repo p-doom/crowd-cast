@@ -30,9 +30,18 @@ fn main() {
             .include("src/ui")
             .compile("notifications_darwin");
         
+        // Build the wizard Objective-C library
+        cc::Build::new()
+            .file("src/ui/wizard_darwin.m")
+            .flag("-fobjc-arc")
+            .include("src/ui")
+            .compile("wizard_darwin");
+        
         // Link frameworks
         println!("cargo:rustc-link-lib=framework=Cocoa");
         println!("cargo:rustc-link-lib=framework=UserNotifications");
+        println!("cargo:rustc-link-lib=framework=ApplicationServices");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
     }
     
     #[cfg(target_os = "linux")]
@@ -52,4 +61,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ui/tray.h");
     println!("cargo:rerun-if-changed=src/ui/tray_darwin.m");
     println!("cargo:rerun-if-changed=src/ui/notifications_darwin.m");
+    println!("cargo:rerun-if-changed=src/ui/wizard_darwin.h");
+    println!("cargo:rerun-if-changed=src/ui/wizard_darwin.m");
 }
