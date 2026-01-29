@@ -29,7 +29,8 @@ use crate::ui::notifications::{
     is_authorized as notifications_authorized, show_capture_resumed_notification,
     show_display_change_notification, show_recording_paused_notification,
     show_recording_resumed_notification, show_recording_started_notification,
-    show_recording_stopped_notification, NotificationAction,
+    show_recording_stopped_notification, show_sources_refreshed_notification,
+    NotificationAction,
 };
 use crate::upload::Uploader;
 
@@ -947,6 +948,9 @@ impl SyncEngine {
         match self.capture_ctx.fully_recreate_sources() {
             Ok(count) => {
                 info!("Successfully refreshed {} capture source(s)", count);
+                if notifications_authorized() {
+                    show_sources_refreshed_notification();
+                }
             }
             Err(e) => {
                 error!("Failed to refresh capture sources: {}", e);

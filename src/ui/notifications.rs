@@ -41,6 +41,7 @@ mod ffi {
         pub fn notifications_show_recording_paused();
         pub fn notifications_show_recording_resumed();
         pub fn notifications_show_obs_download_started();
+        pub fn notifications_show_sources_refreshed();
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -254,6 +255,22 @@ pub fn show_obs_download_started_notification() {
 /// Show OBS download started notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_obs_download_started_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when capture sources are refreshed
+#[cfg(target_os = "macos")]
+pub fn show_sources_refreshed_notification() {
+    unsafe {
+        ffi::notifications_show_sources_refreshed();
+    }
+
+    debug!("Showed sources refreshed notification");
+}
+
+/// Show sources refreshed notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_sources_refreshed_notification() {
     debug!("Notifications not supported on this platform");
 }
 
