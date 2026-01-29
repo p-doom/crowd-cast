@@ -310,6 +310,35 @@ void notifications_show_obs_download_started(void) {
     }
 }
 
+// Show a notification after setup wizard finishes
+void notifications_show_setup_configuring(void) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"Setting up Crowd-Cast";
+        content.body = @"Configuring components in the background. OBS installation will start shortly.";
+        // No sound for a lightweight notification
+
+        // Create request with unique identifier
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil]; // Deliver immediately
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
 // Show a notification when capture sources are refreshed
 void notifications_show_sources_refreshed(void) {
     if (!g_initialized) {

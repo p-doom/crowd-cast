@@ -41,6 +41,7 @@ mod ffi {
         pub fn notifications_show_recording_paused();
         pub fn notifications_show_recording_resumed();
         pub fn notifications_show_obs_download_started();
+        pub fn notifications_show_setup_configuring();
         pub fn notifications_show_sources_refreshed();
         pub fn notifications_show_idle_paused();
         pub fn notifications_show_idle_resumed();
@@ -257,6 +258,22 @@ pub fn show_obs_download_started_notification() {
 /// Show OBS download started notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_obs_download_started_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when post-wizard setup starts
+#[cfg(target_os = "macos")]
+pub fn show_setup_configuring_notification() {
+    unsafe {
+        ffi::notifications_show_setup_configuring();
+    }
+
+    debug!("Showed setup configuring notification");
+}
+
+/// Show setup configuring notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_setup_configuring_notification() {
     debug!("Notifications not supported on this platform");
 }
 

@@ -155,13 +155,15 @@ capture_mouse_click = true
 capture_mouse_scroll = true
 
 [upload]
-lambda_endpoint = "https://your-api.amazonaws.com/presign"
 delete_after_upload = true
 
 [recording]
 output_directory = "/tmp/crowd-cast-recordings"
 autostart_on_launch = true
 ```
+
+Upload endpoint configuration is provided at build time via
+`CROWD_CAST_API_GATEWAY_URL`.
 
 ## Usage
 
@@ -196,6 +198,8 @@ OPTIONS:
 
 ENVIRONMENT:
     RUST_LOG      Set log level (e.g., debug, info, warn)
+    CROWD_CAST_API_GATEWAY_URL
+                  Lambda endpoint for pre-signed S3 URLs (set at build time)
 ```
 
 ### Application Selection
@@ -291,27 +295,29 @@ BUCKET = 'your-bucket'
 
 def handler(event, context):
     body = json.loads(event['body'])
-    session_id = body['session_id']
-    chunk_id = body['chunk_id']
+    file_name = body['fileName']
+    version = body['version']
+    user_id = body['userId']
     
-    video_key = f"sessions/{session_id}/{chunk_id}.mp4"
-    input_key = f"sessions/{session_id}/{chunk_id}.msgpack"
+    key = f"uploads/{version}/{user_id}/{file_name}"
     
-    video_url = s3.generate_presigned_url(
-        'put_object',
-        Params={'Bucket': BUCKET, 'Key': video_key, 'ContentType': 'video/mp4'},
-        ExpiresIn=3600
+    content_type = (
+        "application/msgpack" if file_name.endswith(".msgpack") else "video/mp4"
     )
-    
-    input_url = s3.generate_presigned_url(
+
+    upload_url = s3.generate_presigned_url(
         'put_object',
-        Params={'Bucket': BUCKET, 'Key': input_key, 'ContentType': 'application/msgpack'},
+        Params={'Bucket': BUCKET, 'Key': key, 'ContentType': content_type},
         ExpiresIn=3600
     )
     
     return {
         'statusCode': 200,
-        'body': json.dumps({'video_url': video_url, 'input_url': input_url})
+        'body': json.dumps({
+            'uploadUrl': upload_url,
+            'key': key,
+            'contentType': content_type,
+        })
     }
 ```
 

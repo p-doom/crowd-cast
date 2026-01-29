@@ -69,6 +69,34 @@ fn main() -> Result<()> {
         }
 
         info!("Setup completed successfully");
+
+        // Re-exec the process to get a clean state for OBS initialization.
+        // The wizard's GUI pollutes process state (graphics contexts, NSApplication, etc.)
+        // in ways that cause libobs initialization to crash with SIGTRAP.
+        info!("Restarting with clean process state...");
+        
+        let exe = std::env::current_exe()?;
+        let filtered_args: Vec<String> = std::env::args()
+            .skip(1) // skip the program name
+            .filter(|a| a != "--setup" && a != "-s")
+            .collect();
+        
+        // Use Unix exec to replace this process with a fresh one
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&exe)
+                .args(&filtered_args)
+                .exec();
+            // exec() only returns on error
+            error!("exec failed: {}", err);
+        }
+        
+        // Fallback for non-Unix or if exec fails
+        std::process::Command::new(&exe)
+            .args(&filtered_args)
+            .spawn()?;
+        std::process::exit(0);
     }
 
     // Check permissions
