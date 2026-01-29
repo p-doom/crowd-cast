@@ -38,7 +38,12 @@ mod ffi {
         pub fn notifications_show_capture_resumed(display_name: *const c_char);
         pub fn notifications_show_recording_started();
         pub fn notifications_show_recording_stopped();
+        pub fn notifications_show_recording_paused();
+        pub fn notifications_show_recording_resumed();
         pub fn notifications_show_obs_download_started();
+        pub fn notifications_show_sources_refreshed();
+        pub fn notifications_show_idle_paused();
+        pub fn notifications_show_idle_resumed();
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -207,6 +212,38 @@ pub fn show_recording_stopped_notification() {
     debug!("Notifications not supported on this platform");
 }
 
+/// Show notification when recording is paused
+#[cfg(target_os = "macos")]
+pub fn show_recording_paused_notification() {
+    unsafe {
+        ffi::notifications_show_recording_paused();
+    }
+
+    debug!("Showed recording paused notification");
+}
+
+/// Show recording paused notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_recording_paused_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when recording is resumed
+#[cfg(target_os = "macos")]
+pub fn show_recording_resumed_notification() {
+    unsafe {
+        ffi::notifications_show_recording_resumed();
+    }
+
+    debug!("Showed recording resumed notification");
+}
+
+/// Show recording resumed notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_recording_resumed_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
 /// Show notification when OBS download starts
 #[cfg(target_os = "macos")]
 pub fn show_obs_download_started_notification() {
@@ -220,6 +257,54 @@ pub fn show_obs_download_started_notification() {
 /// Show OBS download started notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_obs_download_started_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when capture sources are refreshed
+#[cfg(target_os = "macos")]
+pub fn show_sources_refreshed_notification() {
+    unsafe {
+        ffi::notifications_show_sources_refreshed();
+    }
+
+    debug!("Showed sources refreshed notification");
+}
+
+/// Show sources refreshed notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_sources_refreshed_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when recording is paused due to user inactivity
+#[cfg(target_os = "macos")]
+pub fn show_idle_paused_notification() {
+    unsafe {
+        ffi::notifications_show_idle_paused();
+    }
+
+    debug!("Showed idle paused notification");
+}
+
+/// Show idle paused notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_idle_paused_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when recording resumes after user activity detected
+#[cfg(target_os = "macos")]
+pub fn show_idle_resumed_notification() {
+    unsafe {
+        ffi::notifications_show_idle_resumed();
+    }
+
+    debug!("Showed idle resumed notification");
+}
+
+/// Show idle resumed notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_idle_resumed_notification() {
     debug!("Notifications not supported on this platform");
 }
 

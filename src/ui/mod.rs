@@ -9,7 +9,8 @@ pub use notifications::{
     init_notifications, is_authorized as notifications_authorized,
     show_capture_resumed_notification, show_display_change_notification,
     show_recording_started_notification, show_recording_stopped_notification,
-    show_obs_download_started_notification, NotificationAction,
+    show_obs_download_started_notification, show_sources_refreshed_notification,
+    NotificationAction,
 };
 
 /// Returns true when running from a macOS .app bundle.
