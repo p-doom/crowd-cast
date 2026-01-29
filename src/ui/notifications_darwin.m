@@ -339,6 +339,62 @@ void notifications_show_sources_refreshed(void) {
     }
 }
 
+// Show a notification when recording is paused due to user inactivity
+void notifications_show_idle_paused(void) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"";
+        content.body = @"Recording paused (idle)";
+
+        // Create request with unique identifier
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil]; // Deliver immediately
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
+// Show a notification when recording resumes after user activity detected
+void notifications_show_idle_resumed(void) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"";
+        content.body = @"Recording resumed";
+
+        // Create request with unique identifier
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil]; // Deliver immediately
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
 // Check if notifications are authorized
 // Returns: 1 if authorized, 0 if not, -1 on error
 int notifications_is_authorized(void) {

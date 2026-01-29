@@ -42,6 +42,8 @@ mod ffi {
         pub fn notifications_show_recording_resumed();
         pub fn notifications_show_obs_download_started();
         pub fn notifications_show_sources_refreshed();
+        pub fn notifications_show_idle_paused();
+        pub fn notifications_show_idle_resumed();
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -271,6 +273,38 @@ pub fn show_sources_refreshed_notification() {
 /// Show sources refreshed notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_sources_refreshed_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when recording is paused due to user inactivity
+#[cfg(target_os = "macos")]
+pub fn show_idle_paused_notification() {
+    unsafe {
+        ffi::notifications_show_idle_paused();
+    }
+
+    debug!("Showed idle paused notification");
+}
+
+/// Show idle paused notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_idle_paused_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when recording resumes after user activity detected
+#[cfg(target_os = "macos")]
+pub fn show_idle_resumed_notification() {
+    unsafe {
+        ffi::notifications_show_idle_resumed();
+    }
+
+    debug!("Showed idle resumed notification");
+}
+
+/// Show idle resumed notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_idle_resumed_notification() {
     debug!("Notifications not supported on this platform");
 }
 

@@ -46,6 +46,15 @@ pub struct CaptureConfig {
     /// Whether setup wizard has been completed
     #[serde(default)]
     pub setup_completed: bool,
+
+    /// Idle timeout in seconds before pausing capture (0 = disabled)
+    /// When no keyboard/mouse activity is detected for this duration, recording pauses automatically.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+
+    /// Whether to pause uploads during idle (in addition to recording)
+    #[serde(default = "default_true")]
+    pub pause_uploads_on_idle: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +117,10 @@ fn default_segment_duration_secs() -> u64 {
     300 // 5 minutes
 }
 
+fn default_idle_timeout_secs() -> u64 {
+    120 // 2 minutes of inactivity before pausing capture
+}
+
 // Default value functions
 fn default_poll_interval() -> u64 {
     100 // 100ms for responsive frontmost app detection
@@ -140,6 +153,8 @@ impl Default for CaptureConfig {
             capture_all: false,
             poll_interval_ms: default_poll_interval(),
             setup_completed: false,
+            idle_timeout_secs: default_idle_timeout_secs(),
+            pause_uploads_on_idle: true,
         }
     }
 }

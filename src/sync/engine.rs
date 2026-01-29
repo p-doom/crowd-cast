@@ -27,7 +27,8 @@ use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
 use crate::input::{create_input_backend, InputBackend};
 use crate::ui::notifications::{
     is_authorized as notifications_authorized, show_capture_resumed_notification,
-    show_display_change_notification, show_recording_paused_notification,
+    show_display_change_notification, show_idle_paused_notification,
+    show_idle_resumed_notification, show_recording_paused_notification,
     show_recording_resumed_notification, show_recording_started_notification,
     show_recording_stopped_notification, show_sources_refreshed_notification,
     NotificationAction,
@@ -153,6 +154,14 @@ pub struct SyncEngine {
     notification_rx: Option<mpsc::UnboundedReceiver<NotificationAction>>,
     /// Pending display refresh retry (for when SCK isn't ready immediately)
     pending_display_refresh: Option<PendingDisplayRefresh>,
+    /// Last time user activity was detected (keyboard/mouse/scroll/click)
+    last_activity_time: Instant,
+    /// Whether we're currently auto-paused due to idle (vs user-initiated pause)
+    idle_paused: bool,
+    /// Idle timeout duration (cached from config, Duration::ZERO means disabled)
+    idle_timeout: Duration,
+    /// Whether to pause uploads during idle
+    pause_uploads_on_idle: bool,
 }
 
 impl SyncEngine {
@@ -172,6 +181,15 @@ impl SyncEngine {
         let uploader = Uploader::new(&config);
         let segment_duration_secs = config.recording.segment_duration_secs;
         let delete_after_upload = config.upload.delete_after_upload;
+        
+        // Activity-gated capture settings
+        let idle_timeout_secs = config.capture.idle_timeout_secs;
+        let idle_timeout = if idle_timeout_secs > 0 {
+            Duration::from_secs(idle_timeout_secs)
+        } else {
+            Duration::ZERO // Disabled
+        };
+        let pause_uploads_on_idle = config.capture.pause_uploads_on_idle;
 
         Self {
             config,
@@ -196,6 +214,10 @@ impl SyncEngine {
             upload_rx: Some(upload_rx),
             notification_rx: Some(notification_rx),
             pending_display_refresh: None,
+            last_activity_time: Instant::now(),
+            idle_paused: false,
+            idle_timeout,
+            pause_uploads_on_idle,
         }
     }
 
@@ -528,6 +550,22 @@ impl SyncEngine {
                 } => {
                     self.retry_display_refresh();
                 }
+
+                // Handle idle timeout (activity-gated capture)
+                _ = async {
+                    // Only run idle timer if:
+                    // - Idle timeout is enabled (non-zero)
+                    // - Not already paused (either manually or idle-paused)
+                    // - Recording is active
+                    if self.idle_timeout.is_zero() || self.is_paused || self.current_session.is_none() {
+                        std::future::pending::<()>().await
+                    } else {
+                        let deadline = self.last_activity_time + self.idle_timeout;
+                        tokio::time::sleep_until(deadline).await
+                    }
+                } => {
+                    self.handle_idle_timeout();
+                }
             }
         }
 
@@ -770,6 +808,8 @@ impl SyncEngine {
         self.current_session = Some(session);
         self.event_buffer.clear();
         self.is_paused = false; // Ensure not paused when starting
+        self.idle_paused = false; // Ensure not idle-paused when starting
+        self.last_activity_time = Instant::now(); // Reset activity timer
 
         let _ = self.status_tx.send(EngineStatus::Capturing { event_count: 0 });
 
@@ -856,6 +896,7 @@ impl SyncEngine {
         self.main_session_id = None;
         self.segment_index = 0;
         self.is_paused = false; // Reset paused state when stopping
+        self.idle_paused = false; // Reset idle-paused state when stopping
         
         // Clear the original display since we're no longer recording
         self.display_monitor.clear_original_display();
@@ -1107,6 +1148,51 @@ impl SyncEngine {
         }
     }
 
+    /// Handle idle timeout - pause recording when user is inactive
+    ///
+    /// Called when no user activity (keyboard/mouse) has been detected
+    /// for the configured idle_timeout duration. Pauses both video recording
+    /// and input capture to save resources and storage.
+    fn handle_idle_timeout(&mut self) {
+        // Don't pause if already paused or no recording in progress
+        if self.current_session.is_none() || self.is_paused {
+            return;
+        }
+
+        info!(
+            "User idle for {:?}, pausing capture...",
+            self.idle_timeout
+        );
+
+        self.idle_paused = true;
+        self.pause_recording();
+
+        // Show notification if enabled
+        if self.config.recording.notify_on_start_stop && notifications_authorized() {
+            show_idle_paused_notification();
+        }
+    }
+
+    /// Resume recording after idle-pause when user activity is detected
+    ///
+    /// Called when any user input is detected while in idle-paused state.
+    /// Resumes video recording and input capture.
+    fn resume_from_idle(&mut self) {
+        if !self.idle_paused {
+            return;
+        }
+
+        info!("User activity detected, resuming capture from idle...");
+
+        self.idle_paused = false;
+        self.resume_recording();
+
+        // Show notification if enabled
+        if self.config.recording.notify_on_start_stop && notifications_authorized() {
+            show_idle_resumed_notification();
+        }
+    }
+
     /// Poll the frontmost application and update capture state
     async fn poll_frontmost_app(&mut self) {
         // Don't update capture state if paused
@@ -1166,6 +1252,15 @@ impl SyncEngine {
 
     /// Handle an input event
     async fn handle_input_event(&mut self, event: InputEvent) {
+        // Always update last activity time for idle detection
+        // This happens regardless of whether capture is enabled
+        self.last_activity_time = Instant::now();
+
+        // Auto-resume from idle if we were idle-paused
+        if self.idle_paused {
+            self.resume_from_idle();
+        }
+
         // Only buffer events if capture is enabled
         if !self.capture_enabled {
             return;
