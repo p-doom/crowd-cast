@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use config::Config;
-use installer::{needs_setup, run_wizard_async};
+use installer::{needs_setup, run_wizard_gui};
 use sync::{create_engine_channels, EngineCommand, SyncEngine};
 
 /// Main entry point, runs tray on main thread (required for macOS)
@@ -61,11 +61,11 @@ fn main() -> Result<()> {
     // Run setup wizard if needed
     if force_setup || needs_setup(&config) {
         info!("Running setup wizard...");
-        let result = runtime.block_on(run_wizard_async(&mut config))?;
+        let result = run_wizard_gui(&mut config)?;
 
-        if !result.success {
-            error!("Setup wizard did not complete successfully");
-            std::process::exit(1);
+        if !result.completed {
+            info!("Setup wizard was cancelled");
+            std::process::exit(0);
         }
 
         info!("Setup completed successfully");

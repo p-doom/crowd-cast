@@ -250,6 +250,95 @@ pub fn open_screen_recording_settings() -> Result<()> {
     Ok(())
 }
 
+/// Prompt for accessibility permission only (shows system dialog)
+/// Returns true if already granted, false otherwise
+#[cfg(target_os = "macos")]
+pub fn prompt_accessibility_permission() -> bool {
+    use std::ffi::c_void;
+    
+    type CFAllocatorRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFBooleanRef = *const c_void;
+    type CFIndex = isize;
+    
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
+    }
+    
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFAllocatorDefault: CFAllocatorRef;
+        static kCFBooleanTrue: CFBooleanRef;
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+        
+        fn CFStringCreateWithCString(
+            alloc: CFAllocatorRef,
+            c_str: *const i8,
+            encoding: u32,
+        ) -> CFStringRef;
+        
+        fn CFDictionaryCreate(
+            allocator: CFAllocatorRef,
+            keys: *const *const c_void,
+            values: *const *const c_void,
+            num_values: CFIndex,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CFDictionaryRef;
+        
+        fn CFRelease(cf: *const c_void);
+    }
+    
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
+    
+    unsafe {
+        let key_cstr = b"AXTrustedCheckOptionPrompt\0".as_ptr() as *const i8;
+        let key = CFStringCreateWithCString(kCFAllocatorDefault, key_cstr, K_CF_STRING_ENCODING_UTF8);
+        
+        if key.is_null() {
+            return false;
+        }
+        
+        let keys: [*const c_void; 1] = [key];
+        let values: [*const c_void; 1] = [kCFBooleanTrue];
+        
+        let dict = CFDictionaryCreate(
+            kCFAllocatorDefault,
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+            &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+        );
+        
+        let trusted = if !dict.is_null() {
+            let result = AXIsProcessTrustedWithOptions(dict);
+            CFRelease(dict);
+            result
+        } else {
+            false
+        };
+        
+        CFRelease(key);
+        trusted
+    }
+}
+
+/// Prompt for screen recording permission only (shows system dialog)
+/// Returns true if granted, false otherwise
+#[cfg(target_os = "macos")]
+pub fn prompt_screen_recording_permission() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+    
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
 // ============================================================================
 // Linux Implementation
 // ============================================================================
