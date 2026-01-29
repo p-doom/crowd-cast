@@ -89,7 +89,7 @@ static BOOL g_wizard_running = NO;
     // Bottom bar with buttons
     NSView *bottomBar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 550, 60)];
     bottomBar.wantsLayer = YES;
-    bottomBar.layer.backgroundColor = [[NSColor colorWithWhite:0.95 alpha:1.0] CGColor];
+    bottomBar.layer.backgroundColor = [[NSColor windowBackgroundColor] CGColor];
     [mainView addSubview:bottomBar];
     
     // Separator line
@@ -251,8 +251,8 @@ static BOOL g_wizard_running = NO;
     // Background box
     NSBox *box = [[NSBox alloc] initWithFrame:NSMakeRect(40, y, 470, 60)];
     box.boxType = NSBoxCustom;
-    box.fillColor = [NSColor colorWithWhite:0.97 alpha:1.0];
-    box.borderColor = [NSColor colorWithWhite:0.9 alpha:1.0];
+    box.fillColor = [NSColor controlBackgroundColor];
+    box.borderColor = [NSColor separatorColor];
     box.borderWidth = 1;
     box.cornerRadius = 8;
     box.titlePosition = NSNoTitle;
@@ -601,8 +601,8 @@ static BOOL g_wizard_running = NO;
     // Autostart checkbox in a box
     NSBox *box = [[NSBox alloc] initWithFrame:NSMakeRect(100, 150, 350, 80)];
     box.boxType = NSBoxCustom;
-    box.fillColor = [NSColor colorWithWhite:0.97 alpha:1.0];
-    box.borderColor = [NSColor colorWithWhite:0.9 alpha:1.0];
+    box.fillColor = [NSColor controlBackgroundColor];
+    box.borderColor = [NSColor separatorColor];
     box.borderWidth = 1;
     box.cornerRadius = 8;
     box.titlePosition = NSNoTitle;
@@ -656,8 +656,8 @@ static BOOL g_wizard_running = NO;
     // Summary box (will be populated when shown)
     NSBox *box = [[NSBox alloc] initWithFrame:NSMakeRect(80, 80, 390, 180)];
     box.boxType = NSBoxCustom;
-    box.fillColor = [NSColor colorWithWhite:0.97 alpha:1.0];
-    box.borderColor = [NSColor colorWithWhite:0.9 alpha:1.0];
+    box.fillColor = [NSColor controlBackgroundColor];
+    box.borderColor = [NSColor separatorColor];
     box.borderWidth = 1;
     box.cornerRadius = 8;
     box.titlePosition = NSNoTitle;
