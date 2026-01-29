@@ -299,6 +299,43 @@ impl RecordingOutput {
             .is_active()
             .map_err(|e| anyhow::anyhow!("Failed to check output status: {}", e))
     }
+
+    /// Pause recording
+    pub fn pause(&mut self) -> Result<()> {
+        if self.state != RecordingState::Recording {
+            debug!("Cannot pause - not recording");
+            return Ok(());
+        }
+
+        info!("Pausing recording");
+        self.output
+            .pause(true)
+            .map_err(|e| anyhow::anyhow!("Failed to pause recording: {}", e))?;
+
+        self.state = RecordingState::Paused;
+        Ok(())
+    }
+
+    /// Resume recording
+    pub fn resume(&mut self) -> Result<()> {
+        if self.state != RecordingState::Paused {
+            debug!("Cannot resume - not paused");
+            return Ok(());
+        }
+
+        info!("Resuming recording");
+        self.output
+            .pause(false)
+            .map_err(|e| anyhow::anyhow!("Failed to resume recording: {}", e))?;
+
+        self.state = RecordingState::Recording;
+        Ok(())
+    }
+
+    /// Check if recording is paused
+    pub fn is_paused(&self) -> bool {
+        self.state == RecordingState::Paused
+    }
 }
 
 /// Builder for RecordingOutput with fluent API

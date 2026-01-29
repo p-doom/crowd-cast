@@ -23,6 +23,7 @@ static CMD_SENDER: Mutex<Option<mpsc::Sender<EngineCommand>>> = Mutex::new(None)
 enum TrayIconState {
     Idle,
     Recording,
+    Paused,
     Blocked,
 }
 
@@ -51,6 +52,7 @@ impl TrayIconSet {
         match state {
             TrayIconState::Idle => self.idle.as_ptr(),
             TrayIconState::Recording => self.recording.as_ptr(),
+            TrayIconState::Paused => self.idle.as_ptr(), // Use idle (grey) icon when paused
             TrayIconState::Blocked => self.blocked.as_ptr(),
         }
     }
@@ -90,31 +92,35 @@ impl TrayApp {
 
         // Create menu items
         // Menu strings must be kept alive
+        // Note: We use indices to update text dynamically based on state
         let status_text = CString::new("Status: Idle")?;
         let separator = CString::new("-")?;
-        let start_text = CString::new("Start Recording")?;
-        let stop_text = CString::new("Stop Recording")?;
-        let pause_capture_text = CString::new("Pause Capture")?;
-        let resume_capture_text = CString::new("Resume Capture")?;
+        let start_text = CString::new("Start Recording")?;    // Index 2 - shown when idle
+        let pause_text = CString::new("Pause Recording")?;    // Index 3 - shown when recording
+        let resume_text = CString::new("Resume Recording")?;  // Index 4 - shown when paused
+        let stop_text = CString::new("Stop Recording")?;      // Index 5 - shown when recording/paused
+        let refresh_text = CString::new("Refresh Sources")?;  // Index 6 - always available
         let config_text = CString::new("Open Config")?;
         let quit_text = CString::new("Quit")?;
 
         let menu_strings = vec![
-            status_text,
-            separator.clone(),
-            start_text,
-            stop_text,
-            separator.clone(),
-            pause_capture_text,
-            resume_capture_text,
-            separator.clone(),
-            config_text,
-            separator,
-            quit_text,
+            status_text,      // 0
+            separator.clone(), // 1
+            start_text,       // 2
+            pause_text,       // 3
+            resume_text,      // 4
+            stop_text,        // 5
+            separator.clone(), // 6
+            refresh_text,     // 7
+            separator.clone(), // 8
+            config_text,      // 9
+            separator.clone(), // 10
+            quit_text,        // 11
         ];
 
         // Build menu items array (NULL-terminated)
-        // Indices: 0=status, 1=sep, 2=start, 3=stop, 4=sep, 5=pause, 6=resume, 7=sep, 8=config, 9=sep, 10=quit
+        // Menu indices: 0=status, 1=sep, 2=start, 3=pause, 4=resume, 5=stop, 6=sep, 7=refresh, 8=sep, 9=config, 10=sep, 11=quit
+        // Initially: Start visible, Pause/Resume/Stop hidden (idle state)
         let mut menu_items = vec![
             TrayMenuItem {
                 text: menu_strings[0].as_ptr(), // Status
@@ -131,63 +137,70 @@ impl TrayApp {
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[2].as_ptr(), // Start Recording
+                text: menu_strings[2].as_ptr(), // Start Recording (visible when idle)
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_start_capture),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[3].as_ptr(), // Stop Recording
-                disabled: 0,
+                text: menu_strings[3].as_ptr(), // Pause Recording (visible when recording)
+                disabled: 1, // Initially hidden (disabled) - idle state
+                checked: 0,
+                cb: Some(on_pause_recording),
+                submenu: std::ptr::null_mut(),
+            },
+            TrayMenuItem {
+                text: menu_strings[4].as_ptr(), // Resume Recording (visible when paused)
+                disabled: 1, // Initially hidden (disabled) - idle state
+                checked: 0,
+                cb: Some(on_resume_recording),
+                submenu: std::ptr::null_mut(),
+            },
+            TrayMenuItem {
+                text: menu_strings[5].as_ptr(), // Stop Recording (visible when recording/paused)
+                disabled: 1, // Initially hidden (disabled) - idle state
                 checked: 0,
                 cb: Some(on_stop_capture),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[4].as_ptr(), // separator
+                text: menu_strings[6].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[5].as_ptr(), // Pause Capture (manual mode)
+                text: menu_strings[7].as_ptr(), // Refresh Sources
                 disabled: 0,
                 checked: 0,
-                cb: Some(on_pause_capture),
+                cb: Some(on_refresh_sources),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[6].as_ptr(), // Resume Capture (manual mode)
-                disabled: 0,
-                checked: 0,
-                cb: Some(on_resume_capture),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[7].as_ptr(), // separator
+                text: menu_strings[8].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[8].as_ptr(), // Open Config
+                text: menu_strings[9].as_ptr(), // Open Config
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_open_config),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[9].as_ptr(), // separator
+                text: menu_strings[10].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[10].as_ptr(), // Quit
+                text: menu_strings[11].as_ptr(), // Quit
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_quit),
@@ -278,42 +291,83 @@ impl TrayApp {
 
     /// Update the status display based on engine status
     fn update_status(&mut self, status: &EngineStatus) {
-        let (status_text, icon_state) = match status {
-            EngineStatus::Idle => ("Status: Idle".to_string(), TrayIconState::Idle),
+        // Determine status text, icon state, and menu state
+        #[derive(Clone, Copy, PartialEq)]
+        enum MenuState {
+            Idle,       // Show: Start
+            Recording,  // Show: Pause, Stop
+            Paused,     // Show: Resume, Stop
+        }
+
+        let (status_text, icon_state, menu_state) = match status {
+            EngineStatus::Idle => ("Status: Idle".to_string(), TrayIconState::Idle, MenuState::Idle),
             EngineStatus::Capturing { event_count } => {
                 (
                     format!("Status: Capturing ({} events)", event_count),
                     TrayIconState::Recording,
+                    MenuState::Recording,
                 )
+            }
+            EngineStatus::Paused => {
+                ("Status: Paused".to_string(), TrayIconState::Paused, MenuState::Paused)
             }
             EngineStatus::RecordingBlocked => {
                 (
                     "Status: Recording (no capture sources)".to_string(),
                     TrayIconState::Blocked,
+                    MenuState::Recording,
                 )
             }
             EngineStatus::WaitingForOBS => {
-                ("Status: Waiting for OBS...".to_string(), TrayIconState::Blocked)
+                ("Status: Waiting for OBS...".to_string(), TrayIconState::Blocked, MenuState::Idle)
             }
             EngineStatus::Uploading { chunk_id } => (
                 format!("Status: Uploading {}", chunk_id),
                 TrayIconState::Idle,
+                MenuState::Idle,
             ),
             EngineStatus::Error(msg) => {
                 (
                     format!("Status: Error - {}", truncate_str(msg, 30)),
                     TrayIconState::Idle,
+                    MenuState::Idle,
                 )
             }
         };
 
-        // Update the status menu item text
+        // Update the status menu item text and menu item visibility
         if let Ok(new_text) = CString::new(status_text.as_bytes()) {
-            // We need to update the menu string and refresh
-            // For simplicity, we store the new string and update the pointer
             if !self._menu_strings.is_empty() {
+                // Update status text
                 self._menu_strings[0] = new_text;
                 self._menu_items[0].text = self._menu_strings[0].as_ptr();
+
+                // Update menu item visibility based on state
+                // Menu indices: 2=start, 3=pause, 4=resume, 5=stop
+                match menu_state {
+                    MenuState::Idle => {
+                        // Show: Start, Hide: Pause, Resume, Stop
+                        self._menu_items[2].disabled = 0; // Start - enabled
+                        self._menu_items[3].disabled = 1; // Pause - disabled
+                        self._menu_items[4].disabled = 1; // Resume - disabled
+                        self._menu_items[5].disabled = 1; // Stop - disabled
+                    }
+                    MenuState::Recording => {
+                        // Show: Pause, Stop, Hide: Start, Resume
+                        self._menu_items[2].disabled = 1; // Start - disabled
+                        self._menu_items[3].disabled = 0; // Pause - enabled
+                        self._menu_items[4].disabled = 1; // Resume - disabled
+                        self._menu_items[5].disabled = 0; // Stop - enabled
+                    }
+                    MenuState::Paused => {
+                        // Show: Resume, Stop, Hide: Start, Pause
+                        self._menu_items[2].disabled = 1; // Start - disabled
+                        self._menu_items[3].disabled = 1; // Pause - disabled
+                        self._menu_items[4].disabled = 0; // Resume - enabled
+                        self._menu_items[5].disabled = 0; // Stop - enabled
+                    }
+                }
+
                 self.tray.menu = self._menu_items.as_mut_ptr();
                 self.tray.icon_filepath = self._icons.path_for(icon_state);
                 unsafe {
@@ -356,20 +410,29 @@ unsafe extern "C" fn on_stop_capture(_item: *mut TrayMenuItem) {
     }
 }
 
-unsafe extern "C" fn on_pause_capture(_item: *mut TrayMenuItem) {
-    info!("Pause capture requested via tray (manual mode)");
+unsafe extern "C" fn on_pause_recording(_item: *mut TrayMenuItem) {
+    info!("Pause recording requested via tray");
     if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
-        if let Err(e) = sender.try_send(EngineCommand::SetCaptureEnabled(false)) {
-            error!("Failed to send pause capture command: {}", e);
+        if let Err(e) = sender.try_send(EngineCommand::PauseRecording) {
+            error!("Failed to send pause recording command: {}", e);
         }
     }
 }
 
-unsafe extern "C" fn on_resume_capture(_item: *mut TrayMenuItem) {
-    info!("Resume capture requested via tray (manual mode)");
+unsafe extern "C" fn on_resume_recording(_item: *mut TrayMenuItem) {
+    info!("Resume recording requested via tray");
     if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
-        if let Err(e) = sender.try_send(EngineCommand::SetCaptureEnabled(true)) {
-            error!("Failed to send resume capture command: {}", e);
+        if let Err(e) = sender.try_send(EngineCommand::ResumeRecording) {
+            error!("Failed to send resume recording command: {}", e);
+        }
+    }
+}
+
+unsafe extern "C" fn on_refresh_sources(_item: *mut TrayMenuItem) {
+    info!("Refresh sources requested via tray");
+    if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
+        if let Err(e) = sender.try_send(EngineCommand::RefreshSources) {
+            error!("Failed to send refresh sources command: {}", e);
         }
     }
 }

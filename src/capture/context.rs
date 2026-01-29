@@ -539,6 +539,53 @@ impl CaptureContext {
         self.recording.as_ref().map_or(false, |r| r.is_recording())
     }
 
+    /// Pause recording
+    pub fn pause_recording(&mut self) -> Result<()> {
+        let recording = match self.recording.as_mut() {
+            Some(r) => r,
+            None => {
+                debug!("No recording in progress to pause");
+                return Ok(());
+            }
+        };
+
+        recording.pause()?;
+
+        // Update state
+        if let Ok(mut state) = self.state.write() {
+            state.recording.is_paused = true;
+            state.should_capture = false;
+        }
+
+        Ok(())
+    }
+
+    /// Resume recording
+    pub fn resume_recording(&mut self) -> Result<()> {
+        let recording = match self.recording.as_mut() {
+            Some(r) => r,
+            None => {
+                debug!("No recording in progress to resume");
+                return Ok(());
+            }
+        };
+
+        recording.resume()?;
+
+        // Update state
+        if let Ok(mut state) = self.state.write() {
+            state.recording.is_paused = false;
+            state.should_capture = state.recording.is_recording && state.any_source_active;
+        }
+
+        Ok(())
+    }
+
+    /// Check if recording is paused
+    pub fn is_paused(&self) -> bool {
+        self.recording.as_ref().map_or(false, |r| r.is_paused())
+    }
+
     /// Get the current recording session info
     pub fn current_session(&self) -> Option<&RecordingSession> {
         self.current_session.as_ref()

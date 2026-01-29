@@ -11,8 +11,12 @@ pub enum EngineCommand {
     StartRecording,
     /// Manually stop recording
     StopRecording,
-    /// Set capture enabled state
-    SetCaptureEnabled(bool),
+    /// Pause recording (both video and keylog)
+    PauseRecording,
+    /// Resume recording (both video and keylog)
+    ResumeRecording,
+    /// Refresh capture sources (recreate them with current display)
+    RefreshSources,
     /// User requested switch to a specific display (from notification action)
     SwitchToDisplay { display_id: u32 },
     /// Shutdown the engine
@@ -29,6 +33,8 @@ pub enum EngineStatus {
         /// Number of events captured in current chunk
         event_count: usize,
     },
+    /// Recording is paused (both video and keylog)
+    Paused,
     /// Recording is active but sources are not working
     RecordingBlocked,
     /// Waiting for libobs to be ready

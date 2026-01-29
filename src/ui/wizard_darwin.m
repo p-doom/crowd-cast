@@ -867,8 +867,10 @@ static BOOL g_wizard_running = NO;
     // Close window immediately so user sees feedback
     [self.window orderOut:nil];
     
-    // Stop modal after a tiny delay to let the window hide
-    [self performSelector:@selector(stopModalNow) withObject:nil afterDelay:0.01];
+    // Stop modal - use dispatch_async to ensure it runs on main thread after current event
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self stopModalNow];
+    });
 }
 
 - (void)finishWizard {
@@ -896,8 +898,10 @@ static BOOL g_wizard_running = NO;
     // Close window immediately so user sees feedback
     [self.window orderOut:nil];
     
-    // Stop modal after a tiny delay to let the window hide
-    [self performSelector:@selector(stopModalNow) withObject:nil afterDelay:0.01];
+    // Stop modal - use dispatch_async to ensure it runs on main thread after current event
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self stopModalNow];
+    });
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
