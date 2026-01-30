@@ -8,6 +8,7 @@ mod config;
 mod data;
 mod input;
 mod installer;
+mod logging;
 mod sync;
 mod ui;
 mod upload;
@@ -16,7 +17,6 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use config::Config;
 use installer::{needs_setup, run_wizard_gui};
@@ -25,10 +25,7 @@ use sync::{create_engine_channels, EngineCommand, SyncEngine};
 /// Main entry point, runs tray on main thread (required for macOS)
 fn main() -> Result<()> {
     // Initialize logging
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    let _log_guard = logging::init_logging()?;
 
     info!("crowd-cast Agent starting...");
 
@@ -245,6 +242,8 @@ fn print_help() {
     println!();
     println!("ENVIRONMENT:");
     println!("    RUST_LOG      Set log level (e.g., debug, info, warn)");
+    println!("    CROWD_CAST_LOG_PATH");
+    println!("                  Override log directory (default: ~/Library/Logs/crowd-cast on macOS)");
     println!();
     println!("For more information, visit: https://github.com/crowd-cast/crowd-cast");
 }
