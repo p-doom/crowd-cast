@@ -25,12 +25,14 @@ use crate::capture::{
 use crate::config::Config;
 use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
 use crate::input::{create_input_backend, InputBackend};
+use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
     is_authorized as notifications_authorized, show_capture_resumed_notification,
     show_display_change_notification, show_idle_paused_notification,
     show_idle_resumed_notification, show_recording_paused_notification,
     show_recording_resumed_notification, show_recording_started_notification,
     show_recording_stopped_notification, show_sources_refreshed_notification,
+    show_permissions_missing_notification,
     NotificationAction,
 };
 use crate::upload::Uploader;
@@ -451,7 +453,7 @@ impl SyncEngine {
                 error!("Failed to autostart recording: {}", e);
                 let _ = self
                     .status_tx
-                    .send(EngineStatus::Error("Autostart recording failed".to_string()));
+                    .send(EngineStatus::Error(format!("Autostart recording failed: {}", e)));
             } else {
                 // Initialize segment timer after successful autostart
                 // Use interval_at to delay first tick (interval() ticks immediately)
@@ -468,12 +470,19 @@ impl SyncEngine {
                 Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         EngineCommand::StartRecording => {
-                            self.start_recording().await?;
-                            // Reset segment timer when recording starts to ensure full-length first segment
-                            // Use interval_at to delay first tick (interval() ticks immediately)
-                            if self.segment_duration_secs > 0 {
-                                let duration = Duration::from_secs(self.segment_duration_secs);
-                                segment_timer = Some(tokio::time::interval_at(Instant::now() + duration, duration));
+                            if let Err(e) = self.start_recording().await {
+                                error!("Failed to start recording: {}", e);
+                                let _ = self.status_tx.send(EngineStatus::Error(format!(
+                                    "Start recording failed: {}",
+                                    e
+                                )));
+                            } else {
+                                // Reset segment timer when recording starts to ensure full-length first segment
+                                // Use interval_at to delay first tick (interval() ticks immediately)
+                                if self.segment_duration_secs > 0 {
+                                    let duration = Duration::from_secs(self.segment_duration_secs);
+                                    segment_timer = Some(tokio::time::interval_at(Instant::now() + duration, duration));
+                                }
                             }
                         }
                         EngineCommand::StopRecording => {
@@ -760,6 +769,18 @@ impl SyncEngine {
         if self.current_session.is_some() {
             warn!("Recording already in progress");
             return Ok(());
+        }
+
+        let missing = describe_missing_permissions();
+        if !missing.is_empty() {
+            let details = missing.join(" ");
+            let message = format!("Recording not started. {}", details);
+            warn!("{}", message);
+            let _ = self.status_tx.send(EngineStatus::Error(message.clone()));
+            if self.config.recording.notify_on_start_stop && notifications_authorized() {
+                show_permissions_missing_notification(&message);
+            }
+            return Err(anyhow::anyhow!("{}", message));
         }
 
         info!("Starting recording...");

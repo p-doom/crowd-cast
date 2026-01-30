@@ -281,6 +281,38 @@ void notifications_show_recording_resumed(void) {
     }
 }
 
+// Show a notification when recording is blocked by missing permissions
+void notifications_show_permissions_missing(const char* message) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"Permissions Required";
+        if (message) {
+            content.body = [NSString stringWithUTF8String:message];
+        } else {
+            content.body = @"Recording not started. Required permissions are missing.";
+        }
+
+        // Create request with unique identifier
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil]; // Deliver immediately
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
 // Show a notification when OBS download starts
 void notifications_show_obs_download_started(void) {
     if (!g_initialized) {

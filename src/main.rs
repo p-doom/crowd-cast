@@ -38,6 +38,7 @@ fn main() -> Result<()> {
     }
 
     let force_setup = args.iter().any(|a| a == "--setup" || a == "-s");
+    let missing_permissions = !installer::all_permissions_granted();
 
     // Create tokio runtime for async operations
     let runtime = tokio::runtime::Runtime::new()?;
@@ -56,7 +57,7 @@ fn main() -> Result<()> {
     info!("Configuration loaded from {:?}", config.config_path());
 
     // Run setup wizard if needed
-    if force_setup || needs_setup(&config) {
+    if force_setup || needs_setup(&config) || missing_permissions {
         info!("Running setup wizard...");
         let result = run_wizard_gui(&mut config)?;
 
