@@ -54,13 +54,16 @@ if [ -f "assets/logo.png" ]; then
     echo "Copied tray icon"
 fi
 
-# Copy OBS frameworks
+# Copy only required OBS frameworks (avoid bundling CEF/Qt)
 echo "Copying OBS frameworks..."
-for framework in "${TARGET_DIR}"/*.framework; do
-    if [ -d "$framework" ]; then
-        framework_name=$(basename "$framework")
+FRAMEWORKS_TO_COPY=("libobs.framework")
+for framework_name in "${FRAMEWORKS_TO_COPY[@]}"; do
+    framework_path="${TARGET_DIR}/${framework_name}"
+    if [ -d "$framework_path" ]; then
         echo "  Copying $framework_name"
-        cp -R "$framework" "$APP_DIR/Contents/Frameworks/"
+        cp -R "$framework_path" "$APP_DIR/Contents/Frameworks/"
+    else
+        echo "  Warning: $framework_name not found in ${TARGET_DIR}"
     fi
 done
 

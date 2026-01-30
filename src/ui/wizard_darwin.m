@@ -959,7 +959,8 @@ int wizard_run(WizardConfig *config) {
     @autoreleasepool {
         // Ensure NSApplication is initialized
         NSApplication *app = [NSApplication sharedApplication];
-        [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+        // Use Accessory policy - allows windows without dock icon
+        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
         
         // Create and show wizard
         WizardWindowController *wizard = [[WizardWindowController alloc] init];
@@ -977,6 +978,21 @@ int wizard_run(WizardConfig *config) {
         [app runModalForWindow:wizard.window];
         
         [[NSNotificationCenter defaultCenter] removeObserver:wizard];
+        
+        // Properly close the window (not just hide it) to release graphics resources
+        [wizard.window close];
+        
+        // Drain pending events to reset run loop state before OBS initialization.
+        NSEvent *event;
+        while ((event = [app nextEventMatchingMask:NSEventMaskAny
+                                         untilDate:nil
+                                            inMode:NSDefaultRunLoopMode
+                                           dequeue:YES])) {
+            [app sendEvent:event];
+        }
+        
+        // Reset activation policy to Prohibited (no UI) - OBS will set up its own state
+        [app setActivationPolicy:NSApplicationActivationPolicyProhibited];
     }
     
     g_wizard_running = NO;
