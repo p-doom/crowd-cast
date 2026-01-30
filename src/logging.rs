@@ -9,6 +9,11 @@ const LOG_FILE_BASENAME: &str = "crowd-cast.log";
 const LOG_DIR_ENV: &str = "CROWD_CAST_LOG_PATH";
 const LOG_RETENTION_DAYS: u64 = 7;
 
+/// Bundle identifier matching Info.plist CFBundleIdentifier.
+/// Used as the subsystem for macOS unified logging (os_log).
+#[cfg(target_os = "macos")]
+const OSLOG_SUBSYSTEM: &str = "dev.crowd-cast.agent";
+
 pub fn init_logging() -> Result<WorkerGuard> {
     let log_dir = resolve_log_dir()?;
     std::fs::create_dir_all(&log_dir)
@@ -22,10 +27,30 @@ pub fn init_logging() -> Result<WorkerGuard> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking).with_ansi(false))
-        .init();
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false);
+
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, add unified logging (os_log) layer alongside file logging.
+        // Logs will appear in Console.app and `log stream --predicate 'subsystem == "dev.crowd-cast.agent"'`
+        let oslog_layer = tracing_oslog::OsLogger::new(OSLOG_SUBSYSTEM, "default");
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .with(oslog_layer)
+            .init();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .init();
+    }
 
     Ok(guard)
 }
