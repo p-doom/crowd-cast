@@ -14,6 +14,11 @@ const LOG_RETENTION_DAYS: u64 = 7;
 #[cfg(target_os = "macos")]
 const OSLOG_SUBSYSTEM: &str = "dev.crowd-cast.agent";
 
+/// Get the log directory path
+pub fn get_log_dir() -> Result<PathBuf> {
+    resolve_log_dir()
+}
+
 pub fn init_logging() -> Result<WorkerGuard> {
     let log_dir = resolve_log_dir()?;
     std::fs::create_dir_all(&log_dir)

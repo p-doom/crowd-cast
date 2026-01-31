@@ -44,7 +44,7 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
         displayId = [displayIdNum unsignedIntValue];
     }
     
-    // Call the Rust callback if set (informational notifications - just track dismissal)
+    // Call the Rust callback if set
     if (g_action_callback) {
         if ([actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier]) {
             // User tapped the notification itself
@@ -81,7 +81,7 @@ int notifications_init(NotificationActionCallback callback) {
         // Create category for display change notifications (informational, no action buttons)
         UNNotificationCategory *displayChangeCategory = [UNNotificationCategory
             categoryWithIdentifier:CATEGORY_DISPLAY_CHANGE
-            actions:@[]  // No action buttons - auto-switch already happened
+            actions:@[]
             intentIdentifiers:@[]
             options:UNNotificationCategoryOptionNone];
         
@@ -117,8 +117,9 @@ void notifications_show_display_change(const char* from_display, const char* to_
     @autoreleasepool {
         UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
         content.title = @"Display Changed";
-        content.body = [NSString stringWithFormat:@"Now recording on %s (was %s).",
-                        to_display, from_display];
+        content.body = [NSString stringWithFormat:
+            @"Display changed: %s (was %s). Finalizing and restarting recording to match the new display.",
+            to_display, from_display];
         content.categoryIdentifier = CATEGORY_DISPLAY_CHANGE;
         content.userInfo = @{
             @"display_id": @(to_display_id),
@@ -152,7 +153,7 @@ void notifications_show_capture_resumed(const char* display_name) {
     @autoreleasepool {
         UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
         content.title = @"Capture Resumed";
-        content.body = [NSString stringWithFormat:@"Recording on %s", display_name];
+        content.body = [NSString stringWithFormat:@"Recording restarted on %s", display_name];
         // Create request with unique identifier
         NSString *identifier = [[NSUUID UUID] UUIDString];
         UNNotificationRequest *request = [UNNotificationRequest

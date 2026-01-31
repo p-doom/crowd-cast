@@ -338,3 +338,50 @@ pub fn get_main_display_uuid() -> Result<String> {
 pub fn get_main_display_uuid() -> Result<String> {
     anyhow::bail!("Display UUID not available on this platform")
 }
+
+/// Get the actual resolution of the main display
+///
+/// On macOS, this returns the pixel dimensions of the current display mode,
+/// which correctly handles Retina displays and different scaling settings.
+/// This is more accurate than OBS's default video info which may not reflect
+/// the actual display configuration.
+#[cfg(target_os = "macos")]
+pub fn get_main_display_resolution() -> Result<(u32, u32)> {
+    use core_graphics::display::CGDisplay;
+    use std::ffi::c_void;
+
+    // FFI declarations for CGDisplayMode functions
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGDisplayCopyDisplayMode(display: u32) -> *const c_void;
+        fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
+        fn CGDisplayModeGetPixelHeight(mode: *const c_void) -> usize;
+        fn CGDisplayModeRelease(mode: *const c_void);
+    }
+
+    let main_display_id = CGDisplay::main().id;
+
+    unsafe {
+        let mode = CGDisplayCopyDisplayMode(main_display_id);
+        if mode.is_null() {
+            anyhow::bail!("Failed to get display mode for main display (ID: {})", main_display_id);
+        }
+
+        let width = CGDisplayModeGetPixelWidth(mode) as u32;
+        let height = CGDisplayModeGetPixelHeight(mode) as u32;
+        
+        CGDisplayModeRelease(mode);
+
+        if width == 0 || height == 0 {
+            anyhow::bail!("Invalid display dimensions: {}x{}", width, height);
+        }
+
+        Ok((width, height))
+    }
+}
+
+/// Get the actual resolution of the main display (non-macOS fallback)
+#[cfg(not(target_os = "macos"))]
+pub fn get_main_display_resolution() -> Result<(u32, u32)> {
+    anyhow::bail!("Display resolution detection not available on this platform")
+}

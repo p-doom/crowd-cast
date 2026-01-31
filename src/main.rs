@@ -5,6 +5,7 @@
 
 mod capture;
 mod config;
+mod crash;
 mod data;
 mod input;
 mod installer;
@@ -26,6 +27,17 @@ use sync::{create_engine_channels, EngineCommand, SyncEngine};
 fn main() -> Result<()> {
     // Initialize logging
     let _log_guard = logging::init_logging()?;
+
+    // Initialize crash handler (must be after logging so we have the log directory)
+    let log_dir = logging::get_log_dir()?;
+    match crash::init_crash_handler(&log_dir) {
+        Ok(crash_log_path) => {
+            info!("Crash handler initialized, crash log: {:?}", crash_log_path);
+        }
+        Err(e) => {
+            warn!("Failed to initialize crash handler: {} (crashes may not be logged)", e);
+        }
+    }
 
     info!("crowd-cast Agent starting...");
 

@@ -1,7 +1,7 @@
 //! macOS notification support using UNUserNotificationCenter
 //!
 //! Provides informational notifications for display changes and recording state.
-//! Since display switching is now automatic, notifications are purely informational.
+//! Since display switching is automatic, notifications are purely informational.
 
 use std::ffi::CString;
 use std::sync::OnceLock;
@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 /// Actions that can be triggered from notifications
 #[derive(Debug, Clone)]
 pub enum NotificationAction {
-    /// User dismissed or tapped the notification (informational only)
+    /// User dismissed or tapped the notification
     Dismissed,
 }
 
