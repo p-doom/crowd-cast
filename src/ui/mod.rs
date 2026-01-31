@@ -8,6 +8,7 @@ pub use tray::*;
 pub use notifications::{
     init_notifications, is_authorized as notifications_authorized,
     show_capture_resumed_notification, show_display_change_notification,
+    show_permissions_missing_notification,
     show_recording_started_notification, show_recording_stopped_notification,
     show_obs_download_started_notification, show_setup_configuring_notification,
     show_sources_refreshed_notification,

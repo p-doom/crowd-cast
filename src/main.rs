@@ -5,9 +5,11 @@
 
 mod capture;
 mod config;
+mod crash;
 mod data;
 mod input;
 mod installer;
+mod logging;
 mod sync;
 mod ui;
 mod upload;
@@ -16,7 +18,6 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use config::Config;
 use installer::{needs_setup, run_wizard_gui};
@@ -25,10 +26,18 @@ use sync::{create_engine_channels, EngineCommand, SyncEngine};
 /// Main entry point, runs tray on main thread (required for macOS)
 fn main() -> Result<()> {
     // Initialize logging
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    let _log_guard = logging::init_logging()?;
+
+    // Initialize crash handler (must be after logging so we have the log directory)
+    let log_dir = logging::get_log_dir()?;
+    match crash::init_crash_handler(&log_dir) {
+        Ok(crash_log_path) => {
+            info!("Crash handler initialized, crash log: {:?}", crash_log_path);
+        }
+        Err(e) => {
+            warn!("Failed to initialize crash handler: {} (crashes may not be logged)", e);
+        }
+    }
 
     info!("crowd-cast Agent starting...");
 
@@ -41,6 +50,7 @@ fn main() -> Result<()> {
     }
 
     let force_setup = args.iter().any(|a| a == "--setup" || a == "-s");
+    let missing_permissions = !installer::all_permissions_granted();
 
     // Create tokio runtime for async operations
     let runtime = tokio::runtime::Runtime::new()?;
@@ -59,7 +69,7 @@ fn main() -> Result<()> {
     info!("Configuration loaded from {:?}", config.config_path());
 
     // Run setup wizard if needed
-    if force_setup || needs_setup(&config) {
+    if force_setup || needs_setup(&config) || missing_permissions {
         info!("Running setup wizard...");
         let result = run_wizard_gui(&mut config)?;
 
@@ -245,6 +255,8 @@ fn print_help() {
     println!();
     println!("ENVIRONMENT:");
     println!("    RUST_LOG      Set log level (e.g., debug, info, warn)");
+    println!("    CROWD_CAST_LOG_PATH");
+    println!("                  Override log directory (default: ~/Library/Logs/crowd-cast on macOS)");
     println!();
     println!("For more information, visit: https://github.com/crowd-cast/crowd-cast");
 }

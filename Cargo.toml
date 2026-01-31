@@ -52,6 +52,7 @@ image = "0.25"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # Error handling
 anyhow = "1"
@@ -81,6 +82,8 @@ objc = "0.2"
 zip = "2"
 # Display detection for capture recovery
 core-graphics = "0.24"
+# Unified logging (os_log) integration
+tracing-oslog = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows-specific

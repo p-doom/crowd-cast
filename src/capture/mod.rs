@@ -18,7 +18,7 @@ mod apps;
 
 pub use context::{CaptureContext, RecordingSession};
 pub use recording::{RecordingConfig, RecordingOutput, RecordingOutputBuilder, RecordingState, VideoCodecPreference};
-pub use sources::{ScreenCaptureSource, get_main_display_uuid};
+pub use sources::{ScreenCaptureSource, get_main_display_uuid, get_main_display_resolution};
 pub use recovery::{DisplayMonitor, DisplayChangeEvent, get_display_name, get_display_uuid};
 pub use frontmost::{get_frontmost_app, AppInfo};
 pub use apps::{list_running_apps, list_capturable_apps};

@@ -1,7 +1,7 @@
 //! macOS notification support using UNUserNotificationCenter
 //!
 //! Provides informational notifications for display changes and recording state.
-//! Since display switching is now automatic, notifications are purely informational.
+//! Since display switching is automatic, notifications are purely informational.
 
 use std::ffi::CString;
 use std::sync::OnceLock;
@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 /// Actions that can be triggered from notifications
 #[derive(Debug, Clone)]
 pub enum NotificationAction {
-    /// User dismissed or tapped the notification (informational only)
+    /// User dismissed or tapped the notification
     Dismissed,
 }
 
@@ -40,6 +40,7 @@ mod ffi {
         pub fn notifications_show_recording_stopped();
         pub fn notifications_show_recording_paused();
         pub fn notifications_show_recording_resumed();
+        pub fn notifications_show_permissions_missing(message: *const c_char);
         pub fn notifications_show_obs_download_started();
         pub fn notifications_show_setup_configuring();
         pub fn notifications_show_sources_refreshed();
@@ -242,6 +243,30 @@ pub fn show_recording_resumed_notification() {
 /// Show recording resumed notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_recording_resumed_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when recording is blocked by missing permissions
+#[cfg(target_os = "macos")]
+pub fn show_permissions_missing_notification(message: &str) {
+    let msg_c = match CString::new(message) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Invalid permissions message string: {}", e);
+            return;
+        }
+    };
+
+    unsafe {
+        ffi::notifications_show_permissions_missing(msg_c.as_ptr());
+    }
+
+    debug!("Showed permissions missing notification");
+}
+
+/// Show permissions missing notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_permissions_missing_notification(_message: &str) {
     debug!("Notifications not supported on this platform");
 }
 
