@@ -106,6 +106,8 @@ struct PendingDisplayRefresh {
     restart_recording: bool,
     /// Whether to show a capture resumed notification on success
     show_resumed_notification: bool,
+    /// Whether to stop recording before reinit (needed if previous stop failed)
+    stop_recording_first: bool,
     /// Whether to do a full libobs context reinitialization (true) or just recreate sources (false)
     full_reinit: bool,
 }
@@ -1195,6 +1197,7 @@ impl SyncEngine {
                     next_retry_at: Instant::now() + DISPLAY_REFRESH_RETRY_BASE_DELAY,
                     restart_recording,
                     show_resumed_notification,
+                    stop_recording_first,
                     full_reinit,
                 });
             }
@@ -1217,7 +1220,7 @@ impl SyncEngine {
                 &pending.display_name,
                 pending.restart_recording,
                 pending.show_resumed_notification,
-                false,
+                pending.stop_recording_first,
                 pending.full_reinit,
             )
             .await
@@ -1249,6 +1252,7 @@ impl SyncEngine {
                         next_retry_at: Instant::now() + delay,
                         restart_recording: pending.restart_recording,
                         show_resumed_notification: pending.show_resumed_notification,
+                        stop_recording_first: pending.stop_recording_first,
                         full_reinit: pending.full_reinit,
                     });
                 }

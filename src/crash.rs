@@ -184,22 +184,24 @@ extern "C" fn signal_handler(sig: libc::c_int, info: *mut libc::siginfo_t, _cont
     let msg = format_signal_message(&mut buf, sig, signal_name, fault_addr);
     
     // Write to crash log fd (async-signal-safe)
+    // Note: We skip fsync() as it's not async-signal-safe and could deadlock
     if let Some(&fd) = CRASH_LOG_FD.get() {
         unsafe {
             libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
-            libc::fsync(fd);
         }
     }
     
-    // Also write to stderr
+    // Also write to stderr (async-signal-safe)
     unsafe {
         libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
     }
     
-    // Re-raise the signal with default handler to generate core dump / proper exit
+    // Re-raise the signal to get default handling (core dump if enabled)
+    // SA_RESETHAND already reset our handler to SIG_DFL, so this will
+    // invoke default behavior. kill(getpid(), sig) is async-signal-safe,
+    // unlike signal()/raise() which are not.
     unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
+        libc::kill(libc::getpid(), sig);
     }
 }
 
