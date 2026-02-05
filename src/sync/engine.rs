@@ -25,12 +25,14 @@ use crate::capture::{
 use crate::config::Config;
 use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
 use crate::input::{create_input_backend, InputBackend};
+use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
     is_authorized as notifications_authorized, show_capture_resumed_notification,
     show_display_change_notification, show_idle_paused_notification,
     show_idle_resumed_notification, show_recording_paused_notification,
     show_recording_resumed_notification, show_recording_started_notification,
     show_recording_stopped_notification, show_sources_refreshed_notification,
+    show_permissions_missing_notification,
     NotificationAction,
 };
 use crate::upload::Uploader;
@@ -100,6 +102,14 @@ struct PendingDisplayRefresh {
     attempt: u32,
     /// When to attempt the next retry
     next_retry_at: Instant,
+    /// Whether to restart recording after reinit
+    restart_recording: bool,
+    /// Whether to show a capture resumed notification on success
+    show_resumed_notification: bool,
+    /// Whether to stop recording before reinit (needed if previous stop failed)
+    stop_recording_first: bool,
+    /// Whether to do a full libobs context reinitialization (true) or just recreate sources (false)
+    full_reinit: bool,
 }
 
 /// Maximum number of display refresh retry attempts
@@ -451,7 +461,7 @@ impl SyncEngine {
                 error!("Failed to autostart recording: {}", e);
                 let _ = self
                     .status_tx
-                    .send(EngineStatus::Error("Autostart recording failed".to_string()));
+                    .send(EngineStatus::Error(format!("Autostart recording failed: {}", e)));
             } else {
                 // Initialize segment timer after successful autostart
                 // Use interval_at to delay first tick (interval() ticks immediately)
@@ -468,12 +478,19 @@ impl SyncEngine {
                 Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         EngineCommand::StartRecording => {
-                            self.start_recording().await?;
-                            // Reset segment timer when recording starts to ensure full-length first segment
-                            // Use interval_at to delay first tick (interval() ticks immediately)
-                            if self.segment_duration_secs > 0 {
-                                let duration = Duration::from_secs(self.segment_duration_secs);
-                                segment_timer = Some(tokio::time::interval_at(Instant::now() + duration, duration));
+                            if let Err(e) = self.start_recording().await {
+                                error!("Failed to start recording: {}", e);
+                                let _ = self.status_tx.send(EngineStatus::Error(format!(
+                                    "Start recording failed: {}",
+                                    e
+                                )));
+                            } else {
+                                // Reset segment timer when recording starts to ensure full-length first segment
+                                // Use interval_at to delay first tick (interval() ticks immediately)
+                                if self.segment_duration_secs > 0 {
+                                    let duration = Duration::from_secs(self.segment_duration_secs);
+                                    segment_timer = Some(tokio::time::interval_at(Instant::now() + duration, duration));
+                                }
                             }
                         }
                         EngineCommand::StopRecording => {
@@ -523,7 +540,7 @@ impl SyncEngine {
                 // Poll frontmost app and check for display changes
                 _ = poll_timer.tick() => {
                     self.poll_frontmost_app().await;
-                    self.check_display_changes();
+                    self.check_display_changes().await;
                 }
 
                 // Handle segment rotation (if enabled)
@@ -548,7 +565,7 @@ impl SyncEngine {
                         None => std::future::pending().await,
                     }
                 } => {
-                    self.retry_display_refresh();
+                    self.retry_display_refresh().await;
                 }
 
                 // Handle idle timeout (activity-gated capture)
@@ -760,6 +777,18 @@ impl SyncEngine {
         if self.current_session.is_some() {
             warn!("Recording already in progress");
             return Ok(());
+        }
+
+        let missing = describe_missing_permissions();
+        if !missing.is_empty() {
+            let details = missing.join(" ");
+            let message = format!("Recording not started. {}", details);
+            warn!("{}", message);
+            let _ = self.status_tx.send(EngineStatus::Error(message.clone()));
+            if self.config.recording.notify_on_start_stop && notifications_authorized() {
+                show_permissions_missing_notification(&message);
+            }
+            return Err(anyhow::anyhow!("{}", message));
         }
 
         info!("Starting recording...");
@@ -1028,7 +1057,7 @@ impl SyncEngine {
     /// caches stale display IDs. This method detects such changes and either:
     /// - Auto-recovers if the original display returns
     /// - Shows a notification to let the user decide if switching to a new display
-    fn check_display_changes(&mut self) {
+    async fn check_display_changes(&mut self) {
         // Check if display configuration changed (macOS only, no-op on other platforms)
         let Some(event) = self.display_monitor.check_for_changes() else {
             return;
@@ -1040,27 +1069,30 @@ impl SyncEngine {
             self.pending_display_refresh = None;
         }
 
+        let restart_recording = self.current_session.is_some();
+
         match event {
-            DisplayChangeEvent::OriginalReturned { display_id, uuid, display_name } => {
-                // Original display came back - auto-recover
+            DisplayChangeEvent::OriginalReturned { display_id, uuid: _, display_name } => {
+                // Original display came back - auto-recover with light reinit
+                // (same resolution expected, just recreate sources)
                 info!("Original display '{}' (id={}) returned, auto-recovering...", display_name, display_id);
-                self.try_recreate_sources_with_retry(&display_name, true);
+                self.try_reinitialize_with_retry(&display_name, restart_recording, true, true, false).await;
             }
             
-            DisplayChangeEvent::SwitchedToNew { from_id, from_name, to_id, to_name, to_uuid } => {
-                // Switched to a different display - update sources to keep SCK stream valid
+            DisplayChangeEvent::SwitchedToNew { from_id, from_name, to_id, to_name, to_uuid: _ } => {
+                // Switched to a different display - use reset_video() to update resolution
+                // This is safe (uses obs_reset_video, doesn't drop context, no SIGABRT)
                 info!(
                     "Display changed: '{}' (id={}) -> '{}' (id={})",
                     from_name, from_id, to_name, to_id
                 );
-                
-                // MUST update sources to keep SCK stream valid, even if capturing different display
-                // If we don't do this, the SCK stream becomes invalid/dead and can't be recovered
-                // later by just updating the display UUID
-                self.try_recreate_sources_with_retry(&to_name, false);
-                
-                // Show notification to inform user about the display change
-                show_display_change_notification(&from_name, &to_name, to_id);
+
+                if restart_recording && notifications_authorized() {
+                    show_display_change_notification(&from_name, &to_name, to_id);
+                }
+
+                // Use full_reinit: true to reset video resolution for new display
+                self.try_reinitialize_with_retry(&to_name, restart_recording, false, true, true).await;
             }
             
             DisplayChangeEvent::AllDisconnected => {
@@ -1071,42 +1103,109 @@ impl SyncEngine {
         }
     }
 
-    /// Try to recreate capture sources, scheduling a retry if it fails
+    /// Reinitialize OBS and optionally restart recording for display changes
+    ///
+    /// When `full_reinit` is false, only recreates capture sources without dropping the
+    /// libobs context. This is safer when the display resolution hasn't changed
+    /// (e.g., when the original display returns after being disconnected).
+    async fn reinitialize_after_display_change(
+        &mut self,
+        display_name: &str,
+        restart_recording: bool,
+        show_resumed_notification: bool,
+        stop_recording_first: bool,
+        full_reinit: bool,
+    ) -> Result<()> {
+        let mut restore_capture = None;
+        if stop_recording_first {
+            restore_capture = Some(self.capture_enabled);
+            self.capture_enabled = false;
+
+            if restart_recording {
+                self.stop_recording().await?;
+            }
+        }
+
+        if full_reinit {
+            // Resolution may have changed - use reset_video() which is safe
+            // (doesn't drop the context, avoids SIGABRT crash)
+            self.capture_ctx.reset_video_and_recreate_sources()?;
+        } else {
+            // Light reinitialization - just recreate capture sources without
+            // touching the libobs context or video settings. This is fastest
+            // and safest when the same display returns at the same resolution.
+            self.capture_ctx.fully_recreate_sources()?;
+        }
+
+        if restart_recording {
+            self.start_recording().await?;
+        }
+
+        if show_resumed_notification && notifications_authorized() {
+            show_capture_resumed_notification(display_name);
+        }
+
+        if let Some(prev) = restore_capture {
+            if self.current_session.is_some() {
+                self.capture_enabled = prev;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Try to reinitialize capture after a display change, scheduling a retry if it fails
     ///
     /// SCK sometimes isn't ready immediately after display changes (especially
     /// when coming out of clamshell mode). This method handles that by scheduling
     /// retries with exponential backoff.
     ///
-    /// Uses `fully_recreate_sources()` which destroys and recreates sources
-    /// for more reliable recovery than just updating the display UUID.
-    fn try_recreate_sources_with_retry(&mut self, display_name: &str, show_resumed_notification: bool) {
-        match self.capture_ctx.fully_recreate_sources() {
-            Ok(count) => {
-                info!(
-                    "Successfully recreated {} capture source(s) for display '{}'",
-                    count, display_name
-                );
+    /// When `full_reinit` is false, only recreates capture sources (faster, safer).
+    /// When `full_reinit` is true, drops and recreates the entire libobs context.
+    async fn try_reinitialize_with_retry(
+        &mut self,
+        display_name: &str,
+        restart_recording: bool,
+        show_resumed_notification: bool,
+        stop_recording_first: bool,
+        full_reinit: bool,
+    ) {
+        match self
+            .reinitialize_after_display_change(
+                display_name,
+                restart_recording,
+                show_resumed_notification,
+                stop_recording_first,
+                full_reinit,
+            )
+            .await
+        {
+            Ok(()) => {
+                info!("Successfully reinitialized capture for display '{}'", display_name);
                 self.pending_display_refresh = None;
-                
-                if show_resumed_notification {
-                    show_capture_resumed_notification(display_name);
-                }
             }
             Err(e) => {
-                warn!("Failed to recreate sources for display '{}': {} (will retry)", display_name, e);
-                
+                warn!(
+                    "Failed to reinitialize capture for display '{}': {} (will retry)",
+                    display_name, e
+                );
+
                 // Schedule a retry
                 self.pending_display_refresh = Some(PendingDisplayRefresh {
                     display_name: display_name.to_string(),
                     attempt: 1,
                     next_retry_at: Instant::now() + DISPLAY_REFRESH_RETRY_BASE_DELAY,
+                    restart_recording,
+                    show_resumed_notification,
+                    stop_recording_first,
+                    full_reinit,
                 });
             }
         }
     }
 
     /// Retry a pending display refresh
-    fn retry_display_refresh(&mut self) {
+    async fn retry_display_refresh(&mut self) {
         let Some(pending) = self.pending_display_refresh.take() else {
             return;
         };
@@ -1116,18 +1215,27 @@ impl SyncEngine {
             pending.display_name, pending.attempt + 1, MAX_DISPLAY_REFRESH_RETRIES
         );
 
-        match self.capture_ctx.fully_recreate_sources() {
-            Ok(count) => {
+        match self
+            .reinitialize_after_display_change(
+                &pending.display_name,
+                pending.restart_recording,
+                pending.show_resumed_notification,
+                pending.stop_recording_first,
+                pending.full_reinit,
+            )
+            .await
+        {
+            Ok(()) => {
                 info!(
-                    "Successfully recreated {} capture source(s) for display '{}' on retry",
-                    count, pending.display_name
+                    "Successfully reinitialized capture for display '{}' on retry",
+                    pending.display_name
                 );
                 // Success - don't reschedule
             }
             Err(e) => {
                 if pending.attempt >= MAX_DISPLAY_REFRESH_RETRIES {
                     error!(
-                        "Failed to recreate sources for display '{}' after {} attempts: {}. Giving up.",
+                        "Failed to reinitialize capture for display '{}' after {} attempts: {}. Giving up.",
                         pending.display_name, MAX_DISPLAY_REFRESH_RETRIES, e
                     );
                     // Don't reschedule - we've exhausted retries
@@ -1142,6 +1250,10 @@ impl SyncEngine {
                         display_name: pending.display_name,
                         attempt: pending.attempt + 1,
                         next_retry_at: Instant::now() + delay,
+                        restart_recording: pending.restart_recording,
+                        show_resumed_notification: pending.show_resumed_notification,
+                        stop_recording_first: pending.stop_recording_first,
+                        full_reinit: pending.full_reinit,
                     });
                 }
             }

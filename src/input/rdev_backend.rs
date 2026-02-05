@@ -46,6 +46,12 @@ impl InputBackend for RdevBackend {
         self.start_time = Some(start_time);
 
         let handle = thread::spawn(move || {
+            // CRITICAL: Tell rdev we're NOT on the main thread so it dispatches
+            // TSM (Text Services Manager) API calls to the main thread via GCD.
+            // Without this, calling TISGetInputSourceProperty from the event tap
+            // thread causes a crash due to dispatch_assert_queue_fail.
+            rdev::set_is_main_thread(false);
+
             info!("rdev input capture started");
 
             let callback = move |event: rdev::Event| {

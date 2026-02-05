@@ -198,6 +198,8 @@ OPTIONS:
 
 ENVIRONMENT:
     RUST_LOG      Set log level (e.g., debug, info, warn)
+    CROWD_CAST_LOG_PATH
+                  Override log directory (default: ~/Library/Logs/crowd-cast on macOS)
     CROWD_CAST_API_GATEWAY_URL
                   Lambda endpoint for pre-signed S3 URLs (set at build time)
 ```
