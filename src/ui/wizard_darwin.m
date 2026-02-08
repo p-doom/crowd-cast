@@ -53,6 +53,14 @@ static BOOL g_wizard_running = NO;
 // Autostart
 @property (nonatomic, strong) NSButton *autostartCheckbox;
 
+// Summary
+@property (nonatomic, strong) NSTextField *summaryPermissionsValueField;
+@property (nonatomic, strong) NSTextField *summaryCaptureValueField;
+@property (nonatomic, strong) NSTextField *summaryAutostartValueField;
+@property (nonatomic, strong) NSTextField *summaryAppsLabel;
+@property (nonatomic, strong) NSScrollView *summaryAppsScrollView;
+@property (nonatomic, strong) NSTextView *summaryAppsTextView;
+
 @end
 
 @implementation WizardWindowController
@@ -474,6 +482,8 @@ static BOOL g_wizard_running = NO;
     _appTableView.rowHeight = 28;
     _appTableView.allowsMultipleSelection = NO;
     _appTableView.headerView = nil;
+    _appTableView.usesAlternatingRowBackgroundColors = YES;
+    _appTableView.selectionHighlightStyle = NSTableViewSelectionHighlightStyleNone;
     
     // Checkbox column
     NSTableColumn *checkColumn = [[NSTableColumn alloc] initWithIdentifier:@"check"];
@@ -519,9 +529,16 @@ static BOOL g_wizard_running = NO;
     
     NSDictionary *app = g_available_apps[row];
     NSString *identifier = tableColumn.identifier;
+    CGFloat rowHeight = tableView.rowHeight;
+    CGFloat checkboxSize = 18.0;
+    CGFloat checkboxY = floor((rowHeight - checkboxSize) / 2.0);
+    CGFloat textHeight = 17.0;
+    CGFloat textY = floor((rowHeight - textHeight) / 2.0);
     
     if ([identifier isEqualToString:@"check"]) {
-        NSButton *checkbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 0, 20, 20)];
+        NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, tableColumn.width, rowHeight)];
+        CGFloat checkboxX = floor((tableColumn.width - checkboxSize) / 2.0);
+        NSButton *checkbox = [[NSButton alloc] initWithFrame:NSMakeRect(checkboxX, checkboxY, checkboxSize, checkboxSize)];
         checkbox.buttonType = NSButtonTypeSwitch;
         checkbox.title = @"";
         checkbox.tag = row;
@@ -531,24 +548,33 @@ static BOOL g_wizard_running = NO;
         NSString *bundleId = app[@"bundle_id"];
         checkbox.state = [g_selected_apps containsObject:bundleId] ? NSControlStateValueOn : NSControlStateValueOff;
         
-        return checkbox;
+        [container addSubview:checkbox];
+        return container;
     } else if ([identifier isEqualToString:@"name"]) {
-        NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 200, 20)];
+        NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, tableColumn.width, rowHeight)];
+        NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, textY, tableColumn.width, textHeight)];
         field.stringValue = app[@"name"] ?: @"Unknown";
         field.bezeled = NO;
         field.editable = NO;
         field.drawsBackground = NO;
         field.font = [NSFont systemFontOfSize:12];
-        return field;
+        field.lineBreakMode = NSLineBreakByTruncatingTail;
+        field.autoresizingMask = NSViewWidthSizable;
+        [container addSubview:field];
+        return container;
     } else if ([identifier isEqualToString:@"bundle"]) {
-        NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 200, 20)];
+        NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, tableColumn.width, rowHeight)];
+        NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, textY, tableColumn.width, textHeight)];
         field.stringValue = app[@"bundle_id"] ?: @"";
         field.bezeled = NO;
         field.editable = NO;
         field.drawsBackground = NO;
         field.font = [NSFont systemFontOfSize:11];
         field.textColor = [NSColor secondaryLabelColor];
-        return field;
+        field.lineBreakMode = NSLineBreakByTruncatingTail;
+        field.autoresizingMask = NSViewWidthSizable;
+        [container addSubview:field];
+        return container;
     }
     
     return nil;
@@ -557,17 +583,48 @@ static BOOL g_wizard_running = NO;
 - (void)appCheckboxChanged:(id)sender {
     NSButton *checkbox = (NSButton *)sender;
     NSInteger row = checkbox.tag;
-    
-    if (row < (NSInteger)g_available_apps.count) {
+    [self setAppSelectedForRow:row selected:(checkbox.state == NSControlStateValueOn)];
+}
+
+- (void)setAppSelectedForRow:(NSInteger)row selected:(BOOL)selected {
+    if (row < 0 || row >= (NSInteger)g_available_apps.count) return;
+
+    NSDictionary *app = g_available_apps[row];
+    NSString *bundleId = app[@"bundle_id"];
+    if (!bundleId) return;
+
+    if (selected) {
+        [g_selected_apps addObject:bundleId];
+    } else {
+        [g_selected_apps removeObject:bundleId];
+    }
+}
+
+- (void)tableViewSelectionDidChange:(NSNotification *)notification {
+    NSTableView *tableView = notification.object;
+    if (tableView != _appTableView) return;
+
+    NSInteger row = tableView.selectedRow;
+    if (row < 0 || _captureAllCheckbox.state == NSControlStateValueOn) return;
+
+    BOOL clickedCheckColumn = NO;
+    NSInteger clickedColumn = tableView.clickedColumn;
+    if (clickedColumn >= 0 && clickedColumn < (NSInteger)tableView.tableColumns.count) {
+        NSTableColumn *column = tableView.tableColumns[clickedColumn];
+        clickedCheckColumn = [column.identifier isEqualToString:@"check"];
+    }
+
+    if (!clickedCheckColumn) {
         NSDictionary *app = g_available_apps[row];
         NSString *bundleId = app[@"bundle_id"];
-        
-        if (checkbox.state == NSControlStateValueOn) {
-            [g_selected_apps addObject:bundleId];
-        } else {
-            [g_selected_apps removeObject:bundleId];
-        }
+        BOOL currentlySelected = bundleId && [g_selected_apps containsObject:bundleId];
+        [self setAppSelectedForRow:row selected:!currentlySelected];
+        NSIndexSet *rowIndexes = [NSIndexSet indexSetWithIndex:row];
+        NSIndexSet *columnIndexes = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, tableView.numberOfColumns)];
+        [tableView reloadDataForRowIndexes:rowIndexes columnIndexes:columnIndexes];
     }
+
+    [tableView deselectAll:nil];
 }
 
 // ============================================================================
@@ -653,8 +710,8 @@ static BOOL g_wizard_running = NO;
     desc.textColor = [NSColor secondaryLabelColor];
     [_summaryView addSubview:desc];
     
-    // Summary box (will be populated when shown)
-    NSBox *box = [[NSBox alloc] initWithFrame:NSMakeRect(80, 80, 390, 180)];
+    // Summary box
+    NSBox *box = [[NSBox alloc] initWithFrame:NSMakeRect(80, 55, 390, 205)];
     box.boxType = NSBoxCustom;
     box.fillColor = [NSColor controlBackgroundColor];
     box.borderColor = [NSColor separatorColor];
@@ -662,35 +719,54 @@ static BOOL g_wizard_running = NO;
     box.cornerRadius = 8;
     box.titlePosition = NSNoTitle;
     [_summaryView addSubview:box];
+
+    // Fixed summary rows
+    NSTextField *permLabel = [self createSummaryLabel:@"Permissions:" y:225 bold:YES];
+    [_summaryView addSubview:permLabel];
+    _summaryPermissionsValueField = [self createSummaryValue:@"" y:225];
+    [_summaryView addSubview:_summaryPermissionsValueField];
+
+    NSTextField *captureLabel = [self createSummaryLabel:@"Capture Mode:" y:198 bold:YES];
+    [_summaryView addSubview:captureLabel];
+    _summaryCaptureValueField = [self createSummaryValue:@"" y:198];
+    [_summaryView addSubview:_summaryCaptureValueField];
+
+    NSTextField *autostartLabel = [self createSummaryLabel:@"Start on Login:" y:171 bold:YES];
+    [_summaryView addSubview:autostartLabel];
+    _summaryAutostartValueField = [self createSummaryValue:@"" y:171];
+    [_summaryView addSubview:_summaryAutostartValueField];
+
+    _summaryAppsLabel = [self createSummaryLabel:@"Selected Apps:" y:144 bold:YES];
+    [_summaryView addSubview:_summaryAppsLabel];
+
+    _summaryAppsScrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(120, 82, 300, 52)];
+    _summaryAppsScrollView.hasVerticalScroller = YES;
+    _summaryAppsScrollView.hasHorizontalScroller = NO;
+    _summaryAppsScrollView.autohidesScrollers = YES;
+    _summaryAppsScrollView.borderType = NSBezelBorder;
+
+    _summaryAppsTextView = [[NSTextView alloc] initWithFrame:_summaryAppsScrollView.bounds];
+    _summaryAppsTextView.editable = NO;
+    _summaryAppsTextView.selectable = NO;
+    _summaryAppsTextView.drawsBackground = NO;
+    _summaryAppsTextView.font = [NSFont systemFontOfSize:11];
+    _summaryAppsTextView.textContainerInset = NSMakeSize(2, 3);
+    _summaryAppsTextView.verticallyResizable = YES;
+    _summaryAppsTextView.horizontallyResizable = NO;
+    _summaryAppsTextView.autoresizingMask = NSViewWidthSizable;
+    _summaryAppsTextView.maxSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
+    _summaryAppsTextView.textContainer.containerSize = NSMakeSize(_summaryAppsScrollView.contentSize.width, CGFLOAT_MAX);
+    _summaryAppsTextView.textContainer.widthTracksTextView = YES;
+    _summaryAppsTextView.textContainer.lineFragmentPadding = 0;
+
+    _summaryAppsScrollView.documentView = _summaryAppsTextView;
+    [_summaryView addSubview:_summaryAppsScrollView];
 }
 
 - (void)updateSummaryView {
-    // Remove old summary labels
-    for (NSView *subview in [_summaryView.subviews copy]) {
-        if (subview.tag >= 200 && subview.tag < 300) {
-            [subview removeFromSuperview];
-        }
-    }
-    
-    CGFloat y = 220;
-    
-    // Permissions
-    NSTextField *permLabel = [self createSummaryLabel:@"Permissions:" y:y bold:YES];
-    permLabel.tag = 200;
-    [_summaryView addSubview:permLabel];
-    
     BOOL allGranted = wizard_check_screen_recording() && wizard_check_accessibility();
-    NSTextField *permValue = [self createSummaryValue:allGranted ? @"All granted" : @"Some missing" y:y];
-    permValue.textColor = allGranted ? [NSColor systemGreenColor] : [NSColor systemOrangeColor];
-    permValue.tag = 201;
-    [_summaryView addSubview:permValue];
-    
-    y -= 30;
-    
-    // Capture mode
-    NSTextField *captureLabel = [self createSummaryLabel:@"Capture Mode:" y:y bold:YES];
-    captureLabel.tag = 202;
-    [_summaryView addSubview:captureLabel];
+    _summaryPermissionsValueField.stringValue = allGranted ? @"All granted" : @"Some missing";
+    _summaryPermissionsValueField.textColor = allGranted ? [NSColor systemGreenColor] : [NSColor systemOrangeColor];
     
     NSString *captureValue;
     if (_captureAllCheckbox.state == NSControlStateValueOn) {
@@ -700,53 +776,47 @@ static BOOL g_wizard_running = NO;
     } else {
         captureValue = [NSString stringWithFormat:@"%lu application(s)", (unsigned long)g_selected_apps.count];
     }
-    NSTextField *captureValueField = [self createSummaryValue:captureValue y:y];
-    captureValueField.tag = 203;
-    [_summaryView addSubview:captureValueField];
-    
-    y -= 30;
-    
-    // Autostart
-    NSTextField *autostartLabel = [self createSummaryLabel:@"Start on Login:" y:y bold:YES];
-    autostartLabel.tag = 204;
-    [_summaryView addSubview:autostartLabel];
-    
-    NSTextField *autostartValue = [self createSummaryValue:_autostartCheckbox.state == NSControlStateValueOn ? @"Yes" : @"No" y:y];
-    autostartValue.tag = 205;
-    [_summaryView addSubview:autostartValue];
-    
-    y -= 30;
-    
-    // Selected apps list (if not capture all)
-    if (_captureAllCheckbox.state != NSControlStateValueOn && g_selected_apps.count > 0) {
-        NSTextField *appsLabel = [self createSummaryLabel:@"Selected Apps:" y:y bold:YES];
-        appsLabel.tag = 206;
-        [_summaryView addSubview:appsLabel];
-        
-        y -= 18;
-        NSInteger appIndex = 0;
-        for (NSString *bundleId in g_selected_apps) {
-            // Find app name
-            NSString *appName = bundleId;
-            for (NSDictionary *app in g_available_apps) {
-                if ([app[@"bundle_id"] isEqualToString:bundleId]) {
-                    appName = app[@"name"];
-                    break;
-                }
+    _summaryCaptureValueField.stringValue = captureValue;
+    _summaryCaptureValueField.textColor = [NSColor labelColor];
+
+    _summaryAutostartValueField.stringValue = _autostartCheckbox.state == NSControlStateValueOn ? @"Yes" : @"No";
+    _summaryAutostartValueField.textColor = [NSColor labelColor];
+
+    BOOL showSelectedApps = (_captureAllCheckbox.state != NSControlStateValueOn && g_selected_apps.count > 0);
+    _summaryAppsLabel.hidden = !showSelectedApps;
+    _summaryAppsScrollView.hidden = !showSelectedApps;
+
+    if (showSelectedApps) {
+        NSMutableArray<NSString *> *selectedAppNames = [NSMutableArray array];
+        NSMutableSet<NSString *> *seenBundleIds = [NSMutableSet set];
+
+        // Keep summary ordering stable by following available app order first.
+        for (NSDictionary *app in g_available_apps) {
+            NSString *bundleId = app[@"bundle_id"];
+            if (bundleId && [g_selected_apps containsObject:bundleId]) {
+                [selectedAppNames addObject:(app[@"name"] ?: bundleId)];
+                [seenBundleIds addObject:bundleId];
             }
-            NSTextField *appField = [[NSTextField alloc] initWithFrame:NSMakeRect(120, y, 300, 15)];
-            appField.stringValue = [NSString stringWithFormat:@"• %@", appName];
-            appField.bezeled = NO;
-            appField.editable = NO;
-            appField.drawsBackground = NO;
-            appField.font = [NSFont systemFontOfSize:11];
-            appField.textColor = [NSColor secondaryLabelColor];
-            appField.tag = 250 + appIndex; // Unique tag using index
-            [_summaryView addSubview:appField];
-            y -= 15;
-            appIndex++;
-            if (y < 40) break; // Allow more apps to be shown
         }
+
+        // Include selected bundle IDs that are no longer present in the app list.
+        NSMutableArray<NSString *> *extraBundleIds = [NSMutableArray array];
+        for (NSString *bundleId in g_selected_apps) {
+            if (![seenBundleIds containsObject:bundleId]) {
+                [extraBundleIds addObject:bundleId];
+            }
+        }
+        [extraBundleIds sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        [selectedAppNames addObjectsFromArray:extraBundleIds];
+
+        NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithCapacity:selectedAppNames.count];
+        for (NSString *name in selectedAppNames) {
+            [lines addObject:[NSString stringWithFormat:@"- %@", name]];
+        }
+        _summaryAppsTextView.string = [lines componentsJoinedByString:@"\n"];
+        [_summaryAppsTextView scrollRangeToVisible:NSMakeRange(0, 0)];
+    } else {
+        _summaryAppsTextView.string = @"";
     }
 }
 
