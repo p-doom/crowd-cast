@@ -164,8 +164,8 @@ pub struct SyncEngine {
     notification_rx: Option<mpsc::UnboundedReceiver<NotificationAction>>,
     /// Pending display refresh retry (for when SCK isn't ready immediately)
     pending_display_refresh: Option<PendingDisplayRefresh>,
-    /// Last time user activity was detected (keyboard/mouse/scroll/click)
-    last_activity_time: Instant,
+    /// Last time an input event was recorded (buffered for upload)
+    last_recorded_action_time: Instant,
     /// Whether we're currently auto-paused due to idle (vs user-initiated pause)
     idle_paused: bool,
     /// Idle timeout duration (cached from config, Duration::ZERO means disabled)
@@ -224,7 +224,7 @@ impl SyncEngine {
             upload_rx: Some(upload_rx),
             notification_rx: Some(notification_rx),
             pending_display_refresh: None,
-            last_activity_time: Instant::now(),
+            last_recorded_action_time: Instant::now(),
             idle_paused: false,
             idle_timeout,
             pause_uploads_on_idle,
@@ -568,7 +568,7 @@ impl SyncEngine {
                     self.retry_display_refresh().await;
                 }
 
-                // Handle idle timeout (activity-gated capture)
+                // Handle idle timeout (recorded-action-gated capture)
                 _ = async {
                     // Only run idle timer if:
                     // - Idle timeout is enabled (non-zero)
@@ -577,7 +577,7 @@ impl SyncEngine {
                     if self.idle_timeout.is_zero() || self.is_paused || self.current_session.is_none() {
                         std::future::pending::<()>().await
                     } else {
-                        let deadline = self.last_activity_time + self.idle_timeout;
+                        let deadline = self.last_recorded_action_time + self.idle_timeout;
                         tokio::time::sleep_until(deadline).await
                     }
                 } => {
@@ -838,7 +838,7 @@ impl SyncEngine {
         self.event_buffer.clear();
         self.is_paused = false; // Ensure not paused when starting
         self.idle_paused = false; // Ensure not idle-paused when starting
-        self.last_activity_time = Instant::now(); // Reset activity timer
+        self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
 
         let _ = self.status_tx.send(EngineStatus::Capturing { event_count: 0 });
 
@@ -1262,7 +1262,7 @@ impl SyncEngine {
 
     /// Handle idle timeout - pause recording when user is inactive
     ///
-    /// Called when no user activity (keyboard/mouse) has been detected
+    /// Called when no input event has been recorded
     /// for the configured idle_timeout duration. Pauses both video recording
     /// and input capture to save resources and storage.
     fn handle_idle_timeout(&mut self) {
@@ -1272,7 +1272,7 @@ impl SyncEngine {
         }
 
         info!(
-            "User idle for {:?}, pausing capture...",
+            "No recorded actions for {:?}, pausing capture...",
             self.idle_timeout
         );
 
@@ -1296,8 +1296,11 @@ impl SyncEngine {
 
         info!("User activity detected, resuming capture from idle...");
 
-        self.idle_paused = false;
         self.resume_recording();
+        if self.is_paused {
+            return;
+        }
+        self.idle_paused = false;
 
         // Show notification if enabled
         if self.config.recording.notify_on_start_stop && notifications_authorized() {
@@ -1305,13 +1308,10 @@ impl SyncEngine {
         }
     }
 
-    /// Poll the frontmost application and update capture state
-    async fn poll_frontmost_app(&mut self) {
-        // Don't update capture state if paused
-        if self.is_paused {
-            return;
-        }
-
+    /// Check whether the current frontmost app should be captured.
+    ///
+    /// Updates tracked app state for logging and consistency with polling path.
+    fn should_capture_frontmost_app(&mut self) -> bool {
         let frontmost = get_frontmost_app();
 
         let bundle_id = frontmost.as_ref().map(|a| a.bundle_id.as_str());
@@ -1335,6 +1335,18 @@ impl SyncEngine {
             }
             self.last_frontmost_app = new_bundle_id;
         }
+
+        should_capture
+    }
+
+    /// Poll the frontmost application and update capture state
+    async fn poll_frontmost_app(&mut self) {
+        // Don't update capture state if paused
+        if self.is_paused {
+            return;
+        }
+
+        let should_capture = self.should_capture_frontmost_app();
 
         // Update capture state (only capture if recording AND app is allowed AND not paused)
         let is_recording = self.current_session.is_some();
@@ -1364,13 +1376,16 @@ impl SyncEngine {
 
     /// Handle an input event
     async fn handle_input_event(&mut self, event: InputEvent) {
-        // Always update last activity time for idle detection
-        // This happens regardless of whether capture is enabled
-        self.last_activity_time = Instant::now();
-
-        // Auto-resume from idle if we were idle-paused
+        // Auto-resume from idle only when frontmost app is capturable
         if self.idle_paused {
-            self.resume_from_idle();
+            let should_capture = self.should_capture_frontmost_app();
+            if should_capture {
+                self.resume_from_idle();
+                // Ensure the event that resumes from idle can be recorded immediately.
+                self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
+            } else {
+                return;
+            }
         }
 
         // Only buffer events if capture is enabled
@@ -1394,6 +1409,7 @@ impl SyncEngine {
         };
 
         self.event_buffer.push(adjusted_event);
+        self.last_recorded_action_time = Instant::now();
 
         // Check if buffer should be flushed (e.g., every N events or time interval)
         if self.event_buffer.len() >= 10000 {
