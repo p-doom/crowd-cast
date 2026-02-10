@@ -92,6 +92,9 @@ windows = { version = "0.58", features = ["Win32_Foundation"] }
 [build-dependencies]
 cc = "1"
 
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cargo-obs-build = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+
 [target.'cfg(target_os = "linux")'.build-dependencies]
 pkg-config = "0.3"
 

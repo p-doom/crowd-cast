@@ -9,6 +9,16 @@ fn main() {
     // macOS: Set rpath for finding libobs.framework and dylibs at runtime
     #[cfg(target_os = "macos")]
     {
+        // Ensure OBS binaries are present during build on macOS.
+        // Set CROWD_CAST_SKIP_OBS_INSTALL=1 to opt out.
+        if std::env::var_os("CROWD_CAST_SKIP_OBS_INSTALL").is_none() {
+            cargo_obs_build::install().expect(
+                "Failed to install OBS binaries (set CROWD_CAST_SKIP_OBS_INSTALL=1 to skip)",
+            );
+        } else {
+            println!("cargo:warning=Skipping OBS binary install (CROWD_CAST_SKIP_OBS_INSTALL is set)");
+        }
+
         println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
         println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
         println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/..");
