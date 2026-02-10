@@ -85,15 +85,9 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 ### Installation
 
 ```bash
-# Install cargo-obs-build tool
-cargo install cargo-obs-build
-
 # Clone the repository
 git clone https://github.com/p-doom/crowd-cast.git
 cd crowd-cast
-
-# Download OBS binaries (required for linking)
-cargo obs-build build --out-dir target/release
 
 # Build the agent
 cargo build --release
@@ -101,6 +95,9 @@ cargo build --release
 # Run the setup wizard
 ./target/release/crowd-cast-agent --setup
 ```
+
+On macOS, `build.rs` automatically installs OBS binaries via `cargo-obs-build` during
+`cargo build`. Set `CROWD_CAST_SKIP_OBS_INSTALL=1` to skip this behavior.
 
 The setup wizard will:
 1. Check and request OS permissions (Accessibility, Screen Recording)
@@ -367,14 +364,10 @@ sudo dnf install gtk3-devel libappindicator-gtk3-devel
 git clone --recursive https://github.com/p-doom/crowd-cast.git
 cd crowd-cast
 
-# 2. Download OBS binaries for linking
-cargo build --release --package cargo-obs-build
-./target/release/cargo-obs-build build --out-dir target/debug
-
-# 3. Build the agent
+# 2. Build the agent (macOS auto-installs OBS binaries in build.rs)
 cargo build
 
-# 4. Run tests
+# 3. Run tests
 cargo test
 ```
 
