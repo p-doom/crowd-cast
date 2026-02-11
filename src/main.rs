@@ -35,7 +35,10 @@ fn main() -> Result<()> {
             info!("Crash handler initialized, crash log: {:?}", crash_log_path);
         }
         Err(e) => {
-            warn!("Failed to initialize crash handler: {} (crashes may not be logged)", e);
+            warn!(
+                "Failed to initialize crash handler: {} (crashes may not be logged)",
+                e
+            );
         }
     }
 
@@ -84,24 +87,22 @@ fn main() -> Result<()> {
         // The wizard's GUI pollutes process state (graphics contexts, NSApplication, etc.)
         // in ways that cause libobs initialization to crash with SIGTRAP.
         info!("Restarting with clean process state...");
-        
+
         let exe = std::env::current_exe()?;
         let filtered_args: Vec<String> = std::env::args()
             .skip(1) // skip the program name
             .filter(|a| a != "--setup" && a != "-s")
             .collect();
-        
+
         // Use Unix exec to replace this process with a fresh one
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(&exe)
-                .args(&filtered_args)
-                .exec();
+            let err = std::process::Command::new(&exe).args(&filtered_args).exec();
             // exec() only returns on error
             error!("exec failed: {}", err);
         }
-        
+
         // Fallback for non-Unix or if exec fails
         std::process::Command::new(&exe)
             .args(&filtered_args)
@@ -120,13 +121,14 @@ fn main() -> Result<()> {
 
     // Bootstrap OBS binaries if needed
     info!("Bootstrapping OBS binaries...");
-    let mut capture_ctx = match runtime.block_on(capture::CaptureContext::new(get_output_directory(&config))) {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            error!("Failed to bootstrap OBS binaries: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let mut capture_ctx =
+        match runtime.block_on(capture::CaptureContext::new(get_output_directory(&config))) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                error!("Failed to bootstrap OBS binaries: {}", e);
+                std::process::exit(1);
+            }
+        };
     info!("OBS binaries ready");
 
     // Initialize libobs context
@@ -238,7 +240,9 @@ fn main() -> Result<()> {
 }
 
 fn get_output_directory(config: &Config) -> std::path::PathBuf {
-    config.recording.output_directory
+    config
+        .recording
+        .output_directory
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"))
 }
@@ -256,7 +260,9 @@ fn print_help() {
     println!("ENVIRONMENT:");
     println!("    RUST_LOG      Set log level (e.g., debug, info, warn)");
     println!("    CROWD_CAST_LOG_PATH");
-    println!("                  Override log directory (default: ~/Library/Logs/crowd-cast on macOS)");
+    println!(
+        "                  Override log directory (default: ~/Library/Logs/crowd-cast on macOS)"
+    );
     println!();
     println!("For more information, visit: https://github.com/crowd-cast/crowd-cast");
 }

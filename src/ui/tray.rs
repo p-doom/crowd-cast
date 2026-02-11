@@ -95,27 +95,27 @@ impl TrayApp {
         // Note: We use indices to update text dynamically based on state
         let status_text = CString::new("Status: Idle")?;
         let separator = CString::new("-")?;
-        let start_text = CString::new("Start Recording")?;    // Index 2 - shown when idle
-        let pause_text = CString::new("Pause Recording")?;    // Index 3 - shown when recording
-        let resume_text = CString::new("Resume Recording")?;  // Index 4 - shown when paused
-        let stop_text = CString::new("Stop Recording")?;      // Index 5 - shown when recording/paused
-        let refresh_text = CString::new("Refresh Sources")?;  // Index 6 - always available
+        let start_text = CString::new("Start Recording")?; // Index 2 - shown when idle
+        let pause_text = CString::new("Pause Recording")?; // Index 3 - shown when recording
+        let resume_text = CString::new("Resume Recording")?; // Index 4 - shown when paused
+        let stop_text = CString::new("Stop Recording")?; // Index 5 - shown when recording/paused
+        let refresh_text = CString::new("Refresh Sources")?; // Index 6 - always available
         let config_text = CString::new("Open Config")?;
         let quit_text = CString::new("Quit")?;
 
         let menu_strings = vec![
-            status_text,      // 0
+            status_text,       // 0
             separator.clone(), // 1
-            start_text,       // 2
-            pause_text,       // 3
-            resume_text,      // 4
-            stop_text,        // 5
+            start_text,        // 2
+            pause_text,        // 3
+            resume_text,       // 4
+            stop_text,         // 5
             separator.clone(), // 6
-            refresh_text,     // 7
+            refresh_text,      // 7
             separator.clone(), // 8
-            config_text,      // 9
+            config_text,       // 9
             separator.clone(), // 10
-            quit_text,        // 11
+            quit_text,         // 11
         ];
 
         // Build menu items array (NULL-terminated)
@@ -124,7 +124,7 @@ impl TrayApp {
         let mut menu_items = vec![
             TrayMenuItem {
                 text: menu_strings[0].as_ptr(), // Status
-                disabled: 1, // Status is not clickable
+                disabled: 1,                    // Status is not clickable
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
@@ -145,21 +145,21 @@ impl TrayApp {
             },
             TrayMenuItem {
                 text: menu_strings[3].as_ptr(), // Pause Recording (visible when recording)
-                disabled: 1, // Initially hidden (disabled) - idle state
+                disabled: 1,                    // Initially hidden (disabled) - idle state
                 checked: 0,
                 cb: Some(on_pause_recording),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
                 text: menu_strings[4].as_ptr(), // Resume Recording (visible when paused)
-                disabled: 1, // Initially hidden (disabled) - idle state
+                disabled: 1,                    // Initially hidden (disabled) - idle state
                 checked: 0,
                 cb: Some(on_resume_recording),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
                 text: menu_strings[5].as_ptr(), // Stop Recording (visible when recording/paused)
-                disabled: 1, // Initially hidden (disabled) - idle state
+                disabled: 1,                    // Initially hidden (disabled) - idle state
                 checked: 0,
                 cb: Some(on_stop_capture),
                 submenu: std::ptr::null_mut(),
@@ -294,45 +294,47 @@ impl TrayApp {
         // Determine status text, icon state, and menu state
         #[derive(Clone, Copy, PartialEq)]
         enum MenuState {
-            Idle,       // Show: Start
-            Recording,  // Show: Pause, Stop
-            Paused,     // Show: Resume, Stop
+            Idle,      // Show: Start
+            Recording, // Show: Pause, Stop
+            Paused,    // Show: Resume, Stop
         }
 
         let (status_text, icon_state, menu_state) = match status {
-            EngineStatus::Idle => ("Status: Idle".to_string(), TrayIconState::Idle, MenuState::Idle),
-            EngineStatus::Capturing { event_count } => {
-                (
-                    format!("Status: Capturing ({} events)", event_count),
-                    TrayIconState::Recording,
-                    MenuState::Recording,
-                )
-            }
-            EngineStatus::Paused => {
-                ("Status: Paused".to_string(), TrayIconState::Paused, MenuState::Paused)
-            }
-            EngineStatus::RecordingBlocked => {
-                (
-                    "Status: Recording (no capture sources)".to_string(),
-                    TrayIconState::Blocked,
-                    MenuState::Recording,
-                )
-            }
-            EngineStatus::WaitingForOBS => {
-                ("Status: Waiting for OBS...".to_string(), TrayIconState::Blocked, MenuState::Idle)
-            }
+            EngineStatus::Idle => (
+                "Status: Idle".to_string(),
+                TrayIconState::Idle,
+                MenuState::Idle,
+            ),
+            EngineStatus::Capturing { event_count } => (
+                format!("Status: Capturing ({} events)", event_count),
+                TrayIconState::Recording,
+                MenuState::Recording,
+            ),
+            EngineStatus::Paused => (
+                "Status: Paused".to_string(),
+                TrayIconState::Paused,
+                MenuState::Paused,
+            ),
+            EngineStatus::RecordingBlocked => (
+                "Status: Recording (no capture sources)".to_string(),
+                TrayIconState::Blocked,
+                MenuState::Recording,
+            ),
+            EngineStatus::WaitingForOBS => (
+                "Status: Waiting for OBS...".to_string(),
+                TrayIconState::Blocked,
+                MenuState::Idle,
+            ),
             EngineStatus::Uploading { chunk_id } => (
                 format!("Status: Uploading {}", chunk_id),
                 TrayIconState::Idle,
                 MenuState::Idle,
             ),
-            EngineStatus::Error(msg) => {
-                (
-                    format!("Status: Error - {}", truncate_str(msg, 30)),
-                    TrayIconState::Idle,
-                    MenuState::Idle,
-                )
-            }
+            EngineStatus::Error(msg) => (
+                format!("Status: Error - {}", truncate_str(msg, 30)),
+                TrayIconState::Idle,
+                MenuState::Idle,
+            ),
         };
 
         // Update the status menu item text and menu item visibility
@@ -468,7 +470,11 @@ fn get_icon_paths() -> Result<TrayIconPaths> {
         .unwrap_or_else(|| std::env::temp_dir());
 
     std::fs::create_dir_all(&icon_dir)?;
-    let ext = if cfg!(target_os = "windows") { "ico" } else { "png" };
+    let ext = if cfg!(target_os = "windows") {
+        "ico"
+    } else {
+        "png"
+    };
 
     let paths = TrayIconPaths {
         idle: icon_dir.join(format!("tray_idle.{}", ext)),
@@ -476,9 +482,7 @@ fn get_icon_paths() -> Result<TrayIconPaths> {
         blocked: icon_dir.join(format!("tray_blocked.{}", ext)),
     };
 
-    let needs_create = !paths.idle.exists()
-        || !paths.recording.exists()
-        || !paths.blocked.exists();
+    let needs_create = !paths.idle.exists() || !paths.recording.exists() || !paths.blocked.exists();
 
     if needs_create {
         create_tray_icons(&paths)?;
@@ -493,7 +497,11 @@ fn create_tray_icons(paths: &TrayIconPaths) -> Result<()> {
     let base = load_base_icon(size);
     let variants = [
         (TrayIconState::Idle, [158, 158, 158, 255], &paths.idle),
-        (TrayIconState::Recording, [76, 175, 80, 255], &paths.recording),
+        (
+            TrayIconState::Recording,
+            [76, 175, 80, 255],
+            &paths.recording,
+        ),
         (TrayIconState::Blocked, [255, 152, 0, 255], &paths.blocked),
     ];
 
@@ -510,7 +518,9 @@ fn create_tray_icons(paths: &TrayIconPaths) -> Result<()> {
 fn load_base_icon(size: u32) -> RgbaImage {
     let logo_bytes = include_bytes!("../../assets/logo.png");
     if let Ok(image) = image::load_from_memory(logo_bytes) {
-        image.resize_exact(size, size, FilterType::Lanczos3).to_rgba8()
+        image
+            .resize_exact(size, size, FilterType::Lanczos3)
+            .to_rgba8()
     } else {
         create_fallback_icon(size)
     }

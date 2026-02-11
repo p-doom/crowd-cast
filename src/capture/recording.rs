@@ -26,7 +26,11 @@ use tracing::{debug, info};
 ///
 /// # Returns
 /// Tuple of (output_width, output_height), both guaranteed to be even
-pub fn calculate_output_dimensions(base_width: u32, base_height: u32, max_height: u32) -> (u32, u32) {
+pub fn calculate_output_dimensions(
+    base_width: u32,
+    base_height: u32,
+    max_height: u32,
+) -> (u32, u32) {
     // If max_height is 0 or source is already at/below max, use native (but ensure even)
     if max_height == 0 || base_height <= max_height {
         return (make_even(base_width), make_even(base_height));
@@ -193,7 +197,11 @@ impl RecordingOutput {
     /// - macOS: VideoToolbox HEVC/H.264
     /// - Windows/Linux: NVENC, AMF, QSV (in order of availability)
     /// - Fallback: x264 software encoding
-    pub fn new(context: ObsContext, output_path: PathBuf, config: &RecordingConfig) -> Result<Self> {
+    pub fn new(
+        context: ObsContext,
+        output_path: PathBuf,
+        config: &RecordingConfig,
+    ) -> Result<Self> {
         info!(
             "Creating recording output: {:?} (codec: {:?}, bitrate: {} Kbps)",
             output_path, config.codec_preference, config.video_bitrate
@@ -207,9 +215,9 @@ impl RecordingOutput {
 
         // Build the output with hardware encoder selection
         // Convert PathBuf to ObsPath
-        let output_path_str = output_path.to_str().ok_or_else(|| {
-            anyhow::anyhow!("Invalid output path (non-UTF8): {:?}", output_path)
-        })?;
+        let output_path_str = output_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid output path (non-UTF8): {:?}", output_path))?;
         let obs_path = ObsPath::new(output_path_str);
 
         // Build the output with hardware encoder selection
@@ -227,7 +235,11 @@ impl RecordingOutput {
 
         info!(
             "Recording output configured successfully (audio capture: {})",
-            if config.enable_audio { "enabled" } else { "disabled (silent track)" }
+            if config.enable_audio {
+                "enabled"
+            } else {
+                "disabled (silent track)"
+            }
         );
         debug!(
             "Using format: {:?}, quality preset: {:?}",

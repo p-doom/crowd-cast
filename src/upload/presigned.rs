@@ -45,7 +45,9 @@ impl Uploader {
     /// Create a new uploader
     pub fn new(config: &Config) -> Self {
         let _ = config;
-        Self { client: Client::new() }
+        Self {
+            client: Client::new(),
+        }
     }
 
     fn compile_time_endpoint() -> Option<&'static str> {
@@ -76,7 +78,8 @@ impl Uploader {
             user_id: user_id.to_string(),
         };
 
-        let presign_response: PresignResponse = self.client
+        let presign_response: PresignResponse = self
+            .client
             .post(endpoint)
             .json(&presign_request)
             .send()
@@ -116,16 +119,12 @@ impl Uploader {
                 .and_then(|name| name.to_str())
                 .context("Failed to get video filename")?;
             let file_name = format!("recordings/{}", video_file);
-            let presign_response = self.request_presigned_url(
-                endpoint,
-                &file_name,
-                version,
-                &user_id,
-            ).await?;
+            let presign_response = self
+                .request_presigned_url(endpoint, &file_name, version, &user_id)
+                .await?;
             debug!(
                 "Got pre-signed URL for video chunk {} (key: {})",
-                chunk.chunk_id,
-                presign_response.key
+                chunk.chunk_id, presign_response.key
             );
             video_presign = Some(presign_response);
             video_file_name = Some(file_name);
@@ -133,16 +132,12 @@ impl Uploader {
 
         // 2. Get pre-signed URL for keylogs
         let keylog_file_name = format!("keylogs/input_{}.msgpack", chunk.chunk_id);
-        let keylog_presign = self.request_presigned_url(
-            endpoint,
-            &keylog_file_name,
-            version,
-            &user_id,
-        ).await?;
+        let keylog_presign = self
+            .request_presigned_url(endpoint, &keylog_file_name, version, &user_id)
+            .await?;
         debug!(
             "Got pre-signed URL for keylogs chunk {} (key: {})",
-            chunk.chunk_id,
-            keylog_presign.key
+            chunk.chunk_id, keylog_presign.key
         );
 
         // 3. Upload video file using streaming (if path is available)
@@ -191,8 +186,8 @@ impl Uploader {
         }
 
         // 4. Upload input log (small enough to fit in RAM)
-        let input_bytes = rmp_serde::to_vec(&chunk.events)
-            .context("Failed to serialize input events")?;
+        let input_bytes =
+            rmp_serde::to_vec(&chunk.events).context("Failed to serialize input events")?;
 
         let keylog_content_type = if keylog_presign.content_type.is_empty() {
             "application/msgpack"
@@ -233,7 +228,7 @@ impl Uploader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_presign_request_serialization() {
         let request = PresignRequest {
@@ -241,7 +236,7 @@ mod tests {
             version: "0.0.1".to_string(),
             user_id: "test-user".to_string(),
         };
-        
+
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("recordings/test.mp4"));
         assert!(json.contains("0.0.1"));

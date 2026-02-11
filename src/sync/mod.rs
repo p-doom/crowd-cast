@@ -2,7 +2,7 @@
 
 mod engine;
 
-pub use engine::{SyncEngine, create_engine_channels};
+pub use engine::{create_engine_channels, SyncEngine};
 
 /// Commands that can be sent to the sync engine
 #[derive(Debug, Clone)]

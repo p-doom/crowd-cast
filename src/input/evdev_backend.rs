@@ -2,7 +2,10 @@
 //! Requires user to be in the 'input' group
 
 #[cfg(target_os = "linux")]
-use crate::data::{EventType, InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveEvent, MouseScrollEvent};
+use crate::data::{
+    EventType, InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveEvent,
+    MouseScrollEvent,
+};
 #[cfg(target_os = "linux")]
 use crate::input::InputBackend;
 #[cfg(target_os = "linux")]
@@ -36,22 +39,22 @@ impl EvdevBackend {
     /// This will enumerate input devices and filter for keyboards and mice
     pub fn new() -> Result<Self> {
         let mut devices = Vec::new();
-        
+
         // Enumerate all input devices
         for entry in std::fs::read_dir("/dev/input")? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if !path.to_string_lossy().contains("event") {
                 continue;
             }
-            
+
             match Device::open(&path) {
                 Ok(device) => {
                     let name = device.name().unwrap_or("Unknown");
                     let has_keys = device.supported_keys().is_some();
                     let has_rel = device.supported_relative_axes().is_some();
-                    
+
                     // Include keyboards and mice
                     if has_keys || has_rel {
                         info!("Found input device: {} ({:?})", name, path);
@@ -63,11 +66,11 @@ impl EvdevBackend {
                 }
             }
         }
-        
+
         if devices.is_empty() {
             anyhow::bail!("No input devices found. Make sure you are in the 'input' group.");
         }
-        
+
         Ok(Self {
             devices,
             capturing: Arc::new(AtomicBool::new(false)),
@@ -82,41 +85,41 @@ impl InputBackend for EvdevBackend {
         if self.capturing.load(Ordering::SeqCst) {
             return Ok(());
         }
-        
+
         self.capturing.store(true, Ordering::SeqCst);
         let start_time = Instant::now();
         self.start_time = Some(start_time);
-        
+
         // Take ownership of devices for the threads
         let devices = std::mem::take(&mut self.devices);
-        
+
         for mut device in devices {
             let tx = tx.clone();
             let capturing = self.capturing.clone();
             let start_time = start_time;
-            
+
             let handle = thread::spawn(move || {
                 let device_name = device.name().unwrap_or("Unknown").to_string();
                 info!("Started evdev capture for: {}", device_name);
-                
+
                 loop {
                     if !capturing.load(Ordering::SeqCst) {
                         break;
                     }
-                    
+
                     // Fetch events with timeout
                     match device.fetch_events() {
                         Ok(events) => {
                             for ev in events {
                                 let timestamp_us = start_time.elapsed().as_micros() as u64;
-                                
+
                                 let event_type = match ev.kind() {
                                     InputEventKind::Key(key) => {
                                         let key_event = KeyEvent {
                                             code: key.0 as u32,
                                             name: format!("{:?}", key),
                                         };
-                                        
+
                                         if ev.value() == 1 {
                                             Some(EventType::KeyPress(key_event))
                                         } else if ev.value() == 0 {
@@ -162,13 +165,13 @@ impl InputBackend for EvdevBackend {
                                     }
                                     _ => None,
                                 };
-                                
+
                                 if let Some(event_type) = event_type {
                                     let input_event = InputEvent {
                                         timestamp_us,
                                         event: event_type,
                                     };
-                                    
+
                                     if let Err(e) = tx.send(input_event) {
                                         debug!("Failed to send input event: {}", e);
                                     }
@@ -181,16 +184,16 @@ impl InputBackend for EvdevBackend {
                         }
                     }
                 }
-                
+
                 info!("Stopped evdev capture for: {}", device_name);
             });
-            
+
             let _ = handle;
         }
-        
+
         Ok(())
     }
-    
+
     fn current_timestamp(&self) -> Option<u64> {
         self.start_time.map(|t| t.elapsed().as_micros() as u64)
     }

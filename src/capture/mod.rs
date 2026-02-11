@@ -9,19 +9,21 @@
 //! - Direct control over capture sources and recording
 //! - Ability to fix ScreenCaptureKit issues directly
 
-mod context;
-mod recording;
-mod sources;
-mod recovery;
-mod frontmost;
 mod apps;
+mod context;
+mod frontmost;
+mod recording;
+mod recovery;
+mod sources;
 
+pub use apps::{list_capturable_apps, list_running_apps};
 pub use context::{CaptureContext, RecordingSession};
-pub use recording::{RecordingConfig, RecordingOutput, RecordingOutputBuilder, RecordingState, VideoCodecPreference};
-pub use sources::{ScreenCaptureSource, get_main_display_uuid, get_main_display_resolution};
-pub use recovery::{DisplayMonitor, DisplayChangeEvent, get_display_name, get_display_uuid};
 pub use frontmost::{get_frontmost_app, AppInfo};
-pub use apps::{list_running_apps, list_capturable_apps};
+pub use recording::{
+    RecordingConfig, RecordingOutput, RecordingOutputBuilder, RecordingState, VideoCodecPreference,
+};
+pub use recovery::{get_display_name, get_display_uuid, DisplayChangeEvent, DisplayMonitor};
+pub use sources::{get_main_display_resolution, get_main_display_uuid, ScreenCaptureSource};
 
 /// Events emitted by the capture system
 #[derive(Debug, Clone)]
@@ -31,10 +33,7 @@ pub enum CaptureEvent {
     /// Recording stopped with output file path
     RecordingStopped { path: Option<std::path::PathBuf> },
     /// Capture source state changed
-    SourceStateChanged { 
-        name: String,
-        active: bool,
-    },
+    SourceStateChanged { name: String, active: bool },
     /// All sources recovered after display reconnect
     SourcesRecovered,
 }

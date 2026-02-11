@@ -24,13 +24,15 @@ pub fn init_logging() -> Result<WorkerGuard> {
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("Failed to create log directory: {:?}", log_dir))?;
 
-    prune_old_logs(&log_dir, Duration::from_secs(60 * 60 * 24 * LOG_RETENTION_DAYS));
+    prune_old_logs(
+        &log_dir,
+        Duration::from_secs(60 * 60 * 24 * LOG_RETENTION_DAYS),
+    );
 
     let file_appender = tracing_appender::rolling::daily(&log_dir, LOG_FILE_BASENAME);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
@@ -83,7 +85,9 @@ fn resolve_log_dir() -> Result<PathBuf> {
 
     #[cfg(target_os = "linux")]
     {
-        let base = proj_dirs.state_dir().unwrap_or_else(|| proj_dirs.data_local_dir());
+        let base = proj_dirs
+            .state_dir()
+            .unwrap_or_else(|| proj_dirs.data_local_dir());
         return Ok(base.join("logs"));
     }
 

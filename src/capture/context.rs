@@ -16,15 +16,15 @@ use libobs_wrapper::context::ObsContext;
 use libobs_wrapper::data::video::ObsVideoInfoBuilder;
 use libobs_wrapper::scenes::ObsSceneRef;
 use libobs_wrapper::utils::StartupInfo;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::{convert::Infallible};
 use tracing::{debug, info, warn};
 
 use crate::crash::log_critical_operation;
 
 use super::recording::{calculate_output_dimensions, RecordingConfig, RecordingOutput};
-use super::sources::{get_main_display_uuid, get_main_display_resolution, ScreenCaptureSource};
+use super::sources::{get_main_display_resolution, get_main_display_uuid, ScreenCaptureSource};
 use super::CaptureState;
 use crate::ui::{is_running_in_app_bundle, show_obs_download_started_notification};
 
@@ -102,8 +102,8 @@ impl CaptureContext {
             &options,
             Box::new(ObsBootstrapNotificationHandler::new(notify_download)),
         )
-            .await
-            .context("Failed to bootstrap OBS binaries")
+        .await
+        .context("Failed to bootstrap OBS binaries")
     }
 
     /// Initialize the libobs context (must be called from main thread on some platforms)
@@ -127,9 +127,15 @@ impl CaptureContext {
                 (w, h)
             }
             Err(e) => {
-                warn!("Failed to detect display resolution: {}. Using OBS defaults.", e);
+                warn!(
+                    "Failed to detect display resolution: {}. Using OBS defaults.",
+                    e
+                );
                 let default_video_info = ObsVideoInfoBuilder::new().build();
-                (default_video_info.get_base_width(), default_video_info.get_base_height())
+                (
+                    default_video_info.get_base_width(),
+                    default_video_info.get_base_height(),
+                )
             }
         };
 
@@ -157,8 +163,7 @@ impl CaptureContext {
 
         let startup_info = StartupInfo::default().set_video_info(video_info);
         log_critical_operation("initialize: calling ObsContext::new()");
-        let context =
-            ObsContext::new(startup_info).context("Failed to create OBS context")?;
+        let context = ObsContext::new(startup_info).context("Failed to create OBS context")?;
         log_critical_operation("initialize: ObsContext::new() completed");
 
         info!("libobs context initialized successfully");
@@ -296,7 +301,7 @@ impl CaptureContext {
         }
 
         let target_apps = self.target_apps.clone();
-        
+
         info!(
             "Fully recreating capture sources for {} target app(s)",
             target_apps.len()
@@ -305,7 +310,10 @@ impl CaptureContext {
         // Clear Rust-side source references
         let old_count = self.capture_sources.len();
         self.capture_sources.clear();
-        debug!("Cleared {} existing capture source(s) from Rust Vec", old_count);
+        debug!(
+            "Cleared {} existing capture source(s) from Rust Vec",
+            old_count
+        );
 
         // Drop the old scene reference - this allows OBS to clean up scene items
         // when we create a new scene
@@ -322,11 +330,14 @@ impl CaptureContext {
 
         // Create a fresh scene with a unique name to avoid conflicts with the old one
         // (The old scene will be cleaned up when all references to it are dropped)
-        let scene_name = format!("main_scene_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0));
-        
+        let scene_name = format!(
+            "main_scene_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+
         debug!("Creating new scene: {}", scene_name);
         let mut scene = context
             .scene(scene_name.as_str())
@@ -349,7 +360,10 @@ impl CaptureContext {
             )
             .context("Failed to create screen capture source")?;
 
-            debug!("Recreated display capture source (audio: {})", capture_audio);
+            debug!(
+                "Recreated display capture source (audio: {})",
+                capture_audio
+            );
             self.capture_sources.push(capture_source);
         } else {
             // Get fresh display UUID
@@ -402,7 +416,10 @@ impl CaptureContext {
         self.scene = Some(scene);
 
         let new_count = self.capture_sources.len();
-        info!("Fully recreated {} capture source(s) with new scene", new_count);
+        info!(
+            "Fully recreated {} capture source(s) with new scene",
+            new_count
+        );
 
         // Update state
         if let Ok(mut state) = self.state.write() {
@@ -424,7 +441,7 @@ impl CaptureContext {
     /// - Graphics module cannot change (always true for same display type)
     pub fn reset_video_and_recreate_sources(&mut self) -> Result<()> {
         log_critical_operation("reset_video_and_recreate_sources: starting");
-        
+
         if !self.is_initialized() {
             anyhow::bail!("OBS context not initialized");
         }
@@ -445,9 +462,15 @@ impl CaptureContext {
                 (w, h)
             }
             Err(e) => {
-                warn!("Failed to detect new display resolution: {}. Using defaults.", e);
+                warn!(
+                    "Failed to detect new display resolution: {}. Using defaults.",
+                    e
+                );
                 let default_video_info = ObsVideoInfoBuilder::new().build();
-                (default_video_info.get_base_width(), default_video_info.get_base_height())
+                (
+                    default_video_info.get_base_width(),
+                    default_video_info.get_base_height(),
+                )
             }
         };
 
@@ -480,10 +503,13 @@ impl CaptureContext {
 
         // Reset video (this is the safe way to change resolution)
         log_critical_operation("reset_video_and_recreate_sources: calling reset_video()");
-        let context = self.context.as_mut()
+        let context = self
+            .context
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
-        
-        context.reset_video(video_info)
+
+        context
+            .reset_video(video_info)
             .context("Failed to reset video output")?;
         log_critical_operation("reset_video_and_recreate_sources: reset_video() completed");
 
@@ -585,8 +611,7 @@ impl CaptureContext {
 
         // Ensure output directory exists
         if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create output directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create output directory")?;
         }
 
         info!(
@@ -759,8 +784,9 @@ impl CaptureContext {
             f(&mut state);
 
             // Recompute should_capture
-            state.should_capture =
-                state.recording.is_recording && !state.recording.is_paused && state.any_source_active;
+            state.should_capture = state.recording.is_recording
+                && !state.recording.is_paused
+                && state.any_source_active;
         }
     }
 
@@ -824,7 +850,7 @@ impl ObsBootstrapStatusHandler for ObsBootstrapNotificationHandler {
 impl Drop for CaptureContext {
     fn drop(&mut self) {
         log_critical_operation("CaptureContext::drop: starting");
-        
+
         // Stop any active recording first
         if self.recording.is_some() {
             info!("Stopping recording during shutdown...");

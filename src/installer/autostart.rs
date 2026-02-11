@@ -34,12 +34,12 @@ pub fn is_autostart_enabled() -> bool {
     {
         is_autostart_enabled_windows()
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         is_autostart_enabled_macos()
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         is_autostart_enabled_linux()
@@ -52,12 +52,12 @@ pub fn enable_autostart(config: &AutostartConfig) -> Result<()> {
     {
         enable_autostart_windows(config)
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         enable_autostart_macos(config)
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         enable_autostart_linux(config)
@@ -70,12 +70,12 @@ pub fn disable_autostart() -> Result<()> {
     {
         disable_autostart_windows()
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         disable_autostart_macos()
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         disable_autostart_linux()
@@ -89,7 +89,7 @@ pub fn disable_autostart() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn is_autostart_enabled_windows() -> bool {
     use std::process::Command;
-    
+
     let output = Command::new("reg")
         .args([
             "query",
@@ -98,7 +98,7 @@ fn is_autostart_enabled_windows() -> bool {
             "crowd-cast",
         ])
         .output();
-    
+
     match output {
         Ok(out) => out.status.success(),
         Err(_) => false,
@@ -108,16 +108,16 @@ fn is_autostart_enabled_windows() -> bool {
 #[cfg(target_os = "windows")]
 fn enable_autostart_windows(config: &AutostartConfig) -> Result<()> {
     use std::process::Command;
-    
+
     let exe_path = config.app_path.to_string_lossy();
     let args = if config.args.is_empty() {
         String::new()
     } else {
         format!(" {}", config.args.join(" "))
     };
-    
-    let value = format!("\"{}\"{}",  exe_path, args);
-    
+
+    let value = format!("\"{}\"{}", exe_path, args);
+
     let status = Command::new("reg")
         .args([
             "add",
@@ -132,7 +132,7 @@ fn enable_autostart_windows(config: &AutostartConfig) -> Result<()> {
         ])
         .status()
         .context("Failed to run reg command")?;
-    
+
     if status.success() {
         info!("Enabled autostart for {}", config.app_name);
         Ok(())
@@ -144,7 +144,7 @@ fn enable_autostart_windows(config: &AutostartConfig) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn disable_autostart_windows() -> Result<()> {
     use std::process::Command;
-    
+
     let status = Command::new("reg")
         .args([
             "delete",
@@ -155,7 +155,7 @@ fn disable_autostart_windows() -> Result<()> {
         ])
         .status()
         .context("Failed to run reg command")?;
-    
+
     if status.success() {
         info!("Disabled autostart");
         Ok(())
@@ -181,35 +181,30 @@ fn get_launch_agent_path() -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn is_autostart_enabled_macos() -> bool {
-    get_launch_agent_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    get_launch_agent_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
 fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
     use std::fs;
-    
+
     let plist_path = get_launch_agent_path()?;
-    
+
     // Ensure LaunchAgents directory exists
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    
+
     let exe_path = config.app_path.to_string_lossy();
-    
+
     // Build program arguments
-    let mut program_args = format!(
-        "        <string>{}</string>\n",
-        exe_path
-    );
+    let mut program_args = format!("        <string>{}</string>\n", exe_path);
     for arg in &config.args {
         program_args.push_str(&format!("        <string>{}</string>\n", arg));
     }
-    
+
     let plist_content = format!(
-r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -229,38 +224,38 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
 "#,
         program_args = program_args
     );
-    
+
     fs::write(&plist_path, plist_content)
         .with_context(|| format!("Failed to write LaunchAgent plist to {:?}", plist_path))?;
-    
+
     info!("Created LaunchAgent at {:?}", plist_path);
-    
+
     // Load the launch agent
     let _ = std::process::Command::new("launchctl")
         .args(["load", plist_path.to_str().unwrap()])
         .output();
-    
+
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn disable_autostart_macos() -> Result<()> {
     use std::fs;
-    
+
     let plist_path = get_launch_agent_path()?;
-    
+
     if plist_path.exists() {
         // Unload the launch agent first
         let _ = std::process::Command::new("launchctl")
             .args(["unload", plist_path.to_str().unwrap()])
             .output();
-        
+
         fs::remove_file(&plist_path)
             .with_context(|| format!("Failed to remove LaunchAgent at {:?}", plist_path))?;
-        
+
         info!("Removed LaunchAgent");
     }
-    
+
     Ok(())
 }
 
@@ -270,12 +265,11 @@ fn disable_autostart_macos() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn get_autostart_path() -> Result<PathBuf> {
-    let config_home = std::env::var("XDG_CONFIG_HOME")
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            format!("{}/.config", home)
-        });
-    
+    let config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{}/.config", home)
+    });
+
     Ok(PathBuf::from(config_home)
         .join("autostart")
         .join("crowd-cast.desktop"))
@@ -283,31 +277,29 @@ fn get_autostart_path() -> Result<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn is_autostart_enabled_linux() -> bool {
-    get_autostart_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    get_autostart_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
 fn enable_autostart_linux(config: &AutostartConfig) -> Result<()> {
     use std::fs;
-    
+
     let desktop_path = get_autostart_path()?;
-    
+
     // Ensure autostart directory exists
     if let Some(parent) = desktop_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    
+
     let exe_path = config.app_path.to_string_lossy();
     let args = if config.args.is_empty() {
         String::new()
     } else {
         format!(" {}", config.args.join(" "))
     };
-    
+
     let desktop_content = format!(
-r#"[Desktop Entry]
+        r#"[Desktop Entry]
 Type=Application
 Name={name}
 Exec={exe}{args}
@@ -320,10 +312,10 @@ Comment=crowd-cast data collection agent
         exe = exe_path,
         args = args
     );
-    
+
     fs::write(&desktop_path, desktop_content)
         .with_context(|| format!("Failed to write desktop file to {:?}", desktop_path))?;
-    
+
     info!("Created autostart desktop file at {:?}", desktop_path);
     Ok(())
 }
@@ -331,16 +323,16 @@ Comment=crowd-cast data collection agent
 #[cfg(target_os = "linux")]
 fn disable_autostart_linux() -> Result<()> {
     use std::fs;
-    
+
     let desktop_path = get_autostart_path()?;
-    
+
     if desktop_path.exists() {
         fs::remove_file(&desktop_path)
             .with_context(|| format!("Failed to remove autostart file at {:?}", desktop_path))?;
-        
+
         info!("Removed autostart desktop file");
     }
-    
+
     Ok(())
 }
 
@@ -357,14 +349,14 @@ pub fn setup_autostart_default() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_autostart_config_default() {
         let config = AutostartConfig::default();
         assert_eq!(config.app_name, "crowd-cast");
         assert!(config.start_minimized);
     }
-    
+
     #[test]
     fn test_is_autostart_enabled() {
         let enabled = is_autostart_enabled();
