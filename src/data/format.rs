@@ -10,22 +10,22 @@ use super::InputEvent;
 pub struct InputChunk {
     /// Session identifier
     pub session_id: String,
-    
+
     /// Chunk identifier (matches video chunk filename)
     pub chunk_id: String,
-    
+
     /// Start timestamp in microseconds since backend start.
     /// This represents when video recording started and is used as the
     /// reference point (t=0) for aligning input events with video.
     pub start_time_us: u64,
-    
+
     /// End timestamp in microseconds since backend start.
     /// Set to the timestamp of the last event in the chunk.
     pub end_time_us: u64,
-    
+
     /// Input events in this chunk
     pub events: Vec<InputEvent>,
-    
+
     /// Metadata about the chunk
     pub metadata: ChunkMetadata,
 }
@@ -35,16 +35,16 @@ pub struct InputChunk {
 pub struct ChunkMetadata {
     /// OBS scene name at time of capture
     pub obs_scene: String,
-    
+
     /// Number of times capture was paused during this chunk
     pub pause_count: u32,
-    
+
     /// Total duration paused (microseconds)
     pub pause_duration_us: u64,
-    
+
     /// Agent version
     pub agent_version: String,
-    
+
     /// Platform (windows, macos, linux)
     pub platform: String,
 }
@@ -67,7 +67,7 @@ impl InputChunk {
             },
         }
     }
-    
+
     /// Set the recording start timestamp.
     /// This should be called when OBS recording starts to synchronize
     /// input events with the video timeline.
@@ -78,18 +78,17 @@ impl InputChunk {
             self.start_time_us = timestamp_us;
         }
     }
-    
+
     /// Add an event to the chunk
     pub fn add_event(&mut self, event: InputEvent) {
         self.end_time_us = event.timestamp_us;
         self.events.push(event);
     }
-    
+
     /// Serialize to MessagePack bytes
     pub fn to_msgpack(&self) -> Result<Vec<u8>> {
         Ok(rmp_serde::to_vec(self)?)
     }
-    
 }
 
 /// Information about a completed recording chunk ready for upload
@@ -97,20 +96,20 @@ impl InputChunk {
 pub struct CompletedChunk {
     /// Session ID
     pub session_id: String,
-    
+
     /// Chunk ID (usually derived from filename)
     pub chunk_id: String,
-    
+
     /// Path to video file (optional, may not be set immediately)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_path: Option<std::path::PathBuf>,
-    
+
     /// Input events in this chunk
     pub events: Vec<InputEvent>,
-    
+
     /// Start timestamp (microseconds)
     pub start_time_us: u64,
-    
+
     /// End timestamp (microseconds)
     pub end_time_us: u64,
 }
@@ -127,27 +126,27 @@ impl InputEventBuffer {
     pub fn new() -> Self {
         Self { events: Vec::new() }
     }
-    
+
     /// Add an event to the buffer
     pub fn push(&mut self, event: InputEvent) {
         self.events.push(event);
     }
-    
+
     /// Get the number of events in the buffer
     pub fn len(&self) -> usize {
         self.events.len()
     }
-    
+
     /// Check if the buffer is empty
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
-    
+
     /// Clear the buffer
     pub fn clear(&mut self) {
         self.events.clear();
     }
-    
+
     /// Drain all events from the buffer
     pub fn drain(&mut self) -> Vec<InputEvent> {
         std::mem::take(&mut self.events)

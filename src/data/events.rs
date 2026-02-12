@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct InputEvent {
     /// Timestamp in microseconds since session start
     pub timestamp_us: u64,
-    
+
     /// The type of event
     pub event: EventType,
 }
@@ -18,19 +18,19 @@ pub struct InputEvent {
 pub enum EventType {
     /// Key press event
     KeyPress(KeyEvent),
-    
+
     /// Key release event
     KeyRelease(KeyEvent),
-    
+
     /// Mouse button press
     MousePress(MouseButtonEvent),
-    
+
     /// Mouse button release
     MouseRelease(MouseButtonEvent),
-    
+
     /// Mouse movement
     MouseMove(MouseMoveEvent),
-    
+
     /// Mouse scroll
     MouseScroll(MouseScrollEvent),
 }
@@ -40,7 +40,7 @@ pub enum EventType {
 pub struct KeyEvent {
     /// Key code (platform-specific)
     pub code: u32,
-    
+
     /// Key name (e.g., "KeyA", "Enter", "ShiftLeft")
     pub name: String,
 }
@@ -50,10 +50,10 @@ pub struct KeyEvent {
 pub struct MouseButtonEvent {
     /// Button identifier
     pub button: MouseButton,
-    
+
     /// X coordinate at time of click
     pub x: f64,
-    
+
     /// Y coordinate at time of click
     pub y: f64,
 }
@@ -72,7 +72,7 @@ pub enum MouseButton {
 pub struct MouseMoveEvent {
     /// Relative X movement (device units, true delta on supported platforms)
     pub delta_x: f64,
-    
+
     /// Relative Y movement (device units, true delta on supported platforms)
     pub delta_y: f64,
 }
@@ -82,13 +82,13 @@ pub struct MouseMoveEvent {
 pub struct MouseScrollEvent {
     /// Horizontal scroll delta
     pub delta_x: i64,
-    
+
     /// Vertical scroll delta
     pub delta_y: i64,
-    
+
     /// X coordinate at time of scroll
     pub x: f64,
-    
+
     /// Y coordinate at time of scroll
     pub y: f64,
 }
@@ -224,7 +224,7 @@ impl From<rdev::Key> for KeyEvent {
             rdev::Key::NextTrack => (228, "NextTrack".to_string()),
             rdev::Key::Unknown(code) => (code as u32 + 1000, format!("Unknown({})", code)),
         };
-        
+
         Self { code, name }
     }
 }

@@ -38,7 +38,7 @@ impl Default for WizardResult {
 }
 
 /// Run the GUI setup wizard
-/// 
+///
 /// On macOS, this launches a native Cocoa window.
 /// On other platforms, returns an error indicating native wizard is not available.
 pub fn run_wizard_gui(config: &mut Config) -> Result<WizardResult> {
@@ -61,20 +61,20 @@ fn run_wizard_macos(config: &mut Config) -> Result<WizardResult> {
     // Get list of available apps
     info!("Loading available applications...");
     let apps = list_capturable_apps();
-    
+
     // Convert to FFI format
     let app_wrappers: Vec<AppInfoWrapper> = apps
         .iter()
         .map(|a| AppInfoWrapper::new(&a.bundle_id, &a.name, a.pid))
         .collect();
-    
+
     // Set apps in the native wizard
     wizard_ffi::set_available_apps(&app_wrappers);
-    
+
     // Run the native wizard (blocks until closed)
     info!("Launching native wizard window...");
     let native_result = wizard_ffi::run_native_wizard();
-    
+
     // Convert result
     let result = WizardResult {
         completed: native_result.completed,
@@ -82,16 +82,16 @@ fn run_wizard_macos(config: &mut Config) -> Result<WizardResult> {
         capture_all: native_result.capture_all,
         autostart_enabled: native_result.enable_autostart,
     };
-    
+
     // If wizard completed, update and save config
     if result.completed {
         info!("Wizard completed successfully");
-        
+
         // Update config
         config.capture.capture_all = result.capture_all;
         config.capture.target_apps = result.selected_apps.clone();
         config.capture.setup_completed = true;
-        
+
         // Enable autostart if requested
         if result.autostart_enabled {
             let autostart_config = AutostartConfig::default();
@@ -101,13 +101,13 @@ fn run_wizard_macos(config: &mut Config) -> Result<WizardResult> {
                 info!("Autostart enabled");
             }
         }
-        
+
         // Save config
         config.save()?;
         info!("Configuration saved");
     } else {
         info!("Wizard was cancelled");
     }
-    
+
     Ok(result)
 }

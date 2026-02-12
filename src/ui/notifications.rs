@@ -24,8 +24,7 @@ mod ffi {
     use std::ffi::c_char;
 
     /// Callback type for notification actions
-    pub type NotificationActionCallback =
-        extern "C" fn(action_id: *const c_char, display_id: u32);
+    pub type NotificationActionCallback = extern "C" fn(action_id: *const c_char, display_id: u32);
 
     #[link(name = "notifications_darwin", kind = "static")]
     extern "C" {
@@ -56,11 +55,7 @@ extern "C" fn notification_action_callback(action_id: *const std::ffi::c_char, d
     let action_str = if action_id.is_null() {
         ""
     } else {
-        unsafe {
-            std::ffi::CStr::from_ptr(action_id)
-                .to_str()
-                .unwrap_or("")
-        }
+        unsafe { std::ffi::CStr::from_ptr(action_id).to_str().unwrap_or("") }
     };
 
     debug!(

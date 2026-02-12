@@ -1,7 +1,10 @@
 //! rdev-based input capture backend
 //! Works on Windows, macOS, and Linux (X11)
 
-use crate::data::{EventType, InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveEvent, MouseScrollEvent};
+use crate::data::{
+    EventType, InputEvent, KeyEvent, MouseButton, MouseButtonEvent, MouseMoveEvent,
+    MouseScrollEvent,
+};
 use crate::input::InputBackend;
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,9 +86,9 @@ impl InputBackend for RdevBackend {
                             y: 0.0,
                         }))
                     }
-                    rdev::EventType::MouseMove { delta_x, delta_y, .. } => {
-                        Some(EventType::MouseMove(MouseMoveEvent { delta_x, delta_y }))
-                    }
+                    rdev::EventType::MouseMove {
+                        delta_x, delta_y, ..
+                    } => Some(EventType::MouseMove(MouseMoveEvent { delta_x, delta_y })),
                     rdev::EventType::Wheel { delta_x, delta_y } => {
                         Some(EventType::MouseScroll(MouseScrollEvent {
                             delta_x,

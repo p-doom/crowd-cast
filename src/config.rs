@@ -228,9 +228,10 @@ impl Config {
 
     /// Save configuration to file
     pub fn save(&self) -> Result<()> {
-        let config_path = self.config_path.clone().unwrap_or_else(|| {
-            Self::default_config_path().expect("Failed to get config path")
-        });
+        let config_path = self
+            .config_path
+            .clone()
+            .unwrap_or_else(|| Self::default_config_path().expect("Failed to get config path"));
 
         // Ensure parent directory exists
         if let Some(parent) = config_path.parent() {
@@ -238,8 +239,7 @@ impl Config {
                 .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
         }
 
-        let contents = toml::to_string_pretty(self)
-            .context("Failed to serialize config")?;
+        let contents = toml::to_string_pretty(self).context("Failed to serialize config")?;
 
         std::fs::write(&config_path, contents)
             .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
@@ -249,9 +249,9 @@ impl Config {
 
     /// Get the config file path
     pub fn config_path(&self) -> PathBuf {
-        self.config_path.clone().unwrap_or_else(|| {
-            Self::default_config_path().expect("Failed to get config path")
-        })
+        self.config_path
+            .clone()
+            .unwrap_or_else(|| Self::default_config_path().expect("Failed to get config path"))
     }
 
     /// Get default config path
@@ -264,9 +264,10 @@ impl Config {
 
     /// Get or generate session ID
     pub fn session_id(&self) -> String {
-        self.recording.session_id.clone().unwrap_or_else(|| {
-            uuid::Uuid::new_v4().to_string()
-        })
+        self.recording
+            .session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
     }
 
     /// Check if setup wizard needs to be run
@@ -279,12 +280,12 @@ impl Config {
         if self.capture.capture_all {
             return true;
         }
-        
+
         if self.capture.target_apps.is_empty() {
             // No apps configured - don't capture anything until setup is done
             return false;
         }
-        
+
         self.capture.target_apps.iter().any(|app| app == bundle_id)
     }
 

@@ -14,13 +14,13 @@ use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::time::Instant;
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::capture::{
-    get_frontmost_app, CaptureContext, DisplayChangeEvent, DisplayMonitor, RecordingSession,
-    get_display_uuid,
+    get_display_uuid, get_frontmost_app, CaptureContext, DisplayChangeEvent, DisplayMonitor,
+    RecordingSession,
 };
 use crate::config::Config;
 use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
@@ -29,15 +29,39 @@ use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
     is_authorized as notifications_authorized, show_capture_resumed_notification,
     show_display_change_notification, show_idle_paused_notification,
-    show_idle_resumed_notification, show_recording_paused_notification,
-    show_recording_resumed_notification, show_recording_started_notification,
-    show_recording_stopped_notification, show_sources_refreshed_notification,
-    show_permissions_missing_notification,
-    NotificationAction,
+    show_idle_resumed_notification, show_permissions_missing_notification,
+    show_recording_paused_notification, show_recording_resumed_notification,
+    show_recording_started_notification, show_recording_stopped_notification,
+    show_sources_refreshed_notification, NotificationAction,
 };
 use crate::upload::Uploader;
 
 use super::{EngineCommand, EngineStatus};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusKind {
+    Idle,
+    Capturing,
+    Paused,
+    RecordingBlocked,
+    WaitingForOBS,
+    Uploading,
+    Error,
+}
+
+impl StatusKind {
+    fn from_status(status: &EngineStatus) -> Self {
+        match status {
+            EngineStatus::Idle => Self::Idle,
+            EngineStatus::Capturing { .. } => Self::Capturing,
+            EngineStatus::Paused => Self::Paused,
+            EngineStatus::RecordingBlocked => Self::RecordingBlocked,
+            EngineStatus::WaitingForOBS => Self::WaitingForOBS,
+            EngineStatus::Uploading { .. } => Self::Uploading,
+            EngineStatus::Error(_) => Self::Error,
+        }
+    }
+}
 
 /// A completed segment ready for upload
 #[derive(Debug)]
@@ -117,6 +141,7 @@ const MAX_DISPLAY_REFRESH_RETRIES: u32 = 5;
 
 /// Base delay between display refresh retries (doubles each attempt)
 const DISPLAY_REFRESH_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -172,6 +197,10 @@ pub struct SyncEngine {
     idle_timeout: Duration,
     /// Whether to pause uploads during idle
     pause_uploads_on_idle: bool,
+    /// Last broadcast status kind (used to dedupe noisy status broadcasts)
+    last_status_kind: Option<StatusKind>,
+    /// Last time a capturing status was broadcast (for throttling)
+    last_capturing_status_at: Option<Instant>,
 }
 
 impl SyncEngine {
@@ -183,7 +212,9 @@ impl SyncEngine {
         status_tx: broadcast::Sender<EngineStatus>,
         notification_rx: mpsc::UnboundedReceiver<NotificationAction>,
     ) -> Self {
-        let output_dir = config.recording.output_directory
+        let output_dir = config
+            .recording
+            .output_directory
             .clone()
             .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"));
 
@@ -191,7 +222,7 @@ impl SyncEngine {
         let uploader = Uploader::new(&config);
         let segment_duration_secs = config.recording.segment_duration_secs;
         let delete_after_upload = config.upload.delete_after_upload;
-        
+
         // Activity-gated capture settings
         let idle_timeout_secs = config.capture.idle_timeout_secs;
         let idle_timeout = if idle_timeout_secs > 0 {
@@ -228,6 +259,62 @@ impl SyncEngine {
             idle_paused: false,
             idle_timeout,
             pause_uploads_on_idle,
+            last_status_kind: None,
+            last_capturing_status_at: None,
+        }
+    }
+
+    fn send_status(&mut self, status: EngineStatus) {
+        self.send_status_internal(status, false);
+    }
+
+    fn send_status_force(&mut self, status: EngineStatus) {
+        self.send_status_internal(status, true);
+    }
+
+    fn send_status_internal(&mut self, status: EngineStatus, force: bool) {
+        let status_kind = StatusKind::from_status(&status);
+        let now = Instant::now();
+
+        let should_send = if force {
+            true
+        } else {
+            match status_kind {
+                // Capturing can be noisy from polling; dedupe and throttle it.
+                StatusKind::Capturing => {
+                    self.last_status_kind != Some(StatusKind::Capturing)
+                        || self.last_capturing_status_at.map_or(true, |last| {
+                            now.duration_since(last) >= CAPTURING_STATUS_INTERVAL
+                        })
+                }
+                // RecordingBlocked can also spam while a non-target app is frontmost.
+                StatusKind::RecordingBlocked => {
+                    self.last_status_kind != Some(StatusKind::RecordingBlocked)
+                }
+                _ => true,
+            }
+        };
+
+        if !should_send {
+            return;
+        }
+
+        if status_kind == StatusKind::Capturing {
+            self.last_capturing_status_at = Some(now);
+        }
+        self.last_status_kind = Some(status_kind);
+        let _ = self.status_tx.send(status);
+    }
+
+    fn reset_segment_timer(&self, segment_timer: &mut Option<tokio::time::Interval>) {
+        if self.segment_duration_secs > 0 && self.current_session.is_some() && !self.is_paused {
+            let duration = Duration::from_secs(self.segment_duration_secs);
+            *segment_timer = Some(tokio::time::interval_at(
+                Instant::now() + duration,
+                duration,
+            ));
+        } else {
+            *segment_timer = None;
         }
     }
 
@@ -282,7 +369,10 @@ impl SyncEngine {
                     }
 
                     if let Err(e) = tokio::fs::remove_file(&segment.input_path).await {
-                        warn!("Failed to delete input file {:?}: {}", segment.input_path, e);
+                        warn!(
+                            "Failed to delete input file {:?}: {}",
+                            segment.input_path, e
+                        );
                     } else {
                         debug!("Deleted input file: {:?}", segment.input_path);
                     }
@@ -453,22 +543,18 @@ impl SyncEngine {
         let mut segment_timer: Option<tokio::time::Interval> = None;
 
         // Broadcast initial status
-        let _ = self.status_tx.send(EngineStatus::Idle);
+        self.send_status_force(EngineStatus::Idle);
 
         if self.config.recording.autostart_on_launch {
             info!("Autostart recording on launch enabled");
             if let Err(e) = self.start_recording().await {
                 error!("Failed to autostart recording: {}", e);
-                let _ = self
-                    .status_tx
-                    .send(EngineStatus::Error(format!("Autostart recording failed: {}", e)));
+                self.send_status_force(EngineStatus::Error(format!(
+                    "Autostart recording failed: {}",
+                    e
+                )));
             } else {
-                // Initialize segment timer after successful autostart
-                // Use interval_at to delay first tick (interval() ticks immediately)
-                if self.segment_duration_secs > 0 {
-                    let duration = Duration::from_secs(self.segment_duration_secs);
-                    segment_timer = Some(tokio::time::interval_at(Instant::now() + duration, duration));
-                }
+                self.reset_segment_timer(&mut segment_timer);
             }
         }
 
@@ -480,28 +566,31 @@ impl SyncEngine {
                         EngineCommand::StartRecording => {
                             if let Err(e) = self.start_recording().await {
                                 error!("Failed to start recording: {}", e);
-                                let _ = self.status_tx.send(EngineStatus::Error(format!(
+                                self.send_status_force(EngineStatus::Error(format!(
                                     "Start recording failed: {}",
                                     e
                                 )));
                             } else {
-                                // Reset segment timer when recording starts to ensure full-length first segment
-                                // Use interval_at to delay first tick (interval() ticks immediately)
-                                if self.segment_duration_secs > 0 {
-                                    let duration = Duration::from_secs(self.segment_duration_secs);
-                                    segment_timer = Some(tokio::time::interval_at(Instant::now() + duration, duration));
-                                }
+                                self.reset_segment_timer(&mut segment_timer);
                             }
                         }
                         EngineCommand::StopRecording => {
                             self.stop_recording().await?;
-                            segment_timer = None;
+                            self.reset_segment_timer(&mut segment_timer);
                         }
                         EngineCommand::PauseRecording => {
+                            let was_paused = self.is_paused;
                             self.pause_recording();
+                            if !was_paused && self.is_paused {
+                                self.reset_segment_timer(&mut segment_timer);
+                            }
                         }
                         EngineCommand::ResumeRecording => {
+                            let was_paused = self.is_paused;
                             self.resume_recording();
+                            if was_paused && !self.is_paused {
+                                self.reset_segment_timer(&mut segment_timer);
+                            }
                         }
                         EngineCommand::RefreshSources => {
                             self.refresh_sources();
@@ -534,7 +623,11 @@ impl SyncEngine {
 
                 // Handle input events
                 Some(event) = input_rx.recv() => {
+                    let was_paused = self.is_paused;
                     self.handle_input_event(event).await;
+                    if was_paused && !self.is_paused {
+                        self.reset_segment_timer(&mut segment_timer);
+                    }
                 }
 
                 // Poll frontmost app and check for display changes
@@ -550,11 +643,14 @@ impl SyncEngine {
                         None => std::future::pending().await,
                     }
                 } => {
-                    if self.current_session.is_some() {
+                    if self.current_session.is_some() && !self.is_paused {
                         info!("Segment duration reached, rotating to new segment...");
                         if let Err(e) = self.rotate_segment().await {
                             error!("Failed to rotate segment: {}", e);
                         }
+                    } else if self.is_paused {
+                        // Keep timer disarmed while paused so pause state is stable.
+                        self.reset_segment_timer(&mut segment_timer);
                     }
                 }
 
@@ -581,7 +677,11 @@ impl SyncEngine {
                         tokio::time::sleep_until(deadline).await
                     }
                 } => {
+                    let was_paused = self.is_paused;
                     self.handle_idle_timeout();
+                    if !was_paused && self.is_paused {
+                        self.reset_segment_timer(&mut segment_timer);
+                    }
                 }
             }
         }
@@ -600,8 +700,14 @@ impl SyncEngine {
             debug!("No recording in progress, skipping segment rotation");
             return Ok(());
         }
+        if self.is_paused {
+            debug!("Skipping segment rotation while paused");
+            return Ok(());
+        }
 
-        let main_session_id = self.main_session_id.clone()
+        let main_session_id = self
+            .main_session_id
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("No main session ID set"))?;
 
         info!(
@@ -610,7 +716,6 @@ impl SyncEngine {
         );
 
         // Disable input capture during rotation to prevent events without corresponding video
-        let was_capturing = self.capture_enabled;
         self.capture_enabled = false;
 
         // Flush current events and get video path
@@ -623,7 +728,9 @@ impl SyncEngine {
         let end_time_us = events.last().map(|e| e.timestamp_us).unwrap_or(0);
 
         // Save combined input events to disk
-        let input_path = self.output_dir.join(format!("input_{}.msgpack", segment_id));
+        let input_path = self
+            .output_dir
+            .join(format!("input_{}.msgpack", segment_id));
         let bytes = rmp_serde::to_vec(&events)?;
         tokio::fs::write(&input_path, bytes).await?;
 
@@ -644,15 +751,14 @@ impl SyncEngine {
 
         // Queue for background upload (if uploader is configured)
         if self.uploader.is_configured() {
-            let segment = CompletedSegment {
-                chunk,
-                input_path,
-            };
+            let segment = CompletedSegment { chunk, input_path };
 
             if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
                 error!("Failed to queue segment for upload: {}", e);
             } else {
-                let _ = self.status_tx.send(EngineStatus::Uploading { chunk_id: segment_id });
+                self.send_status_force(EngineStatus::Uploading {
+                    chunk_id: segment_id,
+                });
             }
         }
 
@@ -673,9 +779,10 @@ impl SyncEngine {
                 error!("Failed to start new segment after rotation: {}", e);
                 self.main_session_id = None;
                 self.segment_index = 0;
-                let _ = self.status_tx.send(EngineStatus::Error(
-                    format!("Segment rotation failed: {}", e)
-                ));
+                self.send_status_force(EngineStatus::Error(format!(
+                    "Segment rotation failed: {}",
+                    e
+                )));
                 return Err(e);
             }
         };
@@ -688,12 +795,14 @@ impl SyncEngine {
         self.recording_start_ns = Some(session.start_time_ns);
         self.current_session = Some(session);
 
-        // Re-enable input capture if it was enabled before rotation
-        self.capture_enabled = was_capturing;
-
-        let _ = self.status_tx.send(EngineStatus::Capturing {
-            event_count: 0,
-        });
+        // Re-evaluate frontmost app immediately so status is accurate after rotation.
+        let should_capture = self.should_capture_frontmost_app();
+        self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
+        if self.capture_enabled {
+            self.send_status_force(EngineStatus::Capturing { event_count: 0 });
+        } else {
+            self.send_status_force(EngineStatus::RecordingBlocked);
+        }
 
         Ok(())
     }
@@ -721,7 +830,8 @@ impl SyncEngine {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let file_name = entry.file_name();
                 let file_name_str = file_name.to_string_lossy();
-                if file_name_str.starts_with(&partial_prefix) && file_name_str.ends_with(".msgpack") {
+                if file_name_str.starts_with(&partial_prefix) && file_name_str.ends_with(".msgpack")
+                {
                     partial_files.push(entry.path());
                 }
             }
@@ -733,21 +843,19 @@ impl SyncEngine {
         // Read and combine events from partial files
         for partial_path in &partial_files {
             match tokio::fs::read(partial_path).await {
-                Ok(bytes) => {
-                    match rmp_serde::from_slice::<Vec<InputEvent>>(&bytes) {
-                        Ok(events) => {
-                            debug!(
-                                "Loaded {} events from partial file {:?}",
-                                events.len(),
-                                partial_path
-                            );
-                            all_events.extend(events);
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse partial file {:?}: {}", partial_path, e);
-                        }
+                Ok(bytes) => match rmp_serde::from_slice::<Vec<InputEvent>>(&bytes) {
+                    Ok(events) => {
+                        debug!(
+                            "Loaded {} events from partial file {:?}",
+                            events.len(),
+                            partial_path
+                        );
+                        all_events.extend(events);
                     }
-                }
+                    Err(e) => {
+                        warn!("Failed to parse partial file {:?}: {}", partial_path, e);
+                    }
+                },
                 Err(e) => {
                     warn!("Failed to read partial file {:?}: {}", partial_path, e);
                 }
@@ -784,7 +892,7 @@ impl SyncEngine {
             let details = missing.join(" ");
             let message = format!("Recording not started. {}", details);
             warn!("{}", message);
-            let _ = self.status_tx.send(EngineStatus::Error(message.clone()));
+            self.send_status_force(EngineStatus::Error(message.clone()));
             if self.config.recording.notify_on_start_stop && notifications_authorized() {
                 show_permissions_missing_notification(&message);
             }
@@ -795,14 +903,17 @@ impl SyncEngine {
 
         // Ensure capture sources are set up
         if !self.capture_ctx.is_capture_setup() {
-            self.capture_ctx.setup_capture(&self.config.capture.target_apps)?;
+            self.capture_ctx
+                .setup_capture(&self.config.capture.target_apps)?;
         }
 
         // Generate a main session ID (persists across all segments)
         let main_session_id = uuid::Uuid::new_v4().to_string();
         self.main_session_id = Some(main_session_id.clone());
         self.segment_index = 0;
-        let _ = self.upload_tx.send(UploadMessage::StartSession(main_session_id.clone()));
+        let _ = self
+            .upload_tx
+            .send(UploadMessage::StartSession(main_session_id.clone()));
 
         // Record the current display as the "original" display for recovery purposes
         let current_displays = self.display_monitor.current_display_ids();
@@ -840,7 +951,14 @@ impl SyncEngine {
         self.idle_paused = false; // Ensure not idle-paused when starting
         self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
 
-        let _ = self.status_tx.send(EngineStatus::Capturing { event_count: 0 });
+        // Compute initial capture eligibility immediately instead of waiting for next poll.
+        let should_capture = self.should_capture_frontmost_app();
+        self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
+        if self.capture_enabled {
+            self.send_status_force(EngineStatus::Capturing { event_count: 0 });
+        } else {
+            self.send_status_force(EngineStatus::RecordingBlocked);
+        }
 
         if self.config.recording.notify_on_start_stop && notifications_authorized() {
             show_recording_started_notification();
@@ -870,7 +988,9 @@ impl SyncEngine {
             let end_time_us = events.last().map(|e| e.timestamp_us).unwrap_or(0);
 
             // Save combined input events to disk
-            let input_path = self.output_dir.join(format!("input_{}.msgpack", segment_id));
+            let input_path = self
+                .output_dir
+                .join(format!("input_{}.msgpack", segment_id));
             let bytes = rmp_serde::to_vec(&events)?;
             tokio::fs::write(&input_path, bytes).await?;
 
@@ -898,15 +1018,14 @@ impl SyncEngine {
                     end_time_us,
                 };
 
-                let segment = CompletedSegment {
-                    chunk,
-                    input_path,
-                };
+                let segment = CompletedSegment { chunk, input_path };
 
                 if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
                     error!("Failed to queue final segment for upload: {}", e);
                 } else {
-                    let _ = self.status_tx.send(EngineStatus::Uploading { chunk_id: segment_id });
+                    self.send_status_force(EngineStatus::Uploading {
+                        chunk_id: segment_id,
+                    });
                 }
             }
         } else {
@@ -926,11 +1045,11 @@ impl SyncEngine {
         self.segment_index = 0;
         self.is_paused = false; // Reset paused state when stopping
         self.idle_paused = false; // Reset idle-paused state when stopping
-        
+
         // Clear the original display since we're no longer recording
         self.display_monitor.clear_original_display();
-        
-        let _ = self.status_tx.send(EngineStatus::Idle);
+
+        self.send_status_force(EngineStatus::Idle);
 
         if self.config.recording.notify_on_start_stop && notifications_authorized() {
             show_recording_stopped_notification();
@@ -966,7 +1085,7 @@ impl SyncEngine {
         self.is_paused = true;
         self.capture_enabled = false;
 
-        let _ = self.status_tx.send(EngineStatus::Paused);
+        self.send_status_force(EngineStatus::Paused);
 
         if self.config.recording.notify_on_start_stop && notifications_authorized() {
             show_recording_paused_notification();
@@ -998,11 +1117,16 @@ impl SyncEngine {
         }
 
         self.is_paused = false;
+        let should_capture = self.should_capture_frontmost_app();
+        self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
 
-        // Re-enable capture (poll_frontmost_app will set capture_enabled correctly)
-        let _ = self.status_tx.send(EngineStatus::Capturing {
-            event_count: self.event_buffer.len(),
-        });
+        if self.capture_enabled {
+            self.send_status_force(EngineStatus::Capturing {
+                event_count: self.event_buffer.len(),
+            });
+        } else {
+            self.send_status_force(EngineStatus::RecordingBlocked);
+        }
 
         if self.config.recording.notify_on_start_stop && notifications_authorized() {
             show_recording_resumed_notification();
@@ -1014,7 +1138,7 @@ impl SyncEngine {
     /// Refresh capture sources (manually triggered from tray menu)
     fn refresh_sources(&mut self) {
         info!("Refreshing capture sources...");
-        
+
         match self.capture_ctx.fully_recreate_sources() {
             Ok(count) => {
                 info!("Successfully refreshed {} capture source(s)", count);
@@ -1033,7 +1157,7 @@ impl SyncEngine {
         // Update the original display to the new one
         if let Some(uuid) = get_display_uuid(display_id) {
             self.display_monitor.set_original_display(display_id, uuid);
-            
+
             // Fully recreate sources for the new display (more reliable than in-place update)
             match self.capture_ctx.fully_recreate_sources() {
                 Ok(count) => {
@@ -1072,14 +1196,34 @@ impl SyncEngine {
         let restart_recording = self.current_session.is_some();
 
         match event {
-            DisplayChangeEvent::OriginalReturned { display_id, uuid: _, display_name } => {
+            DisplayChangeEvent::OriginalReturned {
+                display_id,
+                uuid: _,
+                display_name,
+            } => {
                 // Original display came back - auto-recover with light reinit
                 // (same resolution expected, just recreate sources)
-                info!("Original display '{}' (id={}) returned, auto-recovering...", display_name, display_id);
-                self.try_reinitialize_with_retry(&display_name, restart_recording, true, true, false).await;
+                info!(
+                    "Original display '{}' (id={}) returned, auto-recovering...",
+                    display_name, display_id
+                );
+                self.try_reinitialize_with_retry(
+                    &display_name,
+                    restart_recording,
+                    true,
+                    true,
+                    false,
+                )
+                .await;
             }
-            
-            DisplayChangeEvent::SwitchedToNew { from_id, from_name, to_id, to_name, to_uuid: _ } => {
+
+            DisplayChangeEvent::SwitchedToNew {
+                from_id,
+                from_name,
+                to_id,
+                to_name,
+                to_uuid: _,
+            } => {
                 // Switched to a different display - use reset_video() to update resolution
                 // This is safe (uses obs_reset_video, doesn't drop context, no SIGABRT)
                 info!(
@@ -1092,9 +1236,10 @@ impl SyncEngine {
                 }
 
                 // Use full_reinit: true to reset video resolution for new display
-                self.try_reinitialize_with_retry(&to_name, restart_recording, false, true, true).await;
+                self.try_reinitialize_with_retry(&to_name, restart_recording, false, true, true)
+                    .await;
             }
-            
+
             DisplayChangeEvent::AllDisconnected => {
                 // All displays disconnected - just log and wait
                 info!("All displays disconnected, waiting for reconnection...");
@@ -1181,7 +1326,10 @@ impl SyncEngine {
             .await
         {
             Ok(()) => {
-                info!("Successfully reinitialized capture for display '{}'", display_name);
+                info!(
+                    "Successfully reinitialized capture for display '{}'",
+                    display_name
+                );
                 self.pending_display_refresh = None;
             }
             Err(e) => {
@@ -1212,7 +1360,9 @@ impl SyncEngine {
 
         info!(
             "Retrying display refresh for '{}' (attempt {}/{})",
-            pending.display_name, pending.attempt + 1, MAX_DISPLAY_REFRESH_RETRIES
+            pending.display_name,
+            pending.attempt + 1,
+            MAX_DISPLAY_REFRESH_RETRIES
         );
 
         match self
@@ -1341,12 +1491,13 @@ impl SyncEngine {
 
     /// Poll the frontmost application and update capture state
     async fn poll_frontmost_app(&mut self) {
-        // Don't update capture state if paused
+        // Keep app tracking fresh even while paused so state is accurate on resume.
+        let should_capture = self.should_capture_frontmost_app();
+
+        // Don't update capture state if paused.
         if self.is_paused {
             return;
         }
-
-        let should_capture = self.should_capture_frontmost_app();
 
         // Update capture state (only capture if recording AND app is allowed AND not paused)
         let is_recording = self.current_session.is_some();
@@ -1364,11 +1515,11 @@ impl SyncEngine {
         // Update status
         if is_recording {
             if self.capture_enabled {
-                let _ = self.status_tx.send(EngineStatus::Capturing {
+                self.send_status(EngineStatus::Capturing {
                     event_count: self.event_buffer.len(),
                 });
             } else if !self.is_paused {
-                let _ = self.status_tx.send(EngineStatus::RecordingBlocked);
+                self.send_status(EngineStatus::RecordingBlocked);
             }
             // If paused, don't change status - keep showing Paused
         }
@@ -1382,7 +1533,8 @@ impl SyncEngine {
             if should_capture {
                 self.resume_from_idle();
                 // Ensure the event that resumes from idle can be recorded immediately.
-                self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
+                self.capture_enabled =
+                    should_capture && self.current_session.is_some() && !self.is_paused;
             } else {
                 return;
             }

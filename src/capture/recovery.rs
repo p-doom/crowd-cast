@@ -60,10 +60,7 @@ impl DisplayMonitor {
     /// was active. When this display returns after disconnection, auto-recovery
     /// will be triggered without user intervention.
     pub fn set_original_display(&mut self, display_id: u32, uuid: String) {
-        info!(
-            "Setting original display: id={}, uuid={}",
-            display_id, uuid
-        );
+        info!("Setting original display: id={}, uuid={}", display_id, uuid);
         self.original_display_id = Some(display_id);
         self.original_display_uuid = Some(uuid);
     }

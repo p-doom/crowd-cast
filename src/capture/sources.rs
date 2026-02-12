@@ -11,7 +11,9 @@ use libobs_wrapper::sources::{ObsSourceBuilder, ObsSourceRef};
 use tracing::{debug, info};
 
 #[cfg(target_os = "macos")]
-use libobs_simple::sources::macos::{ScreenCaptureSourceBuilder, ScreenCaptureSourceUpdater, ScreenCaptureType};
+use libobs_simple::sources::macos::{
+    ScreenCaptureSourceBuilder, ScreenCaptureSourceUpdater, ScreenCaptureType,
+};
 #[cfg(target_os = "macos")]
 use libobs_wrapper::data::ObsObjectUpdater;
 #[cfg(target_os = "macos")]
@@ -65,7 +67,7 @@ impl ScreenCaptureSource {
             is_active: true,
         })
     }
-    
+
     /// Create a new screen capture source (fallback for non-macOS)
     #[cfg(not(target_os = "macos"))]
     pub fn new_display_capture(
@@ -143,22 +145,22 @@ impl ScreenCaptureSource {
     pub fn name(&self) -> &str {
         &self.name
     }
-    
+
     /// Check if the source is active (producing frames)
     pub fn is_active(&self) -> bool {
         self.is_active
     }
-    
+
     /// Get a reference to the underlying OBS source
     pub fn source(&self) -> &ObsSourceRef {
         &self.source
     }
-    
+
     /// Get a mutable reference to the underlying OBS source
     pub fn source_mut(&mut self) -> &mut ObsSourceRef {
         &mut self.source
     }
-    
+
     /// Update the active state based on source dimensions
     /// A source with 0 width/height is considered inactive (stale capture)
     pub fn update_active_state(&mut self) -> bool {
@@ -166,24 +168,24 @@ impl ScreenCaptureSource {
         // This is a simplified check - the actual implementation would need to
         // access the source's internal state
         let was_active = self.is_active;
-        
+
         // TODO: Implement proper frame detection
         // For now, assume active unless explicitly marked otherwise
         self.is_active = true;
-        
+
         was_active != self.is_active
     }
-    
+
     /// Mark the source as inactive (stale)
     pub fn mark_inactive(&mut self) {
         self.is_active = false;
     }
-    
+
     /// Mark the source as active
     pub fn mark_active(&mut self) {
         self.is_active = true;
     }
-    
+
     /// Update the display UUID for this source
     ///
     /// This updates the source settings in-place without destroying/recreating it.
@@ -191,17 +193,20 @@ impl ScreenCaptureSource {
     #[cfg(target_os = "macos")]
     pub fn update_display_uuid(&mut self, display_uuid: &str) -> Result<()> {
         let runtime = self.source.runtime();
-        
+
         ScreenCaptureSourceUpdater::create_update(runtime, &mut self.source)
             .context("Failed to create source updater")?
             .set_display_uuid(display_uuid)
             .update()
             .context("Failed to update display UUID")?;
-        
-        debug!("Updated display UUID for source '{}' to {}", self.name, display_uuid);
+
+        debug!(
+            "Updated display UUID for source '{}' to {}",
+            self.name, display_uuid
+        );
         Ok(())
     }
-    
+
     /// Update the display UUID (non-macOS stub)
     #[cfg(not(target_os = "macos"))]
     pub fn update_display_uuid(&mut self, _display_uuid: &str) -> Result<()> {
@@ -220,32 +225,32 @@ impl CaptureSourceManager {
             sources: Vec::new(),
         }
     }
-    
+
     /// Add a source to the manager
     pub fn add(&mut self, source: ScreenCaptureSource) {
         self.sources.push(source);
     }
-    
+
     /// Get all sources
     pub fn sources(&self) -> &[ScreenCaptureSource] {
         &self.sources
     }
-    
+
     /// Get mutable access to all sources
     pub fn sources_mut(&mut self) -> &mut [ScreenCaptureSource] {
         &mut self.sources
     }
-    
+
     /// Check if any source is active
     pub fn any_active(&self) -> bool {
         self.sources.iter().any(|s| s.is_active())
     }
-    
+
     /// Get the number of sources
     pub fn len(&self) -> usize {
         self.sources.len()
     }
-    
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty()
@@ -293,7 +298,10 @@ pub fn get_main_display_uuid() -> Result<String> {
     unsafe {
         let uuid_ref = CGDisplayCreateUUIDFromDisplayID(main_display_id);
         if uuid_ref.is_null() {
-            anyhow::bail!("Failed to get UUID for main display (ID: {})", main_display_id);
+            anyhow::bail!(
+                "Failed to get UUID for main display (ID: {})",
+                main_display_id
+            );
         }
 
         let uuid_string = CFUUIDCreateString(std::ptr::null(), uuid_ref);
@@ -364,12 +372,15 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     unsafe {
         let mode = CGDisplayCopyDisplayMode(main_display_id);
         if mode.is_null() {
-            anyhow::bail!("Failed to get display mode for main display (ID: {})", main_display_id);
+            anyhow::bail!(
+                "Failed to get display mode for main display (ID: {})",
+                main_display_id
+            );
         }
 
         let width = CGDisplayModeGetPixelWidth(mode) as u32;
         let height = CGDisplayModeGetPixelHeight(mode) as u32;
-        
+
         CGDisplayModeRelease(mode);
 
         if width == 0 || height == 0 {
