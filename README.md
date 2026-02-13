@@ -89,8 +89,9 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 git clone https://github.com/p-doom/crowd-cast.git
 cd crowd-cast
 
-# Build the agent
-cargo build --release
+# Build the agent (endpoint is required at build time)
+CROWD_CAST_API_GATEWAY_URL="https://your-api-gateway.execute-api.region.amazonaws.com/prod/presign" \
+  cargo build --release
 
 # Run the setup wizard
 ./target/release/crowd-cast-agent --setup
