@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::capture::list_capturable_apps;
 use crate::config::Config;
-use crate::installer::autostart::{enable_autostart, AutostartConfig};
+use crate::installer::autostart::{disable_autostart, enable_autostart, AutostartConfig};
 
 #[cfg(target_os = "macos")]
 use super::wizard_ffi::{self, AppInfoWrapper};
@@ -91,6 +91,7 @@ fn run_wizard_macos(config: &mut Config) -> Result<WizardResult> {
         config.capture.capture_all = result.capture_all;
         config.capture.target_apps = result.selected_apps.clone();
         config.capture.setup_completed = true;
+        config.capture.start_on_login = result.autostart_enabled;
 
         // Enable autostart if requested
         if result.autostart_enabled {
@@ -100,6 +101,10 @@ fn run_wizard_macos(config: &mut Config) -> Result<WizardResult> {
             } else {
                 info!("Autostart enabled");
             }
+        } else if let Err(e) = disable_autostart() {
+            info!("Failed to disable autostart: {}", e);
+        } else {
+            info!("Autostart disabled");
         }
 
         // Save config

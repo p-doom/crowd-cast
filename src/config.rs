@@ -47,6 +47,10 @@ pub struct CaptureConfig {
     #[serde(default)]
     pub setup_completed: bool,
 
+    /// Whether the app should be configured to start automatically at OS login.
+    #[serde(default)]
+    pub start_on_login: bool,
+
     /// Idle timeout in seconds before pausing capture (0 = disabled)
     /// When no keyboard/mouse activity is detected for this duration, recording pauses automatically.
     #[serde(default = "default_idle_timeout_secs")]
@@ -153,6 +157,7 @@ impl Default for CaptureConfig {
             capture_all: false,
             poll_interval_ms: default_poll_interval(),
             setup_completed: false,
+            start_on_login: false,
             idle_timeout_secs: default_idle_timeout_secs(),
             pause_uploads_on_idle: true,
         }
