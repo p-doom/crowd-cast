@@ -99,7 +99,6 @@ impl TrayApp {
         let pause_text = CString::new("Pause Recording")?; // Index 3 - shown when recording
         let resume_text = CString::new("Resume Recording")?; // Index 4 - shown when paused
         let stop_text = CString::new("Stop Recording")?; // Index 5 - shown when recording/paused
-        let refresh_text = CString::new("Refresh Sources")?; // Index 6 - always available
         let config_text = CString::new("Open Config")?;
         let quit_text = CString::new("Quit")?;
 
@@ -111,15 +110,13 @@ impl TrayApp {
             resume_text,       // 4
             stop_text,         // 5
             separator.clone(), // 6
-            refresh_text,      // 7
+            config_text,       // 7
             separator.clone(), // 8
-            config_text,       // 9
-            separator.clone(), // 10
-            quit_text,         // 11
+            quit_text,         // 9
         ];
 
         // Build menu items array (NULL-terminated)
-        // Menu indices: 0=status, 1=sep, 2=start, 3=pause, 4=resume, 5=stop, 6=sep, 7=refresh, 8=sep, 9=config, 10=sep, 11=quit
+        // Menu indices: 0=status, 1=sep, 2=start, 3=pause, 4=resume, 5=stop, 6=sep, 7=config, 8=sep, 9=quit
         // Initially: Start visible, Pause/Resume/Stop hidden (idle state)
         let mut menu_items = vec![
             TrayMenuItem {
@@ -172,10 +169,10 @@ impl TrayApp {
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[7].as_ptr(), // Refresh Sources
+                text: menu_strings[7].as_ptr(), // Open Config
                 disabled: 0,
                 checked: 0,
-                cb: Some(on_refresh_sources),
+                cb: Some(on_open_config),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
@@ -186,21 +183,7 @@ impl TrayApp {
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[9].as_ptr(), // Open Config
-                disabled: 0,
-                checked: 0,
-                cb: Some(on_open_config),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[10].as_ptr(), // separator
-                disabled: 0,
-                checked: 0,
-                cb: None,
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[11].as_ptr(), // Quit
+                text: menu_strings[9].as_ptr(), // Quit
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_quit),
@@ -426,15 +409,6 @@ unsafe extern "C" fn on_resume_recording(_item: *mut TrayMenuItem) {
     if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
         if let Err(e) = sender.try_send(EngineCommand::ResumeRecording) {
             error!("Failed to send resume recording command: {}", e);
-        }
-    }
-}
-
-unsafe extern "C" fn on_refresh_sources(_item: *mut TrayMenuItem) {
-    info!("Refresh sources requested via tray");
-    if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
-        if let Err(e) = sender.try_send(EngineCommand::RefreshSources) {
-            error!("Failed to send refresh sources command: {}", e);
         }
     }
 }

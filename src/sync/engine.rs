@@ -31,8 +31,7 @@ use crate::ui::notifications::{
     show_display_change_notification, show_idle_paused_notification,
     show_idle_resumed_notification, show_permissions_missing_notification,
     show_recording_paused_notification, show_recording_resumed_notification,
-    show_recording_started_notification, show_recording_stopped_notification,
-    show_sources_refreshed_notification, NotificationAction,
+    show_recording_started_notification, show_recording_stopped_notification, NotificationAction,
 };
 use crate::upload::Uploader;
 
@@ -592,9 +591,6 @@ impl SyncEngine {
                                 self.reset_segment_timer(&mut segment_timer);
                             }
                         }
-                        EngineCommand::RefreshSources => {
-                            self.refresh_sources();
-                        }
                         EngineCommand::SwitchToDisplay { display_id } => {
                             info!("User requested switch to display {}", display_id);
                             self.switch_to_display(display_id);
@@ -1133,23 +1129,6 @@ impl SyncEngine {
         }
 
         info!("Recording resumed");
-    }
-
-    /// Refresh capture sources (manually triggered from tray menu)
-    fn refresh_sources(&mut self) {
-        info!("Refreshing capture sources...");
-
-        match self.capture_ctx.fully_recreate_sources() {
-            Ok(count) => {
-                info!("Successfully refreshed {} capture source(s)", count);
-                if notifications_authorized() {
-                    show_sources_refreshed_notification();
-                }
-            }
-            Err(e) => {
-                error!("Failed to refresh capture sources: {}", e);
-            }
-        }
     }
 
     /// Switch to a specific display (called from notification action or command)
