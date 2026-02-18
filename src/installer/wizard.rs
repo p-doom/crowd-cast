@@ -131,6 +131,11 @@ pub fn run_wizard(config: &mut Config) -> Result<WizardResult> {
             Ok(_) => println!("\n[OK] Autostart enabled.\n"),
             Err(e) => println!("\n[Warning] Failed to enable autostart: {}\n", e),
         }
+    } else {
+        match crate::installer::autostart::disable_autostart() {
+            Ok(_) => println!("\n[OK] Autostart disabled.\n"),
+            Err(e) => println!("\n[Warning] Failed to disable autostart: {}\n", e),
+        }
     }
 
     // Save configuration
@@ -138,6 +143,7 @@ pub fn run_wizard(config: &mut Config) -> Result<WizardResult> {
 
     config.capture.capture_all = capture_all;
     config.capture.target_apps = selected_apps.clone();
+    config.capture.start_on_login = autostart_enabled;
     config.complete_setup()?;
 
     println!("=================================================");
@@ -265,6 +271,7 @@ pub async fn run_wizard_async(config: &mut Config) -> Result<WizardResult> {
     if result.success {
         config.capture.capture_all = result.capture_all;
         config.capture.target_apps = result.selected_apps.clone();
+        config.capture.start_on_login = result.autostart_enabled;
         config.capture.setup_completed = true;
         // Don't save here - run_wizard already saved
     }

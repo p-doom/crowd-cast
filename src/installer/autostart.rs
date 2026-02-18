@@ -171,12 +171,15 @@ fn disable_autostart_windows() -> Result<()> {
 // ============================================================================
 
 #[cfg(target_os = "macos")]
+const MACOS_AUTOSTART_LABEL: &str = "dev.crowd-cast.agent";
+
+#[cfg(target_os = "macos")]
 fn get_launch_agent_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("Could not get HOME directory")?;
     Ok(PathBuf::from(home)
         .join("Library")
         .join("LaunchAgents")
-        .join("dev.crowd-cast.agent.plist"))
+        .join(format!("{}.plist", MACOS_AUTOSTART_LABEL)))
 }
 
 #[cfg(target_os = "macos")]
@@ -209,7 +212,7 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>dev.crowd-cast.agent</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
 {program_args}    </array>
@@ -222,6 +225,7 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
 </dict>
 </plist>
 "#,
+        label = MACOS_AUTOSTART_LABEL,
         program_args = program_args
     );
 
@@ -232,6 +236,9 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
 
     // Load the launch agent
     let _ = std::process::Command::new("launchctl")
+        .args(["unload", plist_path.to_str().unwrap()])
+        .output();
+    let _ = std::process::Command::new("launchctl")
         .args(["load", plist_path.to_str().unwrap()])
         .output();
 
@@ -240,23 +247,49 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn disable_autostart_macos() -> Result<()> {
+    remove_macos_launch_agent(&get_launch_agent_path()?)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_launch_agent(plist_path: &PathBuf) -> Result<()> {
     use std::fs;
 
-    let plist_path = get_launch_agent_path()?;
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", plist_path.to_str().unwrap_or_default()])
+        .output();
 
     if plist_path.exists() {
-        // Unload the launch agent first
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", plist_path.to_str().unwrap()])
-            .output();
-
-        fs::remove_file(&plist_path)
+        fs::remove_file(plist_path)
             .with_context(|| format!("Failed to remove LaunchAgent at {:?}", plist_path))?;
-
-        info!("Removed LaunchAgent");
+        info!("Removed LaunchAgent at {:?}", plist_path);
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn is_current_macos_launch_agent_healthy(config: &AutostartConfig) -> Result<bool> {
+    let plist_path = get_launch_agent_path()?;
+    if !plist_path.exists() {
+        return Ok(false);
+    }
+
+    let expected_exe = config.app_path.to_string_lossy();
+    let contents = std::fs::read_to_string(&plist_path)
+        .with_context(|| format!("Failed to read LaunchAgent plist at {:?}", plist_path))?;
+
+    Ok(contents.contains(MACOS_AUTOSTART_LABEL)
+        && contents.contains(&format!("<string>{}</string>", expected_exe)))
+}
+
+#[cfg(target_os = "macos")]
+fn is_current_macos_launch_agent_registered() -> bool {
+    std::process::Command::new("launchctl")
+        .args(["list", MACOS_AUTOSTART_LABEL])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 // ============================================================================
@@ -339,6 +372,49 @@ fn disable_autostart_linux() -> Result<()> {
 // ============================================================================
 // Common Functions
 // ============================================================================
+
+/// Returns true if any autostart artifact currently exists.
+pub fn has_any_autostart_entry() -> bool {
+    is_autostart_enabled()
+}
+
+/// Reconciles OS autostart state with desired configuration.
+/// This is safe to call on every application startup.
+pub fn reconcile_autostart(config: &AutostartConfig, should_enable: bool) -> Result<()> {
+    if should_enable {
+        #[cfg(target_os = "macos")]
+        {
+            let healthy = is_current_macos_launch_agent_healthy(config).unwrap_or(false);
+            let registered = is_current_macos_launch_agent_registered();
+
+            if !healthy || !registered {
+                info!(
+                    "Autostart needs repair (healthy={}, registered={}) - reconfiguring",
+                    healthy, registered
+                );
+                enable_autostart(config)?;
+            }
+
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            if !is_autostart_enabled() {
+                info!("Autostart missing - enabling");
+                enable_autostart(config)?;
+            }
+            return Ok(());
+        }
+    }
+
+    if has_any_autostart_entry() {
+        info!("Autostart disabled by preference - removing entry");
+        disable_autostart()?;
+    }
+
+    Ok(())
+}
 
 /// Setup autostart with default configuration
 pub fn setup_autostart_default() -> Result<()> {

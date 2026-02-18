@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use config::Config;
-use installer::{needs_setup, run_wizard_gui};
+use installer::{needs_setup, reconcile_autostart, run_wizard_gui, AutostartConfig};
 use sync::{create_engine_channels, EngineCommand, SyncEngine};
 
 /// Main entry point, runs tray on main thread (required for macOS)
@@ -109,6 +109,8 @@ fn main() -> Result<()> {
             .spawn()?;
         std::process::exit(0);
     }
+
+    reconcile_start_on_login(&mut config);
 
     // Check permissions
     let perms = installer::check_permissions();
@@ -245,6 +247,20 @@ fn get_output_directory(config: &Config) -> std::path::PathBuf {
         .output_directory
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"))
+}
+
+fn reconcile_start_on_login(config: &mut Config) {
+    if !config.capture.setup_completed {
+        return;
+    }
+
+    let desired = config.capture.start_on_login;
+
+    let autostart_config = AutostartConfig::default();
+    match reconcile_autostart(&autostart_config, desired) {
+        Ok(_) => info!("Autostart reconciled (start_on_login={})", desired),
+        Err(e) => warn!("Failed to reconcile autostart: {}", e),
+    }
 }
 
 fn print_help() {
