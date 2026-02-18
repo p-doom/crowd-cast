@@ -117,6 +117,38 @@ After setup, simply run `crowd-cast-agent` and it will:
 
 1. Grant **Accessibility** permission to the agent (System Settings → Privacy & Security → Accessibility)
 
+#### macOS Distribution (Developer ID)
+
+First-time setup on a release machine:
+
+```bash
+scripts/setup-macos-signing.sh \
+  --p12 /path/to/developer-id.p12
+```
+
+For full release (sign app, build/sign dmg, notarize, staple, verify):
+
+```bash
+scripts/release-macos.sh \
+  --identity "Developer ID Application: Your Name (TEAMID)" \
+  --api-gateway-url "https://example.execute-api.us-east-1.amazonaws.com/prod/presign"
+```
+
+If you need only app bundling/signing:
+
+```bash
+scripts/bundle-macos.sh \
+  --identity "Developer ID Application: Your Name (TEAMID)"
+```
+
+The signing pipeline uses hardened runtime entitlements from `resources/macos/Entitlements.plist`.
+`scripts/bundle-macos.sh` bundles loader-critical OBS binaries (`libobs.framework` + required `.dylib`s)
+into `Contents/Frameworks`; runtime plugin/data bootstrap is handled by `libobs-bootstrapper`.
+
+Release helper options:
+
+- `scripts/release-macos.sh --skip-notarize`
+
 ### Linux (Wayland)
 
 For Wayland support, the agent uses `evdev` which requires the user to be in the `input` group:
