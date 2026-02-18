@@ -4,6 +4,8 @@
 //! and compiles the tray icon C/Objective-C sources.
 
 fn main() {
+    configure_upload_endpoint();
+
     // Tell Cargo about the no_tray cfg
     println!("cargo::rustc-check-cfg=cfg(no_tray)");
     // macOS: Set rpath for finding libobs.framework and dylibs at runtime
@@ -75,4 +77,28 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ui/notifications_darwin.m");
     println!("cargo:rerun-if-changed=src/ui/wizard_darwin.h");
     println!("cargo:rerun-if-changed=src/ui/wizard_darwin.m");
+}
+
+fn configure_upload_endpoint() {
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_API_GATEWAY_URL");
+
+    let endpoint = std::env::var("CROWD_CAST_API_GATEWAY_URL").unwrap_or_else(|_| {
+        panic!(
+            "CROWD_CAST_API_GATEWAY_URL must be set at build time. Example:\n\
+             CROWD_CAST_API_GATEWAY_URL='https://example.execute-api.us-east-1.amazonaws.com/prod/presign' cargo build --release"
+        )
+    });
+
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        panic!("CROWD_CAST_API_GATEWAY_URL is set but empty");
+    }
+
+    if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
+        panic!(
+            "CROWD_CAST_API_GATEWAY_URL must start with http:// or https:// (got: {endpoint})"
+        );
+    }
+
+    println!("cargo:rustc-env=CROWD_CAST_API_GATEWAY_URL={endpoint}");
 }
