@@ -1,6 +1,6 @@
 #!/bin/bash
 # End-to-end macOS release workflow:
-# build/sign app, create/sign dmg, notarize, staple, and verify.
+# build/sign app, create/sign dmg, and optionally notarize/staple.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +16,8 @@ DMG_PATH="${TARGET_DIR}/${APP_NAME}.dmg"
 SIGN_IDENTITY="${CROWD_CAST_MACOS_SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${CROWD_CAST_NOTARY_PROFILE:-crowdcast-notary}"
 API_GATEWAY_URL="${CROWD_CAST_API_GATEWAY_URL:-}"
-NOTARIZE=1
+DMG_BACKGROUND="resources/macos/dmg-background@2x.png"
+NOTARIZE=0
 
 usage() {
     cat <<EOF
@@ -27,7 +28,7 @@ Options:
   --notary-profile <profile>   notarytool profile (default: crowdcast-notary)
   --api-gateway-url <url>      Build-time CROWD_CAST_API_GATEWAY_URL
   --debug                      Use debug build artifacts
-  --skip-notarize              Skip notarization/stapling steps
+  --notarize                   Run notarization and stapling steps
   -h, --help                   Show this help
 
 Environment fallbacks:
@@ -65,8 +66,8 @@ while [[ $# -gt 0 ]]; do
             DMG_PATH="${TARGET_DIR}/${APP_NAME}.dmg"
             shift
             ;;
-        --skip-notarize)
-            NOTARIZE=0
+        --notarize)
+            NOTARIZE=1
             shift
             ;;
         -h|--help)
@@ -84,7 +85,7 @@ done
 require_cmd cargo
 require_cmd codesign
 require_cmd spctl
-require_cmd hdiutil
+require_cmd create-dmg
 
 if [[ -z "$SIGN_IDENTITY" ]]; then
     echo "Missing signing identity. Pass --identity or set CROWD_CAST_MACOS_SIGN_IDENTITY." >&2
@@ -108,14 +109,35 @@ if [[ ! -d "$APP_PATH" ]]; then
     exit 1
 fi
 
-echo "Step 2/5: Create DMG..."
+echo "Step 2/5: Create drag-to-Applications DMG..."
 rm -f "$DMG_PATH"
-hdiutil create \
-    -volname "$APP_NAME" \
-    -srcfolder "$APP_PATH" \
-    -ov \
-    -format UDZO \
-    "$DMG_PATH"
+
+CREATE_DMG_ARGS=(
+    --volname "$APP_NAME"
+    --window-pos 200 120
+    --window-size 660 400
+    --icon-size 128
+    --text-size 13
+    --icon "${APP_NAME}.app" 180 190
+    --hide-extension "${APP_NAME}.app"
+    --app-drop-link 480 190
+    --no-internet-enable
+    --format UDZO
+)
+
+if [[ -f "$DMG_BACKGROUND" ]]; then
+    CREATE_DMG_ARGS+=(--background "$DMG_BACKGROUND")
+fi
+
+set +e
+create-dmg "${CREATE_DMG_ARGS[@]}" "$DMG_PATH" "$APP_PATH"
+CREATE_DMG_EXIT=$?
+set -e
+
+if [[ $CREATE_DMG_EXIT -ne 0 && $CREATE_DMG_EXIT -ne 2 ]]; then
+    echo "create-dmg failed with exit code $CREATE_DMG_EXIT" >&2
+    exit 1
+fi
 
 echo "Step 3/5: Sign DMG..."
 codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH"
@@ -127,7 +149,7 @@ if [[ "$NOTARIZE" -eq 1 ]]; then
     xcrun stapler staple "$APP_PATH"
     xcrun stapler staple "$DMG_PATH"
 else
-    echo "Step 4/5: Skipped notarization/stapling (--skip-notarize)."
+    echo "Step 4/5: Skipped notarization/stapling (use --notarize to enable)."
 fi
 
 echo "Step 5/5: Verification gates..."
@@ -136,7 +158,7 @@ if [[ "$NOTARIZE" -eq 1 ]]; then
     spctl --assess --type execute --verbose "$APP_PATH"
     spctl --assess --type open --verbose "$DMG_PATH"
 else
-    echo "Skipping Gatekeeper assessment because notarization was skipped."
+    echo "Skipping Gatekeeper assessment because notarization is disabled."
 fi
 
 echo

@@ -81,6 +81,7 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 
 - Rust toolchain (for building from source)
 - macOS: Homebrew with `brew install simde` (for ARM builds)
+- macOS (release builds): `brew install create-dmg` (for DMG packaging)
 
 ### Installation
 
@@ -131,8 +132,11 @@ For full release (sign app, build/sign dmg, notarize, staple, verify):
 ```bash
 scripts/release-macos.sh \
   --identity "Developer ID Application: Your Name (TEAMID)" \
+  --notarize \
   --api-gateway-url "https://example.execute-api.us-east-1.amazonaws.com/prod/presign"
 ```
+
+The release DMG uses a drag-and-drop layout with `CrowdCast.app` and an `Applications` link.
 
 If you need only app bundling/signing:
 
@@ -147,7 +151,7 @@ into `Contents/Frameworks`; runtime plugin/data bootstrap is handled by `libobs-
 
 Release helper options:
 
-- `scripts/release-macos.sh --skip-notarize`
+- `scripts/release-macos.sh --notarize`
 
 ### Linux (Wayland)
 
@@ -378,7 +382,8 @@ crowd-cast/
 
 **macOS (Apple Silicon):**
 ```bash
-brew install simde  # Required for ARM builds
+brew install simde       # Required for ARM builds
+brew install create-dmg  # Required for release DMG packaging
 ```
 
 **Linux:**
