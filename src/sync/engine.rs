@@ -23,7 +23,9 @@ use crate::capture::{
     RecordingSession,
 };
 use crate::config::Config;
-use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
+use crate::data::{
+    CompletedChunk, EventType, InputEvent, InputEventBuffer, KeyEvent, MouseButtonEvent,
+};
 use crate::input::{create_input_backend, InputBackend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
@@ -142,6 +144,52 @@ const MAX_DISPLAY_REFRESH_RETRIES: u32 = 5;
 const DISPLAY_REFRESH_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Default)]
+struct HeldInputState {
+    keys: Vec<KeyEvent>,
+    mouse_buttons: Vec<MouseButtonEvent>,
+}
+
+impl HeldInputState {
+    fn observe(&mut self, event: &EventType) {
+        match event {
+            EventType::KeyPress(key) if !self.keys.contains(key) => self.keys.push(key.clone()),
+            EventType::KeyRelease(key) => self.keys.retain(|held| held != key),
+            EventType::MousePress(button)
+                if !self
+                    .mouse_buttons
+                    .iter()
+                    .any(|held| held.button == button.button) =>
+            {
+                self.mouse_buttons.push(button.clone())
+            }
+            EventType::MouseRelease(button) => self
+                .mouse_buttons
+                .retain(|held| held.button != button.button),
+            _ => {}
+        }
+    }
+
+    fn take_synthetic_releases(&mut self, timestamp_us: u64) -> Vec<InputEvent> {
+        self.keys
+            .drain(..)
+            .map(|key| InputEvent {
+                timestamp_us,
+                event: EventType::KeyRelease(key),
+            })
+            .chain(self.mouse_buttons.drain(..).map(|button| InputEvent {
+                timestamp_us,
+                event: EventType::MouseRelease(button),
+            }))
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.mouse_buttons.clear();
+    }
+}
+
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
     /// Configuration
@@ -156,6 +204,8 @@ pub struct SyncEngine {
     status_tx: broadcast::Sender<EngineStatus>,
     /// Input event buffer
     event_buffer: InputEventBuffer,
+    /// Inputs currently held down in the recorded stream
+    held_inputs: HeldInputState,
     /// Whether input capture is currently enabled
     capture_enabled: bool,
     /// Whether recording is currently paused (both video and keylog)
@@ -238,6 +288,7 @@ impl SyncEngine {
             cmd_rx,
             status_tx,
             event_buffer: InputEventBuffer::new(),
+            held_inputs: HeldInputState::default(),
             capture_enabled: false,
             is_paused: false,
             last_frontmost_app: None,
@@ -315,6 +366,22 @@ impl SyncEngine {
         } else {
             *segment_timer = None;
         }
+    }
+
+    fn flush_held_input_releases(&mut self) {
+        self.event_buffer.events.extend(
+            self.held_inputs.take_synthetic_releases(
+                self.recording_start_ns
+                    .map(|start_ns| {
+                        self.capture_ctx
+                            .get_video_frame_time()
+                            .unwrap_or(0)
+                            .saturating_sub(start_ns)
+                            / 1000
+                    })
+                    .unwrap_or(0),
+            ),
+        );
     }
 
     /// Spawn background task for uploading completed segments
@@ -943,6 +1010,7 @@ impl SyncEngine {
         self.recording_start_ns = Some(session.start_time_ns);
         self.current_session = Some(session);
         self.event_buffer.clear();
+        self.held_inputs.clear();
         self.is_paused = false; // Ensure not paused when starting
         self.idle_paused = false; // Ensure not idle-paused when starting
         self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
@@ -971,6 +1039,7 @@ impl SyncEngine {
         }
 
         info!("Stopping recording...");
+        self.flush_held_input_releases();
 
         // Save any buffered events with final video path
         let video_path = self.current_session.as_ref().map(|s| s.output_path.clone());
@@ -1036,6 +1105,7 @@ impl SyncEngine {
         }
 
         self.current_session = None;
+        self.held_inputs.clear();
         self.recording_start_ns = None;
         self.main_session_id = None;
         self.segment_index = 0;
@@ -1078,6 +1148,7 @@ impl SyncEngine {
             return;
         }
 
+        self.flush_held_input_releases();
         self.is_paused = true;
         self.capture_enabled = false;
 
@@ -1482,6 +1553,9 @@ impl SyncEngine {
         let is_recording = self.current_session.is_some();
         let was_capturing = self.capture_enabled;
         self.capture_enabled = should_capture && is_recording && !self.is_paused;
+        if was_capturing && !self.capture_enabled {
+            self.flush_held_input_releases();
+        }
 
         if self.capture_enabled != was_capturing {
             if self.capture_enabled {
@@ -1539,6 +1613,7 @@ impl SyncEngine {
             event
         };
 
+        self.held_inputs.observe(&adjusted_event.event);
         self.event_buffer.push(adjusted_event);
         self.last_recorded_action_time = Instant::now();
 
@@ -1582,6 +1657,45 @@ impl SyncEngine {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::MouseButton;
+
+    #[test]
+    fn held_input_state_emits_synthetic_releases_and_clears() {
+        let mut held = HeldInputState::default();
+        held.observe(&EventType::KeyPress(KeyEvent {
+            code: 0,
+            name: "Alt".to_string(),
+        }));
+        held.observe(&EventType::MousePress(MouseButtonEvent {
+            button: MouseButton::Left,
+            x: 1.0,
+            y: 2.0,
+        }));
+
+        let events = held.take_synthetic_releases(42);
+        assert!(matches!(events[0].event, EventType::KeyRelease(_)));
+        assert!(matches!(events[1].event, EventType::MouseRelease(_)));
+        assert!(held.take_synthetic_releases(99).is_empty());
+    }
+
+    #[test]
+    fn held_input_state_drops_inputs_released_normally() {
+        let mut held = HeldInputState::default();
+        let key = KeyEvent {
+            code: 0,
+            name: "Alt".to_string(),
+        };
+        held.observe(&EventType::KeyPress(key.clone()));
+        held.observe(&EventType::KeyPress(key.clone()));
+        held.observe(&EventType::KeyRelease(key));
+
+        assert!(held.take_synthetic_releases(42).is_empty());
     }
 }
 

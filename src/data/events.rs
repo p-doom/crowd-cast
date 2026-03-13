@@ -36,7 +36,7 @@ pub enum EventType {
 }
 
 /// Keyboard event data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyEvent {
     /// Key code (platform-specific)
     pub code: u32,
@@ -59,7 +59,7 @@ pub struct MouseButtonEvent {
 }
 
 /// Mouse button identifier
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
     Right,
