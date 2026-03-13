@@ -95,9 +95,7 @@ fn configure_upload_endpoint() {
     }
 
     if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
-        panic!(
-            "CROWD_CAST_API_GATEWAY_URL must start with http:// or https:// (got: {endpoint})"
-        );
+        panic!("CROWD_CAST_API_GATEWAY_URL must start with http:// or https:// (got: {endpoint})");
     }
 
     println!("cargo:rustc-env=CROWD_CAST_API_GATEWAY_URL={endpoint}");

@@ -232,15 +232,25 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
     fs::write(&plist_path, plist_content)
         .with_context(|| format!("Failed to write LaunchAgent plist to {:?}", plist_path))?;
 
-    info!("Created LaunchAgent at {:?}", plist_path);
+    info!(
+        "Configured LaunchAgent at {:?} (applies at next login; no immediate launch)",
+        plist_path
+    );
 
-    // Load the launch agent
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", plist_path.to_str().unwrap()])
-        .output();
-    let _ = std::process::Command::new("launchctl")
-        .args(["load", plist_path.to_str().unwrap()])
-        .output();
+    // Ensure launchd state is not disabled for this service.
+    if is_current_macos_launch_agent_disabled()? {
+        let service = macos_launch_agent_service_target();
+        let status = std::process::Command::new("launchctl")
+            .args(["enable", &service])
+            .status()
+            .with_context(|| format!("Failed to run launchctl enable for {}", service))?;
+
+        if status.success() {
+            info!("Re-enabled LaunchAgent service {}", service);
+        } else {
+            anyhow::bail!("launchctl enable failed for {}", service);
+        }
+    }
 
     Ok(())
 }
@@ -255,8 +265,12 @@ fn disable_autostart_macos() -> Result<()> {
 fn remove_macos_launch_agent(plist_path: &PathBuf) -> Result<()> {
     use std::fs;
 
+    let service = macos_launch_agent_service_target();
     let _ = std::process::Command::new("launchctl")
-        .args(["unload", plist_path.to_str().unwrap_or_default()])
+        .args(["bootout", &service])
+        .output();
+    let _ = std::process::Command::new("launchctl")
+        .args(["disable", &service])
         .output();
 
     if plist_path.exists() {
@@ -284,12 +298,41 @@ fn is_current_macos_launch_agent_healthy(config: &AutostartConfig) -> Result<boo
 }
 
 #[cfg(target_os = "macos")]
-fn is_current_macos_launch_agent_registered() -> bool {
-    std::process::Command::new("launchctl")
-        .args(["list", MACOS_AUTOSTART_LABEL])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+fn macos_launch_agent_domain_target() -> String {
+    let uid = unsafe { libc::getuid() };
+    format!("gui/{}", uid)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_service_target() -> String {
+    format!(
+        "{}/{}",
+        macos_launch_agent_domain_target(),
+        MACOS_AUTOSTART_LABEL
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn is_current_macos_launch_agent_disabled() -> Result<bool> {
+    let domain = macos_launch_agent_domain_target();
+    let output = std::process::Command::new("launchctl")
+        .args(["print-disabled", &domain])
+        .output()
+        .with_context(|| format!("Failed to run launchctl print-disabled for {}", domain))?;
+
+    if !output.status.success() {
+        anyhow::bail!("launchctl print-disabled failed for {}", domain);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let disabled_markers = [
+        format!("\"{}\" => disabled", MACOS_AUTOSTART_LABEL),
+        format!("{} => disabled", MACOS_AUTOSTART_LABEL),
+        format!("\"{}\" => true", MACOS_AUTOSTART_LABEL),
+        format!("{} => true", MACOS_AUTOSTART_LABEL),
+    ];
+
+    Ok(disabled_markers.iter().any(|marker| stdout.contains(marker)))
 }
 
 // ============================================================================
@@ -385,12 +428,12 @@ pub fn reconcile_autostart(config: &AutostartConfig, should_enable: bool) -> Res
         #[cfg(target_os = "macos")]
         {
             let healthy = is_current_macos_launch_agent_healthy(config).unwrap_or(false);
-            let registered = is_current_macos_launch_agent_registered();
+            let disabled = is_current_macos_launch_agent_disabled().unwrap_or(false);
 
-            if !healthy || !registered {
+            if !healthy || disabled {
                 info!(
-                    "Autostart needs repair (healthy={}, registered={}) - reconfiguring",
-                    healthy, registered
+                    "Autostart needs repair (healthy={}, disabled={}) - reconfiguring",
+                    healthy, disabled
                 );
                 enable_autostart(config)?;
             }

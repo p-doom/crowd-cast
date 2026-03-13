@@ -15,7 +15,7 @@ use libobs_bootstrapper::{
 use libobs_wrapper::context::ObsContext;
 use libobs_wrapper::data::video::ObsVideoInfoBuilder;
 use libobs_wrapper::scenes::ObsSceneRef;
-use libobs_wrapper::utils::StartupInfo;
+use libobs_wrapper::utils::{ObsPath, StartupInfo, StartupPaths};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -95,8 +95,29 @@ impl CaptureContext {
 
     /// Bootstrap OBS binaries
     async fn bootstrap_obs() -> Result<ObsBootstrapperResult> {
-        let options = ObsBootstrapperOptions::default();
         let notify_download = is_running_in_app_bundle();
+        #[cfg(target_os = "macos")]
+        let options = {
+            let mut options = ObsBootstrapperOptions::default().set_update(false);
+            if let Some(runtime_root) = obs_runtime_root() {
+                info!(
+                    "Using external OBS bootstrap install dir {}",
+                    runtime_root.display()
+                );
+                options = options.set_install_dir(runtime_root);
+            }
+            options
+        };
+        #[cfg(not(target_os = "macos"))]
+        let options = ObsBootstrapperOptions::default().set_update(false);
+
+        // Do not auto-update OBS at runtime. Only install when missing.
+        let obs_present = ObsBootstrapper::is_valid_installation_with_options(&options)
+            .context("Failed to check OBS installation")?;
+        if obs_present {
+            debug!("OBS installation already present; skipping runtime update checks");
+            return Ok(ObsBootstrapperResult::None);
+        }
 
         ObsBootstrapper::bootstrap_with_handler(
             &options,
@@ -161,7 +182,11 @@ impl CaptureContext {
             .output_height(output_height)
             .build();
 
-        let startup_info = StartupInfo::default().set_video_info(video_info);
+        let mut startup_info = StartupInfo::default().set_video_info(video_info);
+        #[cfg(target_os = "macos")]
+        if let Some(paths) = obs_startup_paths_from_env() {
+            startup_info = startup_info.set_startup_paths(paths);
+        }
         log_critical_operation("initialize: calling ObsContext::new()");
         let context = ObsContext::new(startup_info).context("Failed to create OBS context")?;
         log_critical_operation("initialize: ObsContext::new() completed");
@@ -829,6 +854,41 @@ impl ObsBootstrapNotificationHandler {
             download_notified: false,
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn obs_runtime_root() -> Option<PathBuf> {
+    if let Ok(runtime_dir) = std::env::var("CROWD_CAST_OBS_RUNTIME_DIR") {
+        return Some(PathBuf::from(runtime_dir));
+    }
+
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join("Library/Application Support/dev.crowd-cast.agent/obs/current"))
+}
+
+#[cfg(target_os = "macos")]
+fn obs_startup_paths_from_env() -> Option<StartupPaths> {
+    let runtime_root = obs_runtime_root()?;
+
+    if !runtime_root.exists() {
+        return None;
+    }
+
+    let libobs_data = runtime_root.join("data/libobs");
+    let plugin_bin = runtime_root.join("obs-plugins/%module%.plugin/Contents/MacOS");
+    let plugin_data = runtime_root.join("data/obs-plugins/%module%");
+
+    let paths = StartupPaths::new(
+        ObsPath::new(libobs_data.to_string_lossy().as_ref()),
+        ObsPath::new(plugin_bin.to_string_lossy().as_ref()),
+        ObsPath::new(plugin_data.to_string_lossy().as_ref()),
+    );
+
+    info!(
+        "Using external OBS runtime paths from {}",
+        runtime_root.display()
+    );
+    Some(paths)
 }
 
 impl ObsBootstrapStatusHandler for ObsBootstrapNotificationHandler {

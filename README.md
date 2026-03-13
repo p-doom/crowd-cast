@@ -81,6 +81,7 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 
 - Rust toolchain (for building from source)
 - macOS: Homebrew with `brew install simde` (for ARM builds)
+- macOS (release builds): `brew install create-dmg` (for DMG packaging)
 
 ### Installation
 
@@ -116,6 +117,41 @@ After setup, simply run `crowd-cast-agent` and it will:
 ### macOS
 
 1. Grant **Accessibility** permission to the agent (System Settings → Privacy & Security → Accessibility)
+
+#### macOS Distribution (Developer ID)
+
+First-time setup on a release machine:
+
+```bash
+scripts/setup-macos-signing.sh \
+  --p12 /path/to/developer-id.p12
+```
+
+For full release (sign app, build/sign dmg, notarize, staple, verify):
+
+```bash
+scripts/release-macos.sh \
+  --identity "Developer ID Application: Your Name (TEAMID)" \
+  --notarize \
+  --api-gateway-url "https://example.execute-api.us-east-1.amazonaws.com/prod/presign"
+```
+
+The release DMG uses a drag-and-drop layout with `CrowdCast.app` and an `Applications` link.
+
+If you need only app bundling/signing:
+
+```bash
+scripts/bundle-macos.sh \
+  --identity "Developer ID Application: Your Name (TEAMID)"
+```
+
+The signing pipeline uses hardened runtime entitlements from `resources/macos/Entitlements.plist`.
+`scripts/bundle-macos.sh` bundles loader-critical OBS binaries (`libobs.framework` + required `.dylib`s)
+into `Contents/Frameworks`; runtime plugin/data bootstrap is handled by `libobs-bootstrapper`.
+
+Release helper options:
+
+- `scripts/release-macos.sh --notarize`
 
 ### Linux (Wayland)
 
@@ -346,7 +382,8 @@ crowd-cast/
 
 **macOS (Apple Silicon):**
 ```bash
-brew install simde  # Required for ARM builds
+brew install simde       # Required for ARM builds
+brew install create-dmg  # Required for release DMG packaging
 ```
 
 **Linux:**
