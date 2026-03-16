@@ -19,19 +19,23 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::capture::{
-    get_display_uuid, get_frontmost_app, CaptureContext, DisplayChangeEvent, DisplayMonitor,
-    RecordingSession,
+    CaptureContext, DisplayChangeEvent, DisplayMonitor, RecordingSession, get_display_uuid,
+    get_frontmost_app,
 };
 use crate::config::Config;
-use crate::data::{CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer};
-use crate::input::{create_input_backend, InputBackend};
+use crate::data::{
+    CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer, UNCAPTURED_APP_ID,
+    UNKNOWN_APP_ID,
+};
+use crate::input::{InputBackend, create_input_backend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
-    is_authorized as notifications_authorized, show_capture_resumed_notification,
-    show_display_change_notification, show_idle_paused_notification,
-    show_idle_resumed_notification, show_permissions_missing_notification,
-    show_recording_paused_notification, show_recording_resumed_notification,
-    show_recording_started_notification, show_recording_stopped_notification, NotificationAction,
+    NotificationAction, is_authorized as notifications_authorized,
+    show_capture_resumed_notification, show_display_change_notification,
+    show_idle_paused_notification, show_idle_resumed_notification,
+    show_permissions_missing_notification, show_recording_paused_notification,
+    show_recording_resumed_notification, show_recording_started_notification,
+    show_recording_stopped_notification,
 };
 use crate::upload::Uploader;
 
@@ -141,8 +145,6 @@ const MAX_DISPLAY_REFRESH_RETRIES: u32 = 5;
 /// Base delay between display refresh retries (doubles each attempt)
 const DISPLAY_REFRESH_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
-const UNCAPTURED_APP_ID: &str = "UNCAPTURED";
-const UNKNOWN_APP_ID: &str = "UNKNOWN";
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -204,6 +206,8 @@ pub struct SyncEngine {
     last_capturing_status_at: Option<Instant>,
     /// Last application context emitted into the raw event stream
     last_emitted_context: Option<String>,
+    /// Number of buffered non-context input events for O(1) status updates
+    buffered_non_context_event_count: usize,
 }
 
 impl SyncEngine {
@@ -265,6 +269,7 @@ impl SyncEngine {
             last_status_kind: None,
             last_capturing_status_at: None,
             last_emitted_context: None,
+            buffered_non_context_event_count: 0,
         }
     }
 
@@ -323,18 +328,30 @@ impl SyncEngine {
     }
 
     fn buffered_input_event_count(&self) -> usize {
-        self.event_buffer
-            .events
-            .iter()
-            .filter(|event| !matches!(&event.event, EventType::ContextChanged(_)))
-            .count()
+        self.buffered_non_context_event_count
     }
 
-    fn current_context_app_id(&self, should_capture: bool) -> String {
+    fn buffer_input_event(&mut self, event: InputEvent) {
+        self.event_buffer.push(event);
+        self.buffered_non_context_event_count += 1;
+    }
+
+    fn clear_event_buffer(&mut self) {
+        self.event_buffer.clear();
+        self.buffered_non_context_event_count = 0;
+    }
+
+    fn drain_event_buffer(&mut self) -> Vec<InputEvent> {
+        let events = self.event_buffer.drain();
+        self.buffered_non_context_event_count = 0;
+        events
+    }
+
+    fn current_context_app_id(&self, should_capture: bool) -> &str {
         match self.last_frontmost_app.as_deref() {
-            Some(app_id) if should_capture => app_id.to_string(),
-            Some(_) => UNCAPTURED_APP_ID.to_string(),
-            None => UNKNOWN_APP_ID.to_string(),
+            Some(app_id) if should_capture => app_id,
+            Some(_) => UNCAPTURED_APP_ID,
+            None => UNKNOWN_APP_ID,
         }
     }
 
@@ -362,7 +379,7 @@ impl SyncEngine {
     }
 
     fn emit_context_snapshot(&mut self, should_capture: bool, timestamp_us: u64) {
-        let app_id = self.current_context_app_id(should_capture);
+        let app_id = self.current_context_app_id(should_capture).to_string();
         self.push_context_event(app_id, timestamp_us);
     }
 
@@ -371,11 +388,12 @@ impl SyncEngine {
             return;
         }
 
-        let app_id = self.current_context_app_id(should_capture);
-        if self.last_emitted_context.as_deref() == Some(app_id.as_str()) {
+        if self.last_emitted_context.as_deref() == Some(self.current_context_app_id(should_capture))
+        {
             return;
         }
 
+        let app_id = self.current_context_app_id(should_capture).to_string();
         self.push_context_event(app_id, self.current_capture_timestamp_us());
     }
 
@@ -922,7 +940,7 @@ impl SyncEngine {
         }
 
         // Add remaining events from buffer
-        let buffer_events = self.event_buffer.drain();
+        let buffer_events = self.drain_event_buffer();
         debug!("Adding {} events from buffer", buffer_events.len());
         all_events.extend(buffer_events);
 
@@ -1005,7 +1023,7 @@ impl SyncEngine {
         // Store the OBS timestamp for event synchronization
         self.recording_start_ns = Some(session.start_time_ns);
         self.current_session = Some(session);
-        self.event_buffer.clear();
+        self.clear_event_buffer();
         self.is_paused = false; // Ensure not paused when starting
         self.idle_paused = false; // Ensure not idle-paused when starting
         self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
@@ -1608,7 +1626,7 @@ impl SyncEngine {
             event
         };
 
-        self.event_buffer.push(adjusted_event);
+        self.buffer_input_event(adjusted_event);
         self.last_recorded_action_time = Instant::now();
 
         // Check if buffer should be flushed (e.g., every N events or time interval)
@@ -1640,7 +1658,7 @@ impl SyncEngine {
         ));
 
         // Drain the buffer to bound memory usage
-        let events = self.event_buffer.drain();
+        let events = self.drain_event_buffer();
         let event_count = events.len();
         let bytes = rmp_serde::to_vec(&events)?;
         tokio::fs::write(&flush_path, bytes).await?;
