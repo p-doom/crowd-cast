@@ -16,6 +16,9 @@ pub struct InputEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum EventType {
+    /// Frontmost application context changed
+    ContextChanged(ContextEvent),
+
     /// Key press event
     KeyPress(KeyEvent),
 
@@ -33,6 +36,13 @@ pub enum EventType {
 
     /// Mouse scroll
     MouseScroll(MouseScrollEvent),
+}
+
+/// Frontmost application context at a point in time
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextEvent {
+    /// Bundle identifier / process name, or sentinel values like UNCAPTURED / UNKNOWN
+    pub app_id: String,
 }
 
 /// Keyboard event data
@@ -236,6 +246,29 @@ impl From<rdev::Button> for MouseButton {
             rdev::Button::Right => MouseButton::Right,
             rdev::Button::Middle => MouseButton::Middle,
             rdev::Button::Unknown(n) => MouseButton::Other(n),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_changed_msgpack_roundtrip() {
+        let event = InputEvent {
+            timestamp_us: 42,
+            event: EventType::ContextChanged(ContextEvent {
+                app_id: "UNCAPTURED".to_string(),
+            }),
+        };
+
+        let bytes = rmp_serde::to_vec(&event).unwrap();
+        let decoded: InputEvent = rmp_serde::from_slice(&bytes).unwrap();
+
+        match decoded.event {
+            EventType::ContextChanged(ctx) => assert_eq!(ctx.app_id, "UNCAPTURED"),
+            other => panic!("unexpected event after roundtrip: {:?}", other),
         }
     }
 }

@@ -23,7 +23,7 @@ use crate::capture::{
     RecordingSession,
 };
 use crate::config::Config;
-use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
+use crate::data::{CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer};
 use crate::input::{create_input_backend, InputBackend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
@@ -141,6 +141,8 @@ const MAX_DISPLAY_REFRESH_RETRIES: u32 = 5;
 /// Base delay between display refresh retries (doubles each attempt)
 const DISPLAY_REFRESH_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+const UNCAPTURED_APP_ID: &str = "UNCAPTURED";
+const UNKNOWN_APP_ID: &str = "UNKNOWN";
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -200,6 +202,8 @@ pub struct SyncEngine {
     last_status_kind: Option<StatusKind>,
     /// Last time a capturing status was broadcast (for throttling)
     last_capturing_status_at: Option<Instant>,
+    /// Last application context emitted into the raw event stream
+    last_emitted_context: Option<String>,
 }
 
 impl SyncEngine {
@@ -260,6 +264,7 @@ impl SyncEngine {
             pause_uploads_on_idle,
             last_status_kind: None,
             last_capturing_status_at: None,
+            last_emitted_context: None,
         }
     }
 
@@ -315,6 +320,63 @@ impl SyncEngine {
         } else {
             *segment_timer = None;
         }
+    }
+
+    fn buffered_input_event_count(&self) -> usize {
+        self.event_buffer
+            .events
+            .iter()
+            .filter(|event| !matches!(&event.event, EventType::ContextChanged(_)))
+            .count()
+    }
+
+    fn current_context_app_id(&self, should_capture: bool) -> String {
+        match self.last_frontmost_app.as_deref() {
+            Some(app_id) if should_capture => app_id.to_string(),
+            Some(_) => UNCAPTURED_APP_ID.to_string(),
+            None => UNKNOWN_APP_ID.to_string(),
+        }
+    }
+
+    fn current_capture_timestamp_us(&self) -> u64 {
+        match self.recording_start_ns {
+            Some(start_ns) => {
+                self.capture_ctx
+                    .get_video_frame_time()
+                    .unwrap_or(start_ns)
+                    .saturating_sub(start_ns)
+                    / 1000
+            }
+            None => 0,
+        }
+    }
+
+    fn push_context_event(&mut self, app_id: String, timestamp_us: u64) {
+        self.event_buffer.push(InputEvent {
+            timestamp_us,
+            event: EventType::ContextChanged(ContextEvent {
+                app_id: app_id.clone(),
+            }),
+        });
+        self.last_emitted_context = Some(app_id);
+    }
+
+    fn emit_context_snapshot(&mut self, should_capture: bool, timestamp_us: u64) {
+        let app_id = self.current_context_app_id(should_capture);
+        self.push_context_event(app_id, timestamp_us);
+    }
+
+    fn maybe_emit_context_transition(&mut self, should_capture: bool) {
+        if self.current_session.is_none() {
+            return;
+        }
+
+        let app_id = self.current_context_app_id(should_capture);
+        if self.last_emitted_context.as_deref() == Some(app_id.as_str()) {
+            return;
+        }
+
+        self.push_context_event(app_id, self.current_capture_timestamp_us());
     }
 
     /// Spawn background task for uploading completed segments
@@ -793,6 +855,7 @@ impl SyncEngine {
 
         // Re-evaluate frontmost app immediately so status is accurate after rotation.
         let should_capture = self.should_capture_frontmost_app();
+        self.emit_context_snapshot(should_capture, 0);
         self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing { event_count: 0 });
@@ -949,6 +1012,7 @@ impl SyncEngine {
 
         // Compute initial capture eligibility immediately instead of waiting for next poll.
         let should_capture = self.should_capture_frontmost_app();
+        self.emit_context_snapshot(should_capture, 0);
         self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing { event_count: 0 });
@@ -1041,6 +1105,7 @@ impl SyncEngine {
         self.segment_index = 0;
         self.is_paused = false; // Reset paused state when stopping
         self.idle_paused = false; // Reset idle-paused state when stopping
+        self.last_emitted_context = None;
 
         // Clear the original display since we're no longer recording
         self.display_monitor.clear_original_display();
@@ -1114,11 +1179,12 @@ impl SyncEngine {
 
         self.is_paused = false;
         let should_capture = self.should_capture_frontmost_app();
+        self.emit_context_snapshot(should_capture, self.current_capture_timestamp_us());
         self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
 
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing {
-                event_count: self.event_buffer.len(),
+                event_count: self.buffered_input_event_count(),
             });
         } else {
             self.send_status_force(EngineStatus::RecordingBlocked);
@@ -1480,6 +1546,9 @@ impl SyncEngine {
 
         // Update capture state (only capture if recording AND app is allowed AND not paused)
         let is_recording = self.current_session.is_some();
+        if is_recording {
+            self.maybe_emit_context_transition(should_capture);
+        }
         let was_capturing = self.capture_enabled;
         self.capture_enabled = should_capture && is_recording && !self.is_paused;
 
@@ -1495,7 +1564,7 @@ impl SyncEngine {
         if is_recording {
             if self.capture_enabled {
                 self.send_status(EngineStatus::Capturing {
-                    event_count: self.event_buffer.len(),
+                    event_count: self.buffered_input_event_count(),
                 });
             } else if !self.is_paused {
                 self.send_status(EngineStatus::RecordingBlocked);
