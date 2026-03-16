@@ -266,6 +266,14 @@ impl SyncEngine {
             Duration::from_millis(config.capture.capture_watchdog_timeout_ms);
         let capture_watchdog_max_retries = config.capture.capture_watchdog_max_retries;
 
+        if config.capture.capture_all && single_active_app_capture {
+            warn!(
+                "capture.capture_all=true with non-empty target_apps and single_active_app_capture enabled \
+will still drive video switching from the frontmost app. This configuration is ambiguous and may capture \
+unintended app video."
+            );
+        }
+
         Self {
             config,
             capture_ctx,
@@ -427,6 +435,69 @@ impl SyncEngine {
         }
     }
 
+    fn should_enable_capture_for_target(
+        &self,
+        should_capture: bool,
+        desired_target: Option<&str>,
+    ) -> bool {
+        if !(should_capture && self.current_session.is_some() && !self.is_paused) {
+            return false;
+        }
+
+        if !self.single_active_app_capture {
+            return true;
+        }
+
+        if self
+            .pending_app_switch
+            .as_ref()
+            .map(|pending| pending.target_app.as_deref() != desired_target)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
+        if self.capture_ctx.active_capture_app() != desired_target {
+            return false;
+        }
+
+        let Some(app) = desired_target else {
+            return false;
+        };
+
+        match self.capture_ctx.active_source_is_ready() {
+            Ok(ready) => ready,
+            Err(e) => {
+                debug!(
+                    "Treating active capture source for '{}' as not ready while gating input capture: {}",
+                    app, e
+                );
+                false
+            }
+        }
+    }
+
+    fn update_capture_enabled(&mut self, should_capture: bool, desired_target: Option<&str>) {
+        let was_capturing = self.capture_enabled;
+        self.capture_enabled =
+            self.should_enable_capture_for_target(should_capture, desired_target);
+
+        if self.capture_enabled != was_capturing {
+            if self.capture_enabled {
+                debug!("Input capture enabled");
+            } else {
+                debug!("Input capture disabled");
+            }
+        }
+    }
+
+    fn refresh_capture_enabled_from_frontmost(&mut self) {
+        let (frontmost_app, should_capture) = self.frontmost_capture_state();
+        let desired_target =
+            self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
+        self.update_capture_enabled(should_capture, desired_target.as_deref());
+    }
+
     fn prepare_active_capture_target(
         &mut self,
         frontmost_app: Option<&str>,
@@ -474,7 +545,20 @@ impl SyncEngine {
             return;
         };
 
-        let target_app = pending.target_app.clone();
+        let (frontmost_app, should_capture) = self.frontmost_capture_state();
+        let desired_target =
+            self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
+        if desired_target != pending.target_app {
+            info!(
+                "Skipping stale active capture switch to {:?}; current desired target is {:?}",
+                pending.target_app, desired_target
+            );
+            self.schedule_app_switch(desired_target.clone());
+            self.update_capture_enabled(should_capture, desired_target.as_deref());
+            return;
+        }
+
+        let target_app = desired_target;
         match self
             .capture_ctx
             .switch_active_app_capture(target_app.as_deref())
@@ -483,17 +567,19 @@ impl SyncEngine {
                 if switched {
                     info!("Applied active capture switch to {:?}", target_app);
                 }
-                if let Some(app) = target_app {
+                if let Some(app) = target_app.as_deref() {
                     self.schedule_capture_watchdog(&app, 0);
                 } else {
                     self.clear_capture_watchdog();
                 }
+                self.update_capture_enabled(should_capture, target_app.as_deref());
             }
             Err(e) => {
                 error!(
                     "Failed to apply active capture switch to {:?}: {}",
                     target_app, e
                 );
+                self.update_capture_enabled(should_capture, target_app.as_deref());
                 self.send_status_force(EngineStatus::Error(format!(
                     "Capture source switch failed: {}",
                     e
@@ -515,6 +601,7 @@ impl SyncEngine {
                 self.capture_ctx.active_capture_app()
             );
             self.clear_capture_watchdog();
+            self.refresh_capture_enabled_from_frontmost();
             return;
         }
 
@@ -527,6 +614,7 @@ impl SyncEngine {
                     );
                 }
                 self.clear_capture_watchdog();
+                self.refresh_capture_enabled_from_frontmost();
             }
             Ok(false) => {
                 if watchdog.attempt >= self.capture_watchdog_max_retries {
@@ -538,6 +626,7 @@ impl SyncEngine {
                     if surface_failure {
                         self.send_status_force(EngineStatus::RecordingBlocked);
                     }
+                    self.refresh_capture_enabled_from_frontmost();
                     return;
                 }
 
@@ -550,7 +639,11 @@ impl SyncEngine {
 
                 match self.capture_ctx.refresh_active_capture_source() {
                     Ok(_) => {
-                        self.schedule_capture_watchdog(&watchdog.expected_app, watchdog.attempt + 1)
+                        self.schedule_capture_watchdog(
+                            &watchdog.expected_app,
+                            watchdog.attempt + 1,
+                        );
+                        self.refresh_capture_enabled_from_frontmost();
                     }
                     Err(e) => {
                         self.clear_capture_watchdog();
@@ -564,6 +657,7 @@ impl SyncEngine {
                                 e
                             )));
                         }
+                        self.refresh_capture_enabled_from_frontmost();
                     }
                 }
             }
@@ -576,6 +670,7 @@ impl SyncEngine {
                         e
                     )));
                 }
+                self.refresh_capture_enabled_from_frontmost();
             }
         }
     }
@@ -865,8 +960,10 @@ impl SyncEngine {
                                 self.capture_ctx.active_capture_app().map(|app| app.to_string())
                             {
                                 self.schedule_capture_watchdog(&app, 0);
+                                self.refresh_capture_enabled_from_frontmost();
                             } else {
                                 self.clear_capture_watchdog();
+                                self.refresh_capture_enabled_from_frontmost();
                             }
                         }
                         EngineCommand::SwitchToDisplay { display_id } => {
@@ -1096,10 +1193,10 @@ impl SyncEngine {
         self.recording_start_ns = Some(session.start_time_ns);
         self.current_session = Some(session);
 
-        if let Some(app) = desired_target {
-            self.schedule_capture_watchdog(&app, 0);
+        if let Some(app) = desired_target.as_deref() {
+            self.schedule_capture_watchdog(app, 0);
         }
-        self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
+        self.update_capture_enabled(should_capture, desired_target.as_deref());
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing { event_count: 0 });
         } else {
@@ -1260,10 +1357,10 @@ impl SyncEngine {
         self.idle_paused = false; // Ensure not idle-paused when starting
         self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
 
-        if let Some(app) = desired_target {
-            self.schedule_capture_watchdog(&app, 0);
+        if let Some(app) = desired_target.as_deref() {
+            self.schedule_capture_watchdog(app, 0);
         }
-        self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
+        self.update_capture_enabled(should_capture, desired_target.as_deref());
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing { event_count: 0 });
         } else {
@@ -1443,10 +1540,10 @@ impl SyncEngine {
         }
 
         self.is_paused = false;
-        if let Some(app) = desired_target {
-            self.schedule_capture_watchdog(&app, 0);
+        if let Some(app) = desired_target.as_deref() {
+            self.schedule_capture_watchdog(app, 0);
         }
-        self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
+        self.update_capture_enabled(should_capture, desired_target.as_deref());
 
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing {
@@ -1485,6 +1582,7 @@ impl SyncEngine {
                     } else {
                         self.clear_capture_watchdog();
                     }
+                    self.refresh_capture_enabled_from_frontmost();
                 }
                 Err(e) => {
                     error!("Failed to switch to display {}: {}", display_id, e);
@@ -1611,7 +1709,7 @@ impl SyncEngine {
         }
 
         if let Some(prev) = restore_capture {
-            if self.current_session.is_some() {
+            if !restart_recording && self.current_session.is_some() {
                 self.capture_enabled = prev;
             }
         }
@@ -1782,10 +1880,10 @@ impl SyncEngine {
     async fn poll_frontmost_app(&mut self) {
         // Keep app tracking fresh even while paused so state is accurate on resume.
         let (frontmost_app, should_capture) = self.frontmost_capture_state();
+        let desired_target =
+            self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
         if self.single_active_app_capture && self.current_session.is_some() {
-            let desired_target =
-                self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
-            self.schedule_app_switch(desired_target);
+            self.schedule_app_switch(desired_target.clone());
         }
 
         // Don't update capture state if paused.
@@ -1793,18 +1891,9 @@ impl SyncEngine {
             return;
         }
 
-        // Update capture state (only capture if recording AND app is allowed AND not paused)
+        // Update capture state (only capture if recording, the app is allowed, and video is ready)
         let is_recording = self.current_session.is_some();
-        let was_capturing = self.capture_enabled;
-        self.capture_enabled = should_capture && is_recording && !self.is_paused;
-
-        if self.capture_enabled != was_capturing {
-            if self.capture_enabled {
-                debug!("Input capture enabled");
-            } else {
-                debug!("Input capture disabled");
-            }
-        }
+        self.update_capture_enabled(should_capture, desired_target.as_deref());
 
         // Update status
         if is_recording {
@@ -1824,16 +1913,14 @@ impl SyncEngine {
         // Auto-resume from idle only when frontmost app is capturable
         if self.idle_paused {
             let (frontmost_app, should_capture) = self.frontmost_capture_state();
+            let desired_target =
+                self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
             if self.single_active_app_capture && self.current_session.is_some() {
-                let desired_target = self
-                    .desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
-                self.schedule_app_switch(desired_target);
+                self.schedule_app_switch(desired_target.clone());
             }
             if should_capture {
                 self.resume_from_idle();
-                // Ensure the event that resumes from idle can be recorded immediately.
-                self.capture_enabled =
-                    should_capture && self.current_session.is_some() && !self.is_paused;
+                self.update_capture_enabled(should_capture, desired_target.as_deref());
             } else {
                 return;
             }
