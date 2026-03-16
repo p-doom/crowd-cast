@@ -15,6 +15,8 @@ pub enum EngineCommand {
     PauseRecording,
     /// Resume recording (both video and keylog)
     ResumeRecording,
+    /// Recreate the active capture source
+    RefreshCaptureSource,
     /// User requested switch to a specific display (from notification action)
     SwitchToDisplay { display_id: u32 },
     /// Shutdown the engine

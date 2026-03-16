@@ -332,7 +332,9 @@ fn is_current_macos_launch_agent_disabled() -> Result<bool> {
         format!("{} => true", MACOS_AUTOSTART_LABEL),
     ];
 
-    Ok(disabled_markers.iter().any(|marker| stdout.contains(marker)))
+    Ok(disabled_markers
+        .iter()
+        .any(|marker| stdout.contains(marker)))
 }
 
 // ============================================================================

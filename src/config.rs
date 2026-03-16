@@ -59,6 +59,27 @@ pub struct CaptureConfig {
     /// Whether to pause uploads during idle (in addition to recording)
     #[serde(default = "default_true")]
     pub pause_uploads_on_idle: bool,
+
+    /// On macOS, keep only the frontmost tracked application's capture source active.
+    /// This avoids running multiple ScreenCaptureKit application sources at once.
+    #[serde(default = "default_single_active_app_capture")]
+    pub single_active_app_capture: bool,
+
+    /// Delay before switching the active app capture source after a focus change.
+    #[serde(default = "default_app_switch_debounce_ms")]
+    pub app_switch_debounce_ms: u64,
+
+    /// When a non-target app is frontmost, blank the video instead of keeping the last target app.
+    #[serde(default = "default_true")]
+    pub blank_video_on_untracked_app: bool,
+
+    /// How long to wait for a newly switched capture source to become ready.
+    #[serde(default = "default_capture_watchdog_timeout_ms")]
+    pub capture_watchdog_timeout_ms: u64,
+
+    /// Number of automatic retries before declaring the active capture source unhealthy.
+    #[serde(default = "default_capture_watchdog_max_retries")]
+    pub capture_watchdog_max_retries: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +146,22 @@ fn default_idle_timeout_secs() -> u64 {
     120 // 2 minutes of inactivity before pausing capture
 }
 
+fn default_single_active_app_capture() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn default_app_switch_debounce_ms() -> u64 {
+    200
+}
+
+fn default_capture_watchdog_timeout_ms() -> u64 {
+    1500
+}
+
+fn default_capture_watchdog_max_retries() -> u32 {
+    1
+}
+
 // Default value functions
 fn default_poll_interval() -> u64 {
     100 // 100ms for responsive frontmost app detection
@@ -160,6 +197,11 @@ impl Default for CaptureConfig {
             start_on_login: false,
             idle_timeout_secs: default_idle_timeout_secs(),
             pause_uploads_on_idle: true,
+            single_active_app_capture: default_single_active_app_capture(),
+            app_switch_debounce_ms: default_app_switch_debounce_ms(),
+            blank_video_on_untracked_app: true,
+            capture_watchdog_timeout_ms: default_capture_watchdog_timeout_ms(),
+            capture_watchdog_max_retries: default_capture_watchdog_max_retries(),
         }
     }
 }
