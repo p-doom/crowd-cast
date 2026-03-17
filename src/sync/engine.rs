@@ -19,19 +19,23 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::capture::{
-    get_display_uuid, get_frontmost_app, CaptureContext, DisplayChangeEvent, DisplayMonitor,
-    RecordingSession,
+    CaptureContext, DisplayChangeEvent, DisplayMonitor, RecordingSession, get_display_uuid,
+    get_frontmost_app,
 };
 use crate::config::Config;
-use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
-use crate::input::{create_input_backend, InputBackend};
+use crate::data::{
+    CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer, UNCAPTURED_APP_ID,
+    UNKNOWN_APP_ID,
+};
+use crate::input::{InputBackend, create_input_backend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
-    is_authorized as notifications_authorized, show_capture_resumed_notification,
-    show_display_change_notification, show_idle_paused_notification,
-    show_idle_resumed_notification, show_permissions_missing_notification,
-    show_recording_paused_notification, show_recording_resumed_notification,
-    show_recording_started_notification, show_recording_stopped_notification, NotificationAction,
+    NotificationAction, is_authorized as notifications_authorized,
+    show_capture_resumed_notification, show_display_change_notification,
+    show_idle_paused_notification, show_idle_resumed_notification,
+    show_permissions_missing_notification, show_recording_paused_notification,
+    show_recording_resumed_notification, show_recording_started_notification,
+    show_recording_stopped_notification,
 };
 use crate::upload::Uploader;
 
@@ -200,6 +204,10 @@ pub struct SyncEngine {
     last_status_kind: Option<StatusKind>,
     /// Last time a capturing status was broadcast (for throttling)
     last_capturing_status_at: Option<Instant>,
+    /// Last application context emitted into the raw event stream
+    last_emitted_context: Option<String>,
+    /// Number of buffered non-context input events for O(1) status updates
+    buffered_non_context_event_count: usize,
 }
 
 impl SyncEngine {
@@ -260,6 +268,8 @@ impl SyncEngine {
             pause_uploads_on_idle,
             last_status_kind: None,
             last_capturing_status_at: None,
+            last_emitted_context: None,
+            buffered_non_context_event_count: 0,
         }
     }
 
@@ -315,6 +325,76 @@ impl SyncEngine {
         } else {
             *segment_timer = None;
         }
+    }
+
+    fn buffered_input_event_count(&self) -> usize {
+        self.buffered_non_context_event_count
+    }
+
+    fn buffer_input_event(&mut self, event: InputEvent) {
+        self.event_buffer.push(event);
+        self.buffered_non_context_event_count += 1;
+    }
+
+    fn clear_event_buffer(&mut self) {
+        self.event_buffer.clear();
+        self.buffered_non_context_event_count = 0;
+    }
+
+    fn drain_event_buffer(&mut self) -> Vec<InputEvent> {
+        let events = self.event_buffer.drain();
+        self.buffered_non_context_event_count = 0;
+        events
+    }
+
+    fn current_context_app_id(&self, should_capture: bool) -> &str {
+        match self.last_frontmost_app.as_deref() {
+            Some(app_id) if should_capture => app_id,
+            Some(_) => UNCAPTURED_APP_ID,
+            None => UNKNOWN_APP_ID,
+        }
+    }
+
+    fn current_capture_timestamp_us(&self) -> u64 {
+        match self.recording_start_ns {
+            Some(start_ns) => {
+                self.capture_ctx
+                    .get_video_frame_time()
+                    .unwrap_or(start_ns)
+                    .saturating_sub(start_ns)
+                    / 1000
+            }
+            None => 0,
+        }
+    }
+
+    fn push_context_event(&mut self, app_id: String, timestamp_us: u64) {
+        self.event_buffer.push(InputEvent {
+            timestamp_us,
+            event: EventType::ContextChanged(ContextEvent {
+                app_id: app_id.clone(),
+            }),
+        });
+        self.last_emitted_context = Some(app_id);
+    }
+
+    fn emit_context_snapshot(&mut self, should_capture: bool, timestamp_us: u64) {
+        let app_id = self.current_context_app_id(should_capture).to_string();
+        self.push_context_event(app_id, timestamp_us);
+    }
+
+    fn maybe_emit_context_transition(&mut self, should_capture: bool) {
+        if self.current_session.is_none() {
+            return;
+        }
+
+        if self.last_emitted_context.as_deref() == Some(self.current_context_app_id(should_capture))
+        {
+            return;
+        }
+
+        let app_id = self.current_context_app_id(should_capture).to_string();
+        self.push_context_event(app_id, self.current_capture_timestamp_us());
     }
 
     /// Spawn background task for uploading completed segments
@@ -793,6 +873,7 @@ impl SyncEngine {
 
         // Re-evaluate frontmost app immediately so status is accurate after rotation.
         let should_capture = self.should_capture_frontmost_app();
+        self.emit_context_snapshot(should_capture, 0);
         self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing { event_count: 0 });
@@ -859,7 +940,7 @@ impl SyncEngine {
         }
 
         // Add remaining events from buffer
-        let buffer_events = self.event_buffer.drain();
+        let buffer_events = self.drain_event_buffer();
         debug!("Adding {} events from buffer", buffer_events.len());
         all_events.extend(buffer_events);
 
@@ -942,13 +1023,14 @@ impl SyncEngine {
         // Store the OBS timestamp for event synchronization
         self.recording_start_ns = Some(session.start_time_ns);
         self.current_session = Some(session);
-        self.event_buffer.clear();
+        self.clear_event_buffer();
         self.is_paused = false; // Ensure not paused when starting
         self.idle_paused = false; // Ensure not idle-paused when starting
         self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
 
         // Compute initial capture eligibility immediately instead of waiting for next poll.
         let should_capture = self.should_capture_frontmost_app();
+        self.emit_context_snapshot(should_capture, 0);
         self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing { event_count: 0 });
@@ -1041,6 +1123,7 @@ impl SyncEngine {
         self.segment_index = 0;
         self.is_paused = false; // Reset paused state when stopping
         self.idle_paused = false; // Reset idle-paused state when stopping
+        self.last_emitted_context = None;
 
         // Clear the original display since we're no longer recording
         self.display_monitor.clear_original_display();
@@ -1114,11 +1197,12 @@ impl SyncEngine {
 
         self.is_paused = false;
         let should_capture = self.should_capture_frontmost_app();
+        self.emit_context_snapshot(should_capture, self.current_capture_timestamp_us());
         self.capture_enabled = should_capture && self.current_session.is_some() && !self.is_paused;
 
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing {
-                event_count: self.event_buffer.len(),
+                event_count: self.buffered_input_event_count(),
             });
         } else {
             self.send_status_force(EngineStatus::RecordingBlocked);
@@ -1480,6 +1564,9 @@ impl SyncEngine {
 
         // Update capture state (only capture if recording AND app is allowed AND not paused)
         let is_recording = self.current_session.is_some();
+        if is_recording {
+            self.maybe_emit_context_transition(should_capture);
+        }
         let was_capturing = self.capture_enabled;
         self.capture_enabled = should_capture && is_recording && !self.is_paused;
 
@@ -1495,7 +1582,7 @@ impl SyncEngine {
         if is_recording {
             if self.capture_enabled {
                 self.send_status(EngineStatus::Capturing {
-                    event_count: self.event_buffer.len(),
+                    event_count: self.buffered_input_event_count(),
                 });
             } else if !self.is_paused {
                 self.send_status(EngineStatus::RecordingBlocked);
@@ -1539,7 +1626,7 @@ impl SyncEngine {
             event
         };
 
-        self.event_buffer.push(adjusted_event);
+        self.buffer_input_event(adjusted_event);
         self.last_recorded_action_time = Instant::now();
 
         // Check if buffer should be flushed (e.g., every N events or time interval)
@@ -1571,7 +1658,7 @@ impl SyncEngine {
         ));
 
         // Drain the buffer to bound memory usage
-        let events = self.event_buffer.drain();
+        let events = self.drain_event_buffer();
         let event_count = events.len();
         let bytes = rmp_serde::to_vec(&events)?;
         tokio::fs::write(&flush_path, bytes).await?;
