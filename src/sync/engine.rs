@@ -19,19 +19,23 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::capture::{
-    get_display_uuid, get_frontmost_app, CaptureContext, DisplayChangeEvent, DisplayMonitor,
-    RecordingSession,
+    CaptureContext, DisplayChangeEvent, DisplayMonitor, RecordingSession, get_display_uuid,
+    get_frontmost_app,
 };
 use crate::config::Config;
-use crate::data::{CompletedChunk, EventType, InputEvent, InputEventBuffer};
-use crate::input::{create_input_backend, InputBackend};
+use crate::data::{
+    CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer, UNCAPTURED_APP_ID,
+    UNKNOWN_APP_ID,
+};
+use crate::input::{InputBackend, create_input_backend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
-    is_authorized as notifications_authorized, show_capture_resumed_notification,
-    show_display_change_notification, show_idle_paused_notification,
-    show_idle_resumed_notification, show_permissions_missing_notification,
-    show_recording_paused_notification, show_recording_resumed_notification,
-    show_recording_started_notification, show_recording_stopped_notification, NotificationAction,
+    NotificationAction, is_authorized as notifications_authorized,
+    show_capture_resumed_notification, show_display_change_notification,
+    show_idle_paused_notification, show_idle_resumed_notification,
+    show_permissions_missing_notification, show_recording_paused_notification,
+    show_recording_resumed_notification, show_recording_started_notification,
+    show_recording_stopped_notification,
 };
 use crate::upload::Uploader;
 
@@ -234,6 +238,10 @@ pub struct SyncEngine {
     pending_capture_watchdog: Option<PendingCaptureWatchdog>,
     /// Input events buffered while waiting for a tracked app's video to become ready
     pending_input_transition: Option<PendingInputTransition>,
+    /// Last application context emitted into the raw event stream
+    last_emitted_context: Option<String>,
+    /// Number of buffered non-context input events for O(1) status updates
+    buffered_non_context_event_count: usize,
 }
 
 impl SyncEngine {
@@ -316,6 +324,8 @@ unintended app video."
             pending_app_switch: None,
             pending_capture_watchdog: None,
             pending_input_transition: None,
+            last_emitted_context: None,
+            buffered_non_context_event_count: 0,
         }
     }
 
@@ -489,7 +499,7 @@ unintended app video."
 
         for event in pending.events {
             let delta_us = last_raw_timestamp.saturating_sub(event.timestamp_us);
-            self.event_buffer.push(InputEvent {
+            self.buffer_input_event(InputEvent {
                 timestamp_us: flush_elapsed_us.saturating_sub(delta_us),
                 event: event.event,
             });
@@ -930,6 +940,76 @@ unintended app video."
                 self.refresh_capture_enabled_from_frontmost();
             }
         }
+    }
+
+    fn buffered_input_event_count(&self) -> usize {
+        self.buffered_non_context_event_count
+    }
+
+    fn buffer_input_event(&mut self, event: InputEvent) {
+        self.event_buffer.push(event);
+        self.buffered_non_context_event_count += 1;
+    }
+
+    fn clear_event_buffer(&mut self) {
+        self.event_buffer.clear();
+        self.buffered_non_context_event_count = 0;
+    }
+
+    fn drain_event_buffer(&mut self) -> Vec<InputEvent> {
+        let events = self.event_buffer.drain();
+        self.buffered_non_context_event_count = 0;
+        events
+    }
+
+    fn current_context_app_id(&self, should_capture: bool) -> &str {
+        match self.last_frontmost_app.as_deref() {
+            Some(app_id) if should_capture => app_id,
+            Some(_) => UNCAPTURED_APP_ID,
+            None => UNKNOWN_APP_ID,
+        }
+    }
+
+    fn current_capture_timestamp_us(&self) -> u64 {
+        match self.recording_start_ns {
+            Some(start_ns) => {
+                self.capture_ctx
+                    .get_video_frame_time()
+                    .unwrap_or(start_ns)
+                    .saturating_sub(start_ns)
+                    / 1000
+            }
+            None => 0,
+        }
+    }
+
+    fn push_context_event(&mut self, app_id: String, timestamp_us: u64) {
+        self.event_buffer.push(InputEvent {
+            timestamp_us,
+            event: EventType::ContextChanged(ContextEvent {
+                app_id: app_id.clone(),
+            }),
+        });
+        self.last_emitted_context = Some(app_id);
+    }
+
+    fn emit_context_snapshot(&mut self, should_capture: bool, timestamp_us: u64) {
+        let app_id = self.current_context_app_id(should_capture).to_string();
+        self.push_context_event(app_id, timestamp_us);
+    }
+
+    fn maybe_emit_context_transition(&mut self, should_capture: bool) {
+        if self.current_session.is_none() {
+            return;
+        }
+
+        if self.last_emitted_context.as_deref() == Some(self.current_context_app_id(should_capture))
+        {
+            return;
+        }
+
+        let app_id = self.current_context_app_id(should_capture).to_string();
+        self.push_context_event(app_id, self.current_capture_timestamp_us());
     }
 
     /// Spawn background task for uploading completed segments
@@ -1450,6 +1530,7 @@ unintended app video."
         self.recording_start_ns = Some(session.start_time_ns);
         self.current_session = Some(session);
 
+        self.emit_context_snapshot(should_capture, 0);
         if let Some(app) = desired_target.as_deref() {
             self.schedule_capture_watchdog(app, 0);
         }
@@ -1519,7 +1600,7 @@ unintended app video."
         }
 
         // Add remaining events from buffer
-        let buffer_events = self.event_buffer.drain();
+        let buffer_events = self.drain_event_buffer();
         debug!("Adding {} events from buffer", buffer_events.len());
         all_events.extend(buffer_events);
 
@@ -1616,12 +1697,13 @@ unintended app video."
         // Store the OBS timestamp for event synchronization
         self.recording_start_ns = Some(session.start_time_ns);
         self.current_session = Some(session);
-        self.event_buffer.clear();
+        self.clear_event_buffer();
         self.clear_pending_input_transition();
         self.is_paused = false; // Ensure not paused when starting
         self.idle_paused = false; // Ensure not idle-paused when starting
         self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
 
+        self.emit_context_snapshot(should_capture, 0);
         if let Some(app) = desired_target.as_deref() {
             self.schedule_capture_watchdog(app, 0);
         }
@@ -1720,6 +1802,7 @@ unintended app video."
         self.pending_app_switch = None;
         self.clear_capture_watchdog();
         self.clear_pending_input_transition();
+        self.last_emitted_context = None;
 
         // Clear the original display since we're no longer recording
         self.display_monitor.clear_original_display();
@@ -1806,6 +1889,7 @@ unintended app video."
         }
 
         self.is_paused = false;
+        self.emit_context_snapshot(should_capture, self.current_capture_timestamp_us());
         if let Some(app) = desired_target.as_deref() {
             self.schedule_capture_watchdog(app, 0);
         }
@@ -1813,7 +1897,7 @@ unintended app video."
 
         if self.capture_enabled {
             self.send_status_force(EngineStatus::Capturing {
-                event_count: self.event_buffer.len(),
+                event_count: self.buffered_input_event_count(),
             });
         } else {
             self.send_status_force(EngineStatus::RecordingBlocked);
@@ -2161,13 +2245,16 @@ unintended app video."
 
         // Update capture state (only capture if recording, the app is allowed, and video is ready)
         let is_recording = self.current_session.is_some();
+        if is_recording {
+            self.maybe_emit_context_transition(should_capture);
+        }
         self.update_capture_enabled(should_capture, desired_target.as_deref());
 
         // Update status
         if is_recording {
             if self.capture_enabled {
                 self.send_status(EngineStatus::Capturing {
-                    event_count: self.event_buffer.len(),
+                    event_count: self.buffered_input_event_count(),
                 });
             } else if !self.is_paused {
                 self.send_status(EngineStatus::RecordingBlocked);
@@ -2217,7 +2304,7 @@ unintended app video."
 
         let adjusted_event = self.adjust_input_event_timestamp(event);
 
-        self.event_buffer.push(adjusted_event);
+        self.buffer_input_event(adjusted_event);
         self.last_recorded_action_time = Instant::now();
 
         // Check if buffer should be flushed (e.g., every N events or time interval)
@@ -2249,7 +2336,7 @@ unintended app video."
         ));
 
         // Drain the buffer to bound memory usage
-        let events = self.event_buffer.drain();
+        let events = self.drain_event_buffer();
         let event_count = events.len();
         let bytes = rmp_serde::to_vec(&events)?;
         tokio::fs::write(&flush_path, bytes).await?;
