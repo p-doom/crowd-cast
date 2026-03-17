@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::crash::log_critical_operation;
 
+use super::frontmost::get_frontmost_app;
 use super::recording::{calculate_output_dimensions, RecordingConfig, RecordingOutput};
 use super::sources::{get_main_display_resolution, get_main_display_uuid, ScreenCaptureSource};
 use super::CaptureState;
@@ -59,6 +60,10 @@ pub struct CaptureContext {
     recording_config: RecordingConfig,
     /// Target apps for capture (stored for recreation after display changes)
     target_apps: Vec<String>,
+    /// Whether macOS should keep only one tracked application's source active at a time
+    single_active_app_capture: bool,
+    /// Currently active application capture target when single-active mode is enabled
+    active_capture_app: Option<String>,
 }
 
 impl CaptureContext {
@@ -90,6 +95,8 @@ impl CaptureContext {
             output_directory,
             recording_config: RecordingConfig::default(),
             target_apps: Vec::new(),
+            single_active_app_capture: false,
+            active_capture_app: None,
         })
     }
 
@@ -197,6 +204,184 @@ impl CaptureContext {
         Ok(())
     }
 
+    /// Enable or disable the macOS single-active-app capture strategy.
+    pub fn set_single_active_app_capture(&mut self, enabled: bool) {
+        self.single_active_app_capture = enabled;
+    }
+
+    fn use_single_active_app_capture(&self) -> bool {
+        cfg!(target_os = "macos") && self.single_active_app_capture && !self.target_apps.is_empty()
+    }
+
+    fn build_scene_name(prefix: &str) -> String {
+        format!(
+            "{}_{}",
+            prefix,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        )
+    }
+
+    fn select_initial_active_app(&self) -> Option<String> {
+        if !self.use_single_active_app_capture() {
+            return None;
+        }
+
+        let frontmost = get_frontmost_app()?;
+        if self
+            .target_apps
+            .iter()
+            .any(|app| app == &frontmost.bundle_id)
+        {
+            Some(frontmost.bundle_id)
+        } else {
+            None
+        }
+    }
+
+    fn create_scene(&mut self, scene_name: &str) -> Result<ObsSceneRef> {
+        let context = self
+            .context
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
+
+        context.scene(scene_name).context("Failed to create scene")
+    }
+
+    fn populate_capture_sources(
+        &mut self,
+        scene: &mut ObsSceneRef,
+        active_app: Option<&str>,
+    ) -> Result<(Vec<ScreenCaptureSource>, Option<String>)> {
+        let capture_audio = self.recording_config.enable_audio;
+        let target_apps = self.target_apps.clone();
+        let use_single_active = self.use_single_active_app_capture();
+        let mut capture_sources = Vec::new();
+
+        let context = self
+            .context
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
+
+        if target_apps.is_empty() {
+            let capture_source = ScreenCaptureSource::new_display_capture(
+                context,
+                scene,
+                "screen_capture",
+                capture_audio,
+            )
+            .context("Failed to create screen capture source")?;
+            capture_sources.push(capture_source);
+            return Ok((capture_sources, None));
+        }
+
+        let display_uuid = get_main_display_uuid()
+            .context("Failed to get main display UUID for application capture")?;
+
+        if use_single_active {
+            let Some(bundle_id) = active_app else {
+                info!("No tracked app is frontmost; leaving capture scene blank");
+                return Ok((capture_sources, None));
+            };
+
+            let source = ScreenCaptureSource::new_application_capture(
+                context,
+                scene,
+                "app_capture_active",
+                bundle_id,
+                &display_uuid,
+                capture_audio,
+            )
+            .with_context(|| {
+                format!("Failed to create active capture source for '{}'", bundle_id)
+            })?;
+            capture_sources.push(source);
+
+            info!(
+                "Created single active application capture source for '{}'",
+                bundle_id
+            );
+            return Ok((capture_sources, Some(bundle_id.to_string())));
+        }
+
+        for (i, bundle_id) in target_apps.iter().enumerate() {
+            let source_name = format!("app_capture_{}", i);
+
+            match ScreenCaptureSource::new_application_capture(
+                context,
+                scene,
+                &source_name,
+                bundle_id,
+                &display_uuid,
+                capture_audio,
+            ) {
+                Ok(source) => {
+                    debug!(
+                        "Created capture source '{}' for '{}'",
+                        source_name, bundle_id
+                    );
+                    capture_sources.push(source);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to create capture source for '{}': {}. Skipping.",
+                        bundle_id, e
+                    );
+                }
+            }
+        }
+
+        Ok((capture_sources, None))
+    }
+
+    fn activate_scene(scene: &mut ObsSceneRef) -> Result<()> {
+        scene.set_to_channel(0).context("Failed to activate scene")
+    }
+
+    fn update_capture_state_flags(&self) {
+        if let Ok(mut state) = self.state.write() {
+            state.any_source_active = !self.capture_sources.is_empty();
+            state.should_capture = state.recording.is_recording
+                && !state.recording.is_paused
+                && state.any_source_active;
+        }
+    }
+
+    fn rebuild_scene_with_active_app(
+        &mut self,
+        active_app: Option<&str>,
+        reason: &str,
+    ) -> Result<usize> {
+        log_critical_operation(reason);
+
+        if !self.is_initialized() {
+            anyhow::bail!("OBS context not initialized");
+        }
+
+        let scene_name = Self::build_scene_name("main_scene");
+        debug!("Rebuilding capture scene '{}' for {}", scene_name, reason);
+        let mut scene = self.create_scene(&scene_name)?;
+        let (capture_sources, next_active_capture_app) =
+            self.populate_capture_sources(&mut scene, active_app)?;
+        let count = capture_sources.len();
+        if !self.use_single_active_app_capture() && !self.target_apps.is_empty() && count == 0 {
+            anyhow::bail!(
+                "Failed to create any capture sources for target apps: {:?}",
+                self.target_apps
+            );
+        }
+
+        Self::activate_scene(&mut scene)?;
+
+        self.capture_sources = capture_sources;
+        self.active_capture_app = next_active_capture_app;
+        self.scene = Some(scene);
+        self.update_capture_state_flags();
+        Ok(count)
+    }
+
     /// Set up capture sources and scene for specific applications
     ///
     /// Creates the main scene and adds application capture sources for each target app.
@@ -208,100 +393,35 @@ impl CaptureContext {
     pub fn setup_capture(&mut self, target_apps: &[String]) -> Result<()> {
         // Store target apps for potential recreation after display changes
         self.target_apps = target_apps.to_vec();
-
-        let context = self
-            .context
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
-
-        // Create the main scene
-        let mut scene = context
-            .scene("main_scene")
-            .context("Failed to create main scene")?;
-
-        // Activate the scene on channel 0
-        scene
-            .set_to_channel(0)
-            .context("Failed to activate scene")?;
-
-        // Audio capture is controlled by recording_config.enable_audio
-        let capture_audio = self.recording_config.enable_audio;
-
-        // Clear any existing sources
-        self.capture_sources.clear();
+        let initial_active_app = self.select_initial_active_app();
+        let count = self.rebuild_scene_with_active_app(
+            initial_active_app.as_deref(),
+            "setup_capture: rebuilding scene",
+        )?;
 
         if target_apps.is_empty() {
-            // Fallback to display capture if no apps specified
-            let capture_source = ScreenCaptureSource::new_display_capture(
-                context,
-                &mut scene,
-                "screen_capture",
-                capture_audio,
-            )
-            .context("Failed to create screen capture source")?;
-
-            debug!("Display capture source created (audio: {})", capture_audio);
-
-            self.capture_sources.push(capture_source);
-        } else {
-            // Get display UUID for application capture
-            let display_uuid = get_main_display_uuid()
-                .context("Failed to get main display UUID for application capture")?;
-
-            debug!(
-                "Setting up app capture for {} apps (display: {})",
-                target_apps.len(),
-                display_uuid
-            );
-
-            // Create application capture source for each target app
-            for (i, bundle_id) in target_apps.iter().enumerate() {
-                let source_name = format!("app_capture_{}", i);
-
-                match ScreenCaptureSource::new_application_capture(
-                    context,
-                    &mut scene,
-                    &source_name,
-                    bundle_id,
-                    &display_uuid,
-                    capture_audio,
-                ) {
-                    Ok(source) => {
-                        debug!(
-                            "Created capture source '{}' for '{}'",
-                            source_name, bundle_id
-                        );
-                        self.capture_sources.push(source);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to create capture source for '{}': {}. Skipping.",
-                            bundle_id, e
-                        );
-                        // Continue with other apps rather than failing completely
-                    }
+            info!("Capture scene configured for display capture");
+        } else if self.use_single_active_app_capture() {
+            match &self.active_capture_app {
+                Some(active) => {
+                    info!(
+                        "Capture scene configured for single active app capture (active='{}')",
+                        active
+                    );
+                }
+                None => {
+                    info!(
+                        "Capture scene configured for single active app capture (waiting for tracked app)"
+                    );
                 }
             }
-
-            if self.capture_sources.is_empty() {
-                anyhow::bail!(
-                    "Failed to create any capture sources for target apps: {:?}",
-                    target_apps
-                );
-            }
-
-            info!(
-                "Created {} application capture sources (audio: {})",
-                self.capture_sources.len(),
-                capture_audio
+        } else if count == 0 {
+            anyhow::bail!(
+                "Failed to create any capture sources for target apps: {:?}",
+                target_apps
             );
-        }
-
-        self.scene = Some(scene);
-
-        // Update state
-        if let Ok(mut state) = self.state.write() {
-            state.any_source_active = !self.capture_sources.is_empty();
+        } else {
+            info!("Created {} application capture sources", count);
         }
 
         Ok(())
@@ -320,139 +440,17 @@ impl CaptureContext {
     ///
     /// Returns the number of sources successfully created.
     pub fn fully_recreate_sources(&mut self) -> Result<usize> {
-        log_critical_operation("fully_recreate_sources: starting");
         if !self.is_initialized() {
             anyhow::bail!("OBS context not initialized");
         }
+        let active_app = self.active_capture_app.clone();
+        let count = self.rebuild_scene_with_active_app(
+            active_app.as_deref(),
+            "fully_recreate_sources: rebuilding scene",
+        )?;
 
-        let target_apps = self.target_apps.clone();
-
-        info!(
-            "Fully recreating capture sources for {} target app(s)",
-            target_apps.len()
-        );
-
-        // Clear Rust-side source references
-        let old_count = self.capture_sources.len();
-        self.capture_sources.clear();
-        debug!(
-            "Cleared {} existing capture source(s) from Rust Vec",
-            old_count
-        );
-
-        // Drop the old scene reference - this allows OBS to clean up scene items
-        // when we create a new scene
-        if self.scene.is_some() {
-            debug!("Dropping old scene reference");
-            self.scene = None;
-        }
-
-        // Get the context
-        let context = self
-            .context
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
-
-        // Create a fresh scene with a unique name to avoid conflicts with the old one
-        // (The old scene will be cleaned up when all references to it are dropped)
-        let scene_name = format!(
-            "main_scene_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
-
-        debug!("Creating new scene: {}", scene_name);
-        let mut scene = context
-            .scene(scene_name.as_str())
-            .context("Failed to create new scene")?;
-
-        // Activate the new scene on channel 0 (replaces any existing scene)
-        scene
-            .set_to_channel(0)
-            .context("Failed to activate new scene")?;
-
-        let capture_audio = self.recording_config.enable_audio;
-
-        if target_apps.is_empty() {
-            // Fallback to display capture if no apps specified
-            let capture_source = ScreenCaptureSource::new_display_capture(
-                context,
-                &mut scene,
-                "screen_capture",
-                capture_audio,
-            )
-            .context("Failed to create screen capture source")?;
-
-            debug!(
-                "Recreated display capture source (audio: {})",
-                capture_audio
-            );
-            self.capture_sources.push(capture_source);
-        } else {
-            // Get fresh display UUID
-            let display_uuid = get_main_display_uuid()
-                .context("Failed to get main display UUID for application capture")?;
-
-            debug!(
-                "Recreating app capture for {} apps (display: {})",
-                target_apps.len(),
-                display_uuid
-            );
-
-            // Create application capture source for each target app
-            for (i, bundle_id) in target_apps.iter().enumerate() {
-                let source_name = format!("app_capture_{}", i);
-
-                match ScreenCaptureSource::new_application_capture(
-                    context,
-                    &mut scene,
-                    &source_name,
-                    bundle_id,
-                    &display_uuid,
-                    capture_audio,
-                ) {
-                    Ok(source) => {
-                        debug!(
-                            "Recreated capture source '{}' for '{}'",
-                            source_name, bundle_id
-                        );
-                        self.capture_sources.push(source);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to recreate capture source for '{}': {}. Skipping.",
-                            bundle_id, e
-                        );
-                    }
-                }
-            }
-
-            if self.capture_sources.is_empty() {
-                anyhow::bail!(
-                    "Failed to recreate any capture sources for target apps: {:?}",
-                    target_apps
-                );
-            }
-        }
-
-        // Store the new scene
-        self.scene = Some(scene);
-
-        let new_count = self.capture_sources.len();
-        info!(
-            "Fully recreated {} capture source(s) with new scene",
-            new_count
-        );
-
-        // Update state
-        if let Ok(mut state) = self.state.write() {
-            state.any_source_active = !self.capture_sources.is_empty();
-        }
-
-        log_critical_operation("fully_recreate_sources: completed successfully");
-        Ok(new_count)
+        info!("Fully recreated {} capture source(s) with new scene", count);
+        Ok(count)
     }
 
     /// Reset video output resolution and recreate sources (safe reinit)
@@ -477,8 +475,6 @@ impl CaptureContext {
             self.stop_recording()
                 .context("Failed to stop recording before video reset")?;
         }
-
-        let target_apps = self.target_apps.clone();
 
         // Get new display resolution
         let (base_width, base_height) = match get_main_display_resolution() {
@@ -539,9 +535,12 @@ impl CaptureContext {
         log_critical_operation("reset_video_and_recreate_sources: reset_video() completed");
 
         // Recreate capture sources
-        log_critical_operation("reset_video_and_recreate_sources: calling setup_capture()");
-        self.setup_capture(&target_apps)
-            .context("Failed to setup capture after video reset")?;
+        let active_app = self.active_capture_app.clone();
+        self.rebuild_scene_with_active_app(
+            active_app.as_deref(),
+            "reset_video_and_recreate_sources: rebuilding scene",
+        )
+        .context("Failed to setup capture after video reset")?;
 
         log_critical_operation("reset_video_and_recreate_sources: completed successfully");
         Ok(())
@@ -554,8 +553,6 @@ impl CaptureContext {
     /// recreates capture sources for the stored target apps.
     pub fn reinitialize_for_display_change(&mut self) -> Result<()> {
         log_critical_operation("reinitialize_for_display_change: starting");
-        let target_apps = self.target_apps.clone();
-
         if self.recording.is_some() {
             // Stop any active recording before resetting the context.
             log_critical_operation("reinitialize_for_display_change: stopping recording");
@@ -589,9 +586,12 @@ impl CaptureContext {
         log_critical_operation("reinitialize_for_display_change: calling initialize()");
         self.initialize()
             .context("Failed to reinitialize OBS context")?;
-        log_critical_operation("reinitialize_for_display_change: calling setup_capture()");
-        self.setup_capture(&target_apps)
-            .context("Failed to re-setup capture after reinit")?;
+        let active_app = self.active_capture_app.clone();
+        self.rebuild_scene_with_active_app(
+            active_app.as_deref(),
+            "reinitialize_for_display_change: rebuilding scene",
+        )
+        .context("Failed to re-setup capture after reinit")?;
         log_critical_operation("reinitialize_for_display_change: completed successfully");
 
         Ok(())
@@ -765,6 +765,78 @@ impl CaptureContext {
         self.current_session.as_ref()
     }
 
+    /// Return the active application capture target in single-active mode.
+    pub fn active_capture_app(&self) -> Option<&str> {
+        self.active_capture_app.as_deref()
+    }
+
+    /// Switch the single-active application capture source to a new target app.
+    ///
+    /// Passing `None` clears the current application source and leaves the scene blank.
+    pub fn switch_active_app_capture(&mut self, active_app: Option<&str>) -> Result<bool> {
+        if !self.use_single_active_app_capture() {
+            return Ok(false);
+        }
+
+        let next_app = active_app.map(|app| app.to_string());
+        if self.active_capture_app == next_app {
+            return Ok(false);
+        }
+
+        let count = self.rebuild_scene_with_active_app(
+            next_app.as_deref(),
+            "switch_active_app_capture: rebuilding scene",
+        )?;
+
+        match &next_app {
+            Some(app) => info!(
+                "Switched active application capture to '{}' ({} source ready)",
+                app, count
+            ),
+            None => info!("Cleared active application capture source"),
+        }
+
+        Ok(true)
+    }
+
+    /// Force a refresh of the current application capture source.
+    pub fn refresh_active_capture_source(&mut self) -> Result<bool> {
+        if !self.use_single_active_app_capture() {
+            return Ok(false);
+        }
+
+        let active_app = self.active_capture_app.clone();
+        self.rebuild_scene_with_active_app(
+            active_app.as_deref(),
+            "refresh_active_capture_source: rebuilding scene",
+        )?;
+
+        match active_app {
+            Some(app) => info!("Refreshed active application capture for '{}'", app),
+            None => info!("Refreshed blank application capture scene"),
+        }
+
+        Ok(true)
+    }
+
+    /// Report the dimensions of the currently active source, if any.
+    pub fn active_source_dimensions(&self) -> Result<Option<(u32, u32)>> {
+        let Some(source) = self.capture_sources.first() else {
+            return Ok(None);
+        };
+
+        Ok(Some(source.dimensions()?))
+    }
+
+    /// Return whether the active source has started producing non-zero-sized frames.
+    pub fn active_source_is_ready(&self) -> Result<bool> {
+        let Some((width, height)) = self.active_source_dimensions()? else {
+            return Ok(false);
+        };
+
+        Ok(width > 0 && height > 0)
+    }
+
     /// Get the current video frame time from OBS (in nanoseconds)
     ///
     /// This is the monotonic timestamp used by OBS for video frames.
@@ -827,7 +899,9 @@ impl CaptureContext {
 
     /// Check if capture sources are set up
     pub fn is_capture_setup(&self) -> bool {
-        self.scene.is_some() && !self.capture_sources.is_empty()
+        self.scene.is_some()
+            && (!self.capture_sources.is_empty()
+                || (self.use_single_active_app_capture() && !self.target_apps.is_empty()))
     }
 
     /// Get the number of active capture sources

@@ -8,6 +8,8 @@ use anyhow::{Context as _, Result};
 use libobs_wrapper::context::ObsContext;
 use libobs_wrapper::scenes::ObsSceneRef;
 use libobs_wrapper::sources::{ObsSourceBuilder, ObsSourceRef};
+use libobs_wrapper::unsafe_send::Sendable;
+use libobs_wrapper::utils::traits::ObsUpdatable;
 use tracing::{debug, info};
 
 #[cfg(target_os = "macos")]
@@ -16,8 +18,6 @@ use libobs_simple::sources::macos::{
 };
 #[cfg(target_os = "macos")]
 use libobs_wrapper::data::ObsObjectUpdater;
-#[cfg(target_os = "macos")]
-use libobs_wrapper::utils::traits::ObsUpdatable;
 
 /// Wrapper around a screen capture source
 pub struct ScreenCaptureSource {
@@ -164,14 +164,11 @@ impl ScreenCaptureSource {
     /// Update the active state based on source dimensions
     /// A source with 0 width/height is considered inactive (stale capture)
     pub fn update_active_state(&mut self) -> bool {
-        // In libobs, we can check if frames are being produced by checking dimensions
-        // This is a simplified check - the actual implementation would need to
-        // access the source's internal state
         let was_active = self.is_active;
-
-        // TODO: Implement proper frame detection
-        // For now, assume active unless explicitly marked otherwise
-        self.is_active = true;
+        self.is_active = self
+            .dimensions()
+            .map(|(width, height)| width > 0 && height > 0)
+            .unwrap_or(false);
 
         was_active != self.is_active
     }
@@ -211,6 +208,21 @@ impl ScreenCaptureSource {
     #[cfg(not(target_os = "macos"))]
     pub fn update_display_uuid(&mut self, _display_uuid: &str) -> Result<()> {
         Ok(())
+    }
+
+    /// Return the current source dimensions reported by OBS.
+    pub fn dimensions(&self) -> Result<(u32, u32)> {
+        let runtime = self.source.runtime();
+        let source_ptr = Sendable(self.source.as_ptr());
+
+        let width = libobs_wrapper::run_with_obs!(runtime.clone(), (source_ptr), move || unsafe {
+            libobs::obs_source_get_width(source_ptr)
+        })?;
+        let height = libobs_wrapper::run_with_obs!(runtime, (source_ptr), move || unsafe {
+            libobs::obs_source_get_height(source_ptr)
+        })?;
+
+        Ok((width, height))
     }
 }
 

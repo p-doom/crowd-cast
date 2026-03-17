@@ -140,6 +140,8 @@ fn main() -> Result<()> {
     }
     info!("libobs context initialized");
 
+    capture_ctx.set_single_active_app_capture(config.capture.single_active_app_capture);
+
     // Set up capture sources (application capture for target apps, or display capture fallback)
     let target_apps = &config.capture.target_apps;
     if let Err(e) = capture_ctx.setup_capture(target_apps) {
