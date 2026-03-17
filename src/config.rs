@@ -65,10 +65,6 @@ pub struct CaptureConfig {
     #[serde(default = "default_single_active_app_capture")]
     pub single_active_app_capture: bool,
 
-    /// Delay before switching the active app capture source after a focus change.
-    #[serde(default = "default_app_switch_debounce_ms")]
-    pub app_switch_debounce_ms: u64,
-
     /// When a non-target app is frontmost, blank the video instead of keeping the last target app.
     #[serde(default = "default_true")]
     pub blank_video_on_untracked_app: bool,
@@ -150,10 +146,6 @@ fn default_single_active_app_capture() -> bool {
     cfg!(target_os = "macos")
 }
 
-fn default_app_switch_debounce_ms() -> u64 {
-    200
-}
-
 fn default_capture_watchdog_timeout_ms() -> u64 {
     1500
 }
@@ -198,7 +190,6 @@ impl Default for CaptureConfig {
             idle_timeout_secs: default_idle_timeout_secs(),
             pause_uploads_on_idle: true,
             single_active_app_capture: default_single_active_app_capture(),
-            app_switch_debounce_ms: default_app_switch_debounce_ms(),
             blank_video_on_untracked_app: true,
             capture_watchdog_timeout_ms: default_capture_watchdog_timeout_ms(),
             capture_watchdog_max_retries: default_capture_watchdog_max_retries(),

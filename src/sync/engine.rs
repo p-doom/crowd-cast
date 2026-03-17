@@ -23,7 +23,7 @@ use crate::capture::{
     RecordingSession,
 };
 use crate::config::Config;
-use crate::data::{CompletedChunk, InputEvent, InputEventBuffer};
+use crate::data::{CompletedChunk, EventType, InputEvent, InputEventBuffer};
 use crate::input::{create_input_backend, InputBackend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
@@ -148,12 +148,19 @@ struct PendingCaptureWatchdog {
     attempt: u32,
 }
 
+#[derive(Debug)]
+struct PendingInputTransition {
+    target_app: String,
+    events: Vec<InputEvent>,
+}
+
 /// Maximum number of display refresh retry attempts
 const MAX_DISPLAY_REFRESH_RETRIES: u32 = 5;
 
 /// Base delay between display refresh retries (doubles each attempt)
 const DISPLAY_REFRESH_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_TRANSITION_INPUT_EVENTS: usize = 512;
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -217,16 +224,16 @@ pub struct SyncEngine {
     single_active_app_capture: bool,
     /// Whether to blank the video when a non-target app is frontmost
     blank_video_on_untracked_app: bool,
-    /// Debounce applied to app-switch-driven source swaps
-    app_switch_debounce: Duration,
     /// Timeout for the active-source readiness watchdog
     capture_watchdog_timeout: Duration,
     /// Number of automatic source-refresh retries before giving up
     capture_watchdog_max_retries: u32,
-    /// Pending app source switch after a debounce delay
+    /// Pending app source switch awaiting application
     pending_app_switch: Option<PendingAppSwitch>,
     /// Pending active-source readiness watchdog
     pending_capture_watchdog: Option<PendingCaptureWatchdog>,
+    /// Input events buffered while waiting for a tracked app's video to become ready
+    pending_input_transition: Option<PendingInputTransition>,
 }
 
 impl SyncEngine {
@@ -261,7 +268,6 @@ impl SyncEngine {
             && cfg!(target_os = "macos")
             && !config.capture.target_apps.is_empty();
         let blank_video_on_untracked_app = config.capture.blank_video_on_untracked_app;
-        let app_switch_debounce = Duration::from_millis(config.capture.app_switch_debounce_ms);
         let capture_watchdog_timeout =
             Duration::from_millis(config.capture.capture_watchdog_timeout_ms);
         let capture_watchdog_max_retries = config.capture.capture_watchdog_max_retries;
@@ -305,11 +311,11 @@ unintended app video."
             last_capturing_status_at: None,
             single_active_app_capture,
             blank_video_on_untracked_app,
-            app_switch_debounce,
             capture_watchdog_timeout,
             capture_watchdog_max_retries,
             pending_app_switch: None,
             pending_capture_watchdog: None,
+            pending_input_transition: None,
         }
     }
 
@@ -371,6 +377,189 @@ unintended app video."
         self.capture_ctx.active_capture_app()
     }
 
+    fn current_recording_elapsed_us(&self) -> Option<u64> {
+        let start_ns = self.recording_start_ns?;
+        let current_ns = self.capture_ctx.get_video_frame_time().ok()?;
+        Some(current_ns.saturating_sub(start_ns) / 1000)
+    }
+
+    fn clear_pending_input_transition(&mut self) {
+        self.pending_input_transition = None;
+    }
+
+    fn reset_pending_input_transition(&mut self, target_app: &str) {
+        if let Some(pending) = &self.pending_input_transition {
+            if pending.target_app != target_app && !pending.events.is_empty() {
+                debug!(
+                    "Discarding {} buffered transition input event(s) for stale target '{}'",
+                    pending.events.len(),
+                    pending.target_app
+                );
+            }
+        }
+
+        self.pending_input_transition = Some(PendingInputTransition {
+            target_app: target_app.to_string(),
+            events: Vec::new(),
+        });
+    }
+
+    fn should_buffer_transition_input(
+        &self,
+        should_capture: bool,
+        desired_target: Option<&str>,
+    ) -> bool {
+        self.single_active_app_capture
+            && should_capture
+            && self.current_session.is_some()
+            && !self.is_paused
+            && desired_target.is_some()
+            && !self.capture_enabled
+    }
+
+    fn buffer_transition_input_event(&mut self, target_app: &str, event: InputEvent) {
+        let needs_reset = self
+            .pending_input_transition
+            .as_ref()
+            .map(|pending| pending.target_app != target_app)
+            .unwrap_or(true);
+        if needs_reset {
+            self.reset_pending_input_transition(target_app);
+        }
+
+        if let Some(pending) = self.pending_input_transition.as_mut() {
+            if pending.events.len() >= MAX_TRANSITION_INPUT_EVENTS {
+                if pending.events.len() == MAX_TRANSITION_INPUT_EVENTS {
+                    warn!(
+                        "Transition input buffer for '{}' reached {} events; dropping additional events until video is ready",
+                        pending.target_app, MAX_TRANSITION_INPUT_EVENTS
+                    );
+                }
+                return;
+            }
+
+            pending.events.push(event);
+        }
+    }
+
+    fn flush_pending_input_transition(&mut self, desired_target: Option<&str>) {
+        if !self.capture_enabled {
+            return;
+        }
+
+        let Some(target_app) = desired_target else {
+            self.clear_pending_input_transition();
+            return;
+        };
+
+        let matches_target = self
+            .pending_input_transition
+            .as_ref()
+            .map(|pending| pending.target_app == target_app)
+            .unwrap_or(false);
+        if !matches_target {
+            if self.pending_input_transition.is_some() {
+                self.clear_pending_input_transition();
+            }
+            return;
+        }
+
+        let Some(flush_elapsed_us) = self.current_recording_elapsed_us() else {
+            debug!(
+                "Deferring flush of buffered transition input for '{}' because recording time is unavailable",
+                target_app
+            );
+            return;
+        };
+
+        let Some(pending) = self.pending_input_transition.take() else {
+            return;
+        };
+
+        if pending.events.is_empty() {
+            return;
+        }
+
+        let last_raw_timestamp = pending
+            .events
+            .last()
+            .map(|event| event.timestamp_us)
+            .unwrap_or(0);
+        let buffered_count = pending.events.len();
+
+        for event in pending.events {
+            let delta_us = last_raw_timestamp.saturating_sub(event.timestamp_us);
+            self.event_buffer.push(InputEvent {
+                timestamp_us: flush_elapsed_us.saturating_sub(delta_us),
+                event: event.event,
+            });
+        }
+
+        self.last_recorded_action_time = Instant::now();
+        debug!(
+            "Flushed {} buffered transition input event(s) for '{}'",
+            buffered_count, target_app
+        );
+    }
+
+    fn rearm_capture_recovery_if_needed(
+        &mut self,
+        should_capture: bool,
+        desired_target: Option<&str>,
+    ) {
+        let Some(target_app) = desired_target else {
+            return;
+        };
+
+        if !(self.single_active_app_capture
+            && should_capture
+            && self.current_session.is_some()
+            && !self.is_paused)
+        {
+            return;
+        }
+
+        if self.pending_app_switch.is_some() {
+            return;
+        }
+
+        if self.capture_ctx.active_capture_app() != Some(target_app) {
+            return;
+        }
+
+        if self
+            .pending_capture_watchdog
+            .as_ref()
+            .map(|pending| pending.expected_app == target_app)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        match self.capture_ctx.active_source_is_ready() {
+            Ok(true) => {}
+            Ok(false) => self.schedule_capture_watchdog(target_app, 0),
+            Err(e) => {
+                debug!(
+                    "Unable to inspect readiness for '{}'; deferring recovery re-arm: {}",
+                    target_app, e
+                );
+            }
+        }
+    }
+
+    async fn apply_due_app_switch(&mut self) {
+        let should_apply = self
+            .pending_app_switch
+            .as_ref()
+            .map(|pending| pending.scheduled_at <= Instant::now())
+            .unwrap_or(false);
+
+        if should_apply {
+            self.apply_pending_app_switch().await;
+        }
+    }
+
     fn schedule_app_switch(&mut self, target_app: Option<String>) {
         if !self.single_active_app_capture {
             return;
@@ -390,11 +579,8 @@ unintended app video."
             return;
         }
 
-        let scheduled_at = Instant::now() + self.app_switch_debounce;
-        info!(
-            "Scheduling active capture switch to {:?} in {:?}",
-            target_app, self.app_switch_debounce
-        );
+        let scheduled_at = Instant::now();
+        info!("Queueing active capture switch to {:?}", target_app);
         self.pending_app_switch = Some(PendingAppSwitch {
             target_app,
             scheduled_at,
@@ -482,6 +668,12 @@ unintended app video."
         self.capture_enabled =
             self.should_enable_capture_for_target(should_capture, desired_target);
 
+        if self.capture_enabled {
+            self.flush_pending_input_transition(desired_target);
+        } else if !self.should_buffer_transition_input(should_capture, desired_target) {
+            self.clear_pending_input_transition();
+        }
+
         if self.capture_enabled != was_capturing {
             if self.capture_enabled {
                 debug!("Input capture enabled");
@@ -496,6 +688,70 @@ unintended app video."
         let desired_target =
             self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
         self.update_capture_enabled(should_capture, desired_target.as_deref());
+    }
+
+    async fn sync_single_active_capture_state_for_input(&mut self) -> (bool, Option<String>) {
+        let (frontmost_app, should_capture) = self.frontmost_capture_state();
+        let desired_target =
+            self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
+
+        if self.single_active_app_capture && self.current_session.is_some() {
+            self.schedule_app_switch(desired_target.clone());
+            self.apply_due_app_switch().await;
+            self.rearm_capture_recovery_if_needed(should_capture, desired_target.as_deref());
+        }
+
+        self.update_capture_enabled(should_capture, desired_target.as_deref());
+        (should_capture, desired_target)
+    }
+
+    fn adjust_input_event_timestamp(&self, event: InputEvent) -> InputEvent {
+        if let Some(elapsed_us) = self.current_recording_elapsed_us() {
+            InputEvent {
+                timestamp_us: elapsed_us,
+                ..event
+            }
+        } else {
+            event
+        }
+    }
+
+    fn drain_pending_transition_events_for_persistence(&mut self) -> Vec<InputEvent> {
+        let Some(flush_elapsed_us) = self.current_recording_elapsed_us() else {
+            if let Some(pending) = self.pending_input_transition.take() {
+                warn!(
+                    "Dropping {} buffered transition input event(s) for '{}' because recording time is unavailable",
+                    pending.events.len(),
+                    pending.target_app
+                );
+            }
+            return Vec::new();
+        };
+
+        let Some(pending) = self.pending_input_transition.take() else {
+            return Vec::new();
+        };
+
+        if pending.events.is_empty() {
+            return Vec::new();
+        }
+
+        let last_raw_timestamp = pending
+            .events
+            .last()
+            .map(|event| event.timestamp_us)
+            .unwrap_or(0);
+        let mut remapped = Vec::with_capacity(pending.events.len());
+
+        for event in pending.events {
+            let delta_us = last_raw_timestamp.saturating_sub(event.timestamp_us);
+            remapped.push(InputEvent {
+                timestamp_us: flush_elapsed_us.saturating_sub(delta_us),
+                event: event.event,
+            });
+        }
+
+        remapped
     }
 
     fn prepare_active_capture_target(
@@ -568,11 +824,12 @@ unintended app video."
                     info!("Applied active capture switch to {:?}", target_app);
                 }
                 if let Some(app) = target_app.as_deref() {
-                    self.schedule_capture_watchdog(&app, 0);
+                    self.schedule_capture_watchdog(app, 0);
                 } else {
                     self.clear_capture_watchdog();
                 }
                 self.update_capture_enabled(should_capture, target_app.as_deref());
+                self.rearm_capture_recovery_if_needed(should_capture, target_app.as_deref());
             }
             Err(e) => {
                 error!(
@@ -1007,7 +1264,7 @@ unintended app video."
                     self.check_display_changes().await;
                 }
 
-                // Apply a debounced app-driven capture source switch
+                // Apply a queued app-driven capture source switch
                 _ = async {
                     match &self.pending_app_switch {
                         Some(pending) => tokio::time::sleep_until(pending.scheduled_at).await,
@@ -1266,6 +1523,13 @@ unintended app video."
         debug!("Adding {} events from buffer", buffer_events.len());
         all_events.extend(buffer_events);
 
+        let transition_events = self.drain_pending_transition_events_for_persistence();
+        debug!(
+            "Adding {} events from transition buffer",
+            transition_events.len()
+        );
+        all_events.extend(transition_events);
+
         // Clean up partial files
         for partial_path in partial_files {
             if let Err(e) = tokio::fs::remove_file(&partial_path).await {
@@ -1353,6 +1617,7 @@ unintended app video."
         self.recording_start_ns = Some(session.start_time_ns);
         self.current_session = Some(session);
         self.event_buffer.clear();
+        self.clear_pending_input_transition();
         self.is_paused = false; // Ensure not paused when starting
         self.idle_paused = false; // Ensure not idle-paused when starting
         self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
@@ -1454,6 +1719,7 @@ unintended app video."
         self.idle_paused = false; // Reset idle-paused state when stopping
         self.pending_app_switch = None;
         self.clear_capture_watchdog();
+        self.clear_pending_input_transition();
 
         // Clear the original display since we're no longer recording
         self.display_monitor.clear_original_display();
@@ -1884,6 +2150,8 @@ unintended app video."
             self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
         if self.single_active_app_capture && self.current_session.is_some() {
             self.schedule_app_switch(desired_target.clone());
+            self.apply_due_app_switch().await;
+            self.rearm_capture_recovery_if_needed(should_capture, desired_target.as_deref());
         }
 
         // Don't update capture state if paused.
@@ -1910,41 +2178,44 @@ unintended app video."
 
     /// Handle an input event
     async fn handle_input_event(&mut self, event: InputEvent) {
+        let mut transition_target = None;
+
         // Auto-resume from idle only when frontmost app is capturable
         if self.idle_paused {
-            let (frontmost_app, should_capture) = self.frontmost_capture_state();
-            let desired_target =
-                self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
-            if self.single_active_app_capture && self.current_session.is_some() {
-                self.schedule_app_switch(desired_target.clone());
-            }
+            let (should_capture, desired_target) =
+                self.sync_single_active_capture_state_for_input().await;
             if should_capture {
                 self.resume_from_idle();
                 self.update_capture_enabled(should_capture, desired_target.as_deref());
+                if self.should_buffer_transition_input(should_capture, desired_target.as_deref()) {
+                    transition_target = desired_target;
+                }
             } else {
                 return;
+            }
+        } else if self.single_active_app_capture
+            && self.current_session.is_some()
+            && (self.pending_app_switch.is_some()
+                || self.pending_capture_watchdog.is_some()
+                || !self.capture_enabled
+                || !matches!(&event.event, EventType::MouseMove(_)))
+        {
+            let (should_capture, desired_target) =
+                self.sync_single_active_capture_state_for_input().await;
+            if self.should_buffer_transition_input(should_capture, desired_target.as_deref()) {
+                transition_target = desired_target;
             }
         }
 
         // Only buffer events if capture is enabled
         if !self.capture_enabled {
+            if let Some(target_app) = transition_target.as_deref() {
+                self.buffer_transition_input_event(target_app, event);
+            }
             return;
         }
 
-        // Adjust timestamp relative to OBS recording start for video sync
-        // Convert from system microseconds to OBS-relative microseconds
-        let adjusted_event = if let Some(start_ns) = self.recording_start_ns {
-            // Get current OBS timestamp and compute relative offset
-            let current_ns = self.capture_ctx.get_video_frame_time().unwrap_or(0);
-            let elapsed_us = current_ns.saturating_sub(start_ns) / 1000;
-
-            InputEvent {
-                timestamp_us: elapsed_us,
-                ..event
-            }
-        } else {
-            event
-        };
+        let adjusted_event = self.adjust_input_event_timestamp(event);
 
         self.event_buffer.push(adjusted_event);
         self.last_recorded_action_time = Instant::now();
