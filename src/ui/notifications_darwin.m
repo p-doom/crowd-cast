@@ -457,6 +457,33 @@ void notifications_show_idle_resumed(void) {
     }
 }
 
+// Show a notification when an update is being installed
+void notifications_show_update_installing(void) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"Update Available";
+        content.body = @"A new version of CrowdCast is being installed. The app will restart shortly.";
+
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil];
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
 // Check if notifications are authorized
 // Returns: 1 if authorized, 0 if not, -1 on error
 int notifications_is_authorized(void) {

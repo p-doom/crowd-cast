@@ -19,23 +19,22 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::capture::{
-    CaptureContext, DisplayChangeEvent, DisplayMonitor, RecordingSession, get_display_uuid,
-    get_frontmost_app,
+    get_display_uuid, get_frontmost_app, CaptureContext, DisplayChangeEvent, DisplayMonitor,
+    RecordingSession,
 };
 use crate::config::Config;
 use crate::data::{
     CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer, UNCAPTURED_APP_ID,
     UNKNOWN_APP_ID,
 };
-use crate::input::{InputBackend, create_input_backend};
+use crate::input::{create_input_backend, InputBackend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
-    NotificationAction, is_authorized as notifications_authorized,
-    show_capture_resumed_notification, show_display_change_notification,
-    show_idle_paused_notification, show_idle_resumed_notification,
-    show_permissions_missing_notification, show_recording_paused_notification,
-    show_recording_resumed_notification, show_recording_started_notification,
-    show_recording_stopped_notification,
+    is_authorized as notifications_authorized, show_capture_resumed_notification,
+    show_display_change_notification, show_idle_paused_notification,
+    show_idle_resumed_notification, show_permissions_missing_notification,
+    show_recording_paused_notification, show_recording_resumed_notification,
+    show_recording_started_notification, show_recording_stopped_notification, NotificationAction,
 };
 use crate::upload::Uploader;
 
@@ -1285,6 +1284,11 @@ unintended app video."
                             if was_paused && !self.is_paused {
                                 self.reset_segment_timer(&mut segment_timer);
                             }
+                        }
+                        EngineCommand::PrepareForUpdate => {
+                            info!("Preparing for update install");
+                            self.stop_recording().await?;
+                            self.reset_segment_timer(&mut segment_timer);
                         }
                         EngineCommand::RefreshCaptureSource => {
                             if let Err(e) = self.capture_ctx.refresh_active_capture_source() {

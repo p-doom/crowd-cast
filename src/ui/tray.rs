@@ -12,12 +12,57 @@ use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use super::tray_ffi::{self, Tray, TrayMenuItem};
+use super::{
+    tray_ffi::{self, Tray, TrayMenuItem},
+    UpdaterController,
+};
 use crate::sync::{EngineCommand, EngineStatus};
 
 // Global state for callbacks (required because C callbacks can't capture Rust state)
+static CHECK_FOR_UPDATES_REQUESTED: AtomicBool = AtomicBool::new(false);
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CMD_SENDER: Mutex<Option<mpsc::Sender<EngineCommand>>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrepareForUpdateAction {
+    Wait,
+    SendCommand,
+    ClearRequest,
+}
+
+fn status_blocks_immediate_update(status: &EngineStatus) -> bool {
+    matches!(
+        status,
+        EngineStatus::Capturing { .. }
+            | EngineStatus::Paused
+            | EngineStatus::RecordingBlocked
+            | EngineStatus::Uploading { .. }
+    )
+}
+
+fn status_needs_prepare_for_update(status: &EngineStatus) -> bool {
+    matches!(
+        status,
+        EngineStatus::Capturing { .. } | EngineStatus::Paused | EngineStatus::RecordingBlocked
+    )
+}
+
+fn next_prepare_for_update_action(
+    request_pending: bool,
+    last_status: Option<&EngineStatus>,
+) -> PrepareForUpdateAction {
+    if !request_pending {
+        return PrepareForUpdateAction::Wait;
+    }
+
+    match last_status {
+        Some(status) if status_needs_prepare_for_update(status) => {
+            PrepareForUpdateAction::SendCommand
+        }
+        Some(_) => PrepareForUpdateAction::ClearRequest,
+        None => PrepareForUpdateAction::Wait,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayIconState {
@@ -68,6 +113,11 @@ pub struct TrayApp {
     _menu_items: Vec<TrayMenuItem>,
     _menu_strings: Vec<CString>,
     tray: Tray,
+    updater: UpdaterController,
+    last_updater_can_check: Option<bool>,
+    last_status: Option<EngineStatus>,
+    pending_prepare_for_update: bool,
+    last_update_check: std::time::Instant,
 }
 
 impl TrayApp {
@@ -87,6 +137,7 @@ impl TrayApp {
         // Get tray icon paths
         let icon_paths = get_icon_paths()?;
         let icons = TrayIconSet::new(&icon_paths)?;
+        let updater = UpdaterController::new();
 
         let tooltip = CString::new("crowd-cast Agent")?;
 
@@ -100,6 +151,7 @@ impl TrayApp {
         let resume_text = CString::new("Resume Recording")?; // Index 4 - shown when paused
         let stop_text = CString::new("Stop Recording")?; // Index 5 - shown when recording/paused
         let refresh_text = CString::new("Refresh Capture")?;
+        let updates_text = CString::new("Check for Updates...")?;
         let config_text = CString::new("Open Config")?;
         let quit_text = CString::new("Quit")?;
 
@@ -111,14 +163,15 @@ impl TrayApp {
             resume_text,       // 4
             stop_text,         // 5
             refresh_text,      // 6
-            separator.clone(), // 7
-            config_text,       // 8
-            separator.clone(), // 9
-            quit_text,         // 10
+            updates_text,      // 7
+            separator.clone(), // 8
+            config_text,       // 9
+            separator.clone(), // 10
+            quit_text,         // 11
         ];
 
         // Build menu items array (NULL-terminated)
-        // Menu indices: 0=status, 1=sep, 2=start, 3=pause, 4=resume, 5=stop, 6=refresh, 7=sep, 8=config, 9=sep, 10=quit
+        // Menu indices: 0=status, 1=sep, 2=start, 3=pause, 4=resume, 5=stop, 6=refresh, 7=updates, 8=sep, 9=config, 10=sep, 11=quit
         // Initially: Start visible, Pause/Resume/Stop hidden (idle state)
         let mut menu_items = vec![
             TrayMenuItem {
@@ -171,28 +224,35 @@ impl TrayApp {
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[7].as_ptr(), // separator
+                text: menu_strings[7].as_ptr(), // Check for Updates...
+                disabled: 1,                    // Enabled after updater starts
+                checked: 0,
+                cb: Some(on_check_for_updates),
+                submenu: std::ptr::null_mut(),
+            },
+            TrayMenuItem {
+                text: menu_strings[8].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[8].as_ptr(), // Open Config
+                text: menu_strings[9].as_ptr(), // Open Config
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_open_config),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[9].as_ptr(), // separator
+                text: menu_strings[10].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[10].as_ptr(), // Quit
+                text: menu_strings[11].as_ptr(), // Quit
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_quit),
@@ -225,6 +285,11 @@ impl TrayApp {
             _menu_items: menu_items,
             _menu_strings: menu_strings,
             tray,
+            updater,
+            last_updater_can_check: None,
+            last_status: None,
+            pending_prepare_for_update: false,
+            last_update_check: std::time::Instant::now(),
         })
     }
 
@@ -239,6 +304,12 @@ impl TrayApp {
         }
 
         QUIT_REQUESTED.store(false, Ordering::SeqCst);
+        CHECK_FOR_UPDATES_REQUESTED.store(false, Ordering::SeqCst);
+        self.updater.start();
+        if let Some(reason) = self.updater.reason() {
+            info!("Updater unavailable: {}", reason);
+        }
+        self.refresh_updater_menu_item();
 
         loop {
             // Check for status updates (non-blocking)
@@ -273,6 +344,49 @@ impl TrayApp {
                 break;
             }
 
+            if CHECK_FOR_UPDATES_REQUESTED.swap(false, Ordering::SeqCst) {
+                if let Err(e) = self.updater.check_for_updates() {
+                    warn!("Failed to check for updates: {}", e);
+                }
+                self.last_update_check = std::time::Instant::now();
+            }
+
+            // Periodic background update check (bypasses Sparkle's scheduler
+            // which relies on NSUserDefaults that may not persist).
+            // Interval matches SUScheduledCheckInterval in Info.plist (default 60s for testing, 86400 for production).
+            const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            if self.last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
+                if self.updater.can_check_for_updates() {
+                    info!("Scheduled background update check");
+                    self.updater.check_for_updates_in_background();
+                }
+                self.last_update_check = std::time::Instant::now();
+            }
+
+            self.pending_prepare_for_update |= self.updater.take_prepare_for_update_request();
+            match next_prepare_for_update_action(
+                self.pending_prepare_for_update,
+                self.last_status.as_ref(),
+            ) {
+                PrepareForUpdateAction::SendCommand => {
+                    info!("Auto-update requested a clean stop before install");
+                    match self.cmd_tx.try_send(EngineCommand::PrepareForUpdate) {
+                        Ok(()) => {
+                            self.pending_prepare_for_update = false;
+                        }
+                        Err(e) => {
+                            warn!("Failed to queue prepare-for-update command: {}", e);
+                        }
+                    }
+                }
+                PrepareForUpdateAction::ClearRequest => {
+                    self.pending_prepare_for_update = false;
+                }
+                PrepareForUpdateAction::Wait => {}
+            }
+
+            self.refresh_updater_menu_item();
+
             // Small sleep to prevent busy loop when no events
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
@@ -283,6 +397,8 @@ impl TrayApp {
 
     /// Update the status display based on engine status
     fn update_status(&mut self, status: &EngineStatus) {
+        self.last_status = Some(status.clone());
+
         // Determine status text, icon state, and menu state
         #[derive(Clone, Copy, PartialEq)]
         enum MenuState {
@@ -370,7 +486,109 @@ impl TrayApp {
             }
         }
 
+        self.updater
+            .set_busy(status_blocks_immediate_update(status));
+        self.refresh_updater_menu_item();
+
         debug!("Tray status updated: {}", status_text);
+    }
+
+    fn refresh_updater_menu_item(&mut self) {
+        if self._menu_items.len() <= 7 {
+            return;
+        }
+
+        let can_check = self.updater.can_check_for_updates();
+        if self.last_updater_can_check == Some(can_check) {
+            return;
+        }
+
+        self.last_updater_can_check = Some(can_check);
+        self._menu_items[7].disabled = if can_check { 0 } else { 1 };
+
+        self.tray.menu = self._menu_items.as_mut_ptr();
+        unsafe {
+            tray_ffi::tray_update(&mut self.tray);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        next_prepare_for_update_action, status_blocks_immediate_update,
+        status_needs_prepare_for_update, PrepareForUpdateAction,
+    };
+    use crate::sync::EngineStatus;
+
+    #[test]
+    fn update_blocking_statuses_match_policy() {
+        assert!(status_blocks_immediate_update(&EngineStatus::Capturing {
+            event_count: 1
+        }));
+        assert!(status_blocks_immediate_update(&EngineStatus::Paused));
+        assert!(status_blocks_immediate_update(
+            &EngineStatus::RecordingBlocked
+        ));
+        assert!(status_blocks_immediate_update(&EngineStatus::Uploading {
+            chunk_id: "chunk".into(),
+        }));
+
+        assert!(!status_blocks_immediate_update(&EngineStatus::Idle));
+        assert!(!status_blocks_immediate_update(
+            &EngineStatus::WaitingForOBS
+        ));
+        assert!(!status_blocks_immediate_update(&EngineStatus::Error(
+            "boom".into()
+        )));
+    }
+
+    #[test]
+    fn prepare_for_update_only_targets_active_recording_states() {
+        assert!(status_needs_prepare_for_update(&EngineStatus::Capturing {
+            event_count: 1
+        }));
+        assert!(status_needs_prepare_for_update(&EngineStatus::Paused));
+        assert!(status_needs_prepare_for_update(
+            &EngineStatus::RecordingBlocked
+        ));
+
+        assert!(!status_needs_prepare_for_update(&EngineStatus::Idle));
+        assert!(!status_needs_prepare_for_update(
+            &EngineStatus::WaitingForOBS
+        ));
+        assert!(!status_needs_prepare_for_update(&EngineStatus::Uploading {
+            chunk_id: "chunk".into(),
+        }));
+    }
+
+    #[test]
+    fn prepare_for_update_action_is_one_shot_and_status_driven() {
+        assert_eq!(
+            next_prepare_for_update_action(true, Some(&EngineStatus::Capturing { event_count: 1 })),
+            PrepareForUpdateAction::SendCommand
+        );
+        assert_eq!(
+            next_prepare_for_update_action(true, Some(&EngineStatus::Idle)),
+            PrepareForUpdateAction::ClearRequest
+        );
+        assert_eq!(
+            next_prepare_for_update_action(
+                true,
+                Some(&EngineStatus::Uploading {
+                    chunk_id: "chunk".into(),
+                })
+            ),
+            PrepareForUpdateAction::ClearRequest
+        );
+        assert_eq!(
+            next_prepare_for_update_action(true, None),
+            PrepareForUpdateAction::Wait
+        );
+        assert_eq!(
+            next_prepare_for_update_action(false, Some(&EngineStatus::Paused)),
+            PrepareForUpdateAction::Wait
+        );
     }
 }
 
@@ -429,6 +647,11 @@ unsafe extern "C" fn on_refresh_capture(_item: *mut TrayMenuItem) {
             error!("Failed to send refresh capture command: {}", e);
         }
     }
+}
+
+unsafe extern "C" fn on_check_for_updates(_item: *mut TrayMenuItem) {
+    info!("Check for updates requested via tray");
+    CHECK_FOR_UPDATES_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 unsafe extern "C" fn on_open_config(_item: *mut TrayMenuItem) {

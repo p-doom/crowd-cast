@@ -45,6 +45,7 @@ mod ffi {
         pub fn notifications_show_sources_refreshed();
         pub fn notifications_show_idle_paused();
         pub fn notifications_show_idle_resumed();
+        pub fn notifications_show_update_installing();
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -342,6 +343,22 @@ pub fn show_idle_resumed_notification() {
 /// Show idle resumed notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_idle_resumed_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification when an update is being installed
+#[cfg(target_os = "macos")]
+pub fn show_update_installing_notification() {
+    unsafe {
+        ffi::notifications_show_update_installing();
+    }
+
+    debug!("Showed update installing notification");
+}
+
+/// Show update installing notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_update_installing_notification() {
     debug!("Notifications not supported on this platform");
 }
 
