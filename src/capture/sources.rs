@@ -183,6 +183,35 @@ impl ScreenCaptureSource {
         self.is_active = true;
     }
 
+    /// Update the target application for this source in-place.
+    ///
+    /// Calls `obs_source_update()` which triggers the OBS source's internal
+    /// `destroy_screen_stream` → `init_screen_stream` cycle. The SCStream is
+    /// torn down and rebuilt within the same source — no source-level
+    /// destroy/create, no scene rebuild, no CGDisplayStream leak.
+    #[cfg(target_os = "macos")]
+    pub fn update_application(&mut self, bundle_id: &str) -> Result<()> {
+        let runtime = self.source.runtime();
+
+        ScreenCaptureSourceUpdater::create_update(runtime, &mut self.source)
+            .context("Failed to create source updater")?
+            .set_application(bundle_id)
+            .update()
+            .context("Failed to update application")?;
+
+        info!(
+            "Updated capture source '{}' to application '{}'",
+            self.name, bundle_id
+        );
+        Ok(())
+    }
+
+    /// Update the target application (non-macOS stub)
+    #[cfg(not(target_os = "macos"))]
+    pub fn update_application(&mut self, _bundle_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Update the display UUID for this source
     ///
     /// This updates the source settings in-place without destroying/recreating it.

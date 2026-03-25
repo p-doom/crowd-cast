@@ -46,7 +46,11 @@ impl Uploader {
     pub fn new(config: &Config) -> Self {
         let _ = config;
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(600)) // 10 min for large uploads
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 
@@ -82,6 +86,7 @@ impl Uploader {
             .client
             .post(endpoint)
             .json(&presign_request)
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .context("Failed to request pre-signed URL")?

@@ -1,7 +1,7 @@
 //! macOS Sparkle updater integration.
 
 use anyhow::{anyhow, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(target_os = "macos")]
 use crate::ui::current_app_bundle_path;
@@ -78,6 +78,7 @@ impl UpdaterController {
             if status == 0 {
                 self.started = true;
                 info!("Sparkle updater initialized");
+                self.check_post_update_notification();
             } else {
                 let reason = unsafe { ffi::last_error_message() }
                     .unwrap_or_else(|| "Failed to initialize Sparkle updater.".to_string());
@@ -85,6 +86,59 @@ impl UpdaterController {
                 self.reason = Some(reason.clone());
                 warn!("Sparkle updater unavailable: {reason}");
             }
+        }
+    }
+
+    /// Check if the app was updated since last launch and show a notification.
+    fn check_post_update_notification(&self) {
+        let Some(bundle_path) = crate::ui::current_app_bundle_path() else {
+            return;
+        };
+        let plist = bundle_path.join("Contents/Info.plist");
+
+        // Read current version and build from the bundle
+        let version = std::process::Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Print :CFBundleShortVersionString", &plist.to_string_lossy()])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let build = std::process::Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Print :CFBundleVersion", &plist.to_string_lossy()])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        if version.is_empty() || build.is_empty() {
+            return;
+        }
+
+        // Persist last-known build in a small file next to the config
+        let marker_path = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+            .map(|p| p.data_dir().join("last_build"))
+            .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-last-build"));
+
+        let previous_build = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        let previous_build = previous_build.trim();
+
+        // Always write the current build
+        if let Some(parent) = marker_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&marker_path, &build);
+
+        // Show notification if the build changed (and this isn't the first launch)
+        if !previous_build.is_empty() && previous_build != build {
+            info!(
+                "Detected update: {} -> {} (version {})",
+                previous_build, build, version
+            );
+            super::show_update_completed_notification(&version, &build);
+        } else {
+            debug!("Build unchanged ({}), no update notification", build);
         }
     }
 

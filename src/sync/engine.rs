@@ -235,6 +235,15 @@ pub struct SyncEngine {
     pending_app_switch: Option<PendingAppSwitch>,
     /// Pending active-source readiness watchdog
     pending_capture_watchdog: Option<PendingCaptureWatchdog>,
+    /// Bundle ID of the app whose capture source failed to become ready after
+    /// all watchdog retries. Prevents infinite create/destroy cycles.
+    /// Cleared on app switch, recording stop/start, or display change.
+    capture_watchdog_exhausted_app: Option<String>,
+    /// Segment rotation timer — fires every `segment_duration_secs` to split
+    /// the recording into manageable chunks. Stored as a struct field so that
+    /// every code path that starts/stops recording (including display recovery)
+    /// automatically gets the timer in the right state.
+    segment_timer: Option<tokio::time::Interval>,
     /// Input events buffered while waiting for a tracked app's video to become ready
     pending_input_transition: Option<PendingInputTransition>,
     /// Last application context emitted into the raw event stream
@@ -322,6 +331,8 @@ unintended app video."
             capture_watchdog_max_retries,
             pending_app_switch: None,
             pending_capture_watchdog: None,
+            capture_watchdog_exhausted_app: None,
+            segment_timer: None,
             pending_input_transition: None,
             last_emitted_context: None,
             buffered_non_context_event_count: 0,
@@ -370,15 +381,15 @@ unintended app video."
         let _ = self.status_tx.send(status);
     }
 
-    fn reset_segment_timer(&self, segment_timer: &mut Option<tokio::time::Interval>) {
+    fn reset_segment_timer(&mut self) {
         if self.segment_duration_secs > 0 && self.current_session.is_some() && !self.is_paused {
             let duration = Duration::from_secs(self.segment_duration_secs);
-            *segment_timer = Some(tokio::time::interval_at(
+            self.segment_timer = Some(tokio::time::interval_at(
                 Instant::now() + duration,
                 duration,
             ));
         } else {
-            *segment_timer = None;
+            self.segment_timer = None;
         }
     }
 
@@ -542,6 +553,13 @@ unintended app video."
             .map(|pending| pending.expected_app == target_app)
             .unwrap_or(false)
         {
+            return;
+        }
+
+        // Don't restart the watchdog if we already exhausted retries for this
+        // exact app — prevents infinite create/destroy cycles when a source
+        // never becomes ready (e.g., certain Electron apps).
+        if self.capture_watchdog_exhausted_app.as_deref() == Some(target_app) {
             return;
         }
 
@@ -831,6 +849,7 @@ unintended app video."
             Ok(switched) => {
                 if switched {
                     info!("Applied active capture switch to {:?}", target_app);
+                    self.capture_watchdog_exhausted_app = None;
                 }
                 if let Some(app) = target_app.as_deref() {
                     self.schedule_capture_watchdog(app, 0);
@@ -885,9 +904,12 @@ unintended app video."
             Ok(false) => {
                 if watchdog.attempt >= self.capture_watchdog_max_retries {
                     warn!(
-                        "Active capture source for '{}' did not become ready after {} retry attempt(s)",
+                        "Active capture source for '{}' did not become ready after {} retry attempt(s); \
+                         suppressing further retries until app switch",
                         watchdog.expected_app, watchdog.attempt
                     );
+                    self.capture_watchdog_exhausted_app =
+                        Some(watchdog.expected_app.clone());
                     self.clear_capture_watchdog();
                     if surface_failure {
                         self.send_status_force(EngineStatus::RecordingBlocked);
@@ -1231,10 +1253,6 @@ unintended app video."
         let poll_interval = Duration::from_millis(self.config.capture.poll_interval_ms);
         let mut poll_timer = tokio::time::interval(poll_interval);
 
-        // Segment rotation timer (created when recording starts, not at engine start)
-        // This ensures the first segment is the full duration
-        let mut segment_timer: Option<tokio::time::Interval> = None;
-
         // Broadcast initial status
         self.send_status_force(EngineStatus::Idle);
 
@@ -1247,7 +1265,7 @@ unintended app video."
                     e
                 )));
             } else {
-                self.reset_segment_timer(&mut segment_timer);
+                self.reset_segment_timer();
             }
         }
 
@@ -1264,31 +1282,31 @@ unintended app video."
                                     e
                                 )));
                             } else {
-                                self.reset_segment_timer(&mut segment_timer);
+                                self.reset_segment_timer();
                             }
                         }
                         EngineCommand::StopRecording => {
                             self.stop_recording().await?;
-                            self.reset_segment_timer(&mut segment_timer);
+                            self.reset_segment_timer();
                         }
                         EngineCommand::PauseRecording => {
                             let was_paused = self.is_paused;
                             self.pause_recording();
                             if !was_paused && self.is_paused {
-                                self.reset_segment_timer(&mut segment_timer);
+                                self.reset_segment_timer();
                             }
                         }
                         EngineCommand::ResumeRecording => {
                             let was_paused = self.is_paused;
                             self.resume_recording();
                             if was_paused && !self.is_paused {
-                                self.reset_segment_timer(&mut segment_timer);
+                                self.reset_segment_timer();
                             }
                         }
                         EngineCommand::PrepareForUpdate => {
                             info!("Preparing for update install");
                             self.stop_recording().await?;
-                            self.reset_segment_timer(&mut segment_timer);
+                            self.reset_segment_timer();
                         }
                         EngineCommand::RefreshCaptureSource => {
                             if let Err(e) = self.capture_ctx.refresh_active_capture_source() {
@@ -1338,7 +1356,7 @@ unintended app video."
                     let was_paused = self.is_paused;
                     self.handle_input_event(event).await;
                     if was_paused && !self.is_paused {
-                        self.reset_segment_timer(&mut segment_timer);
+                        self.reset_segment_timer();
                     }
                 }
 
@@ -1360,7 +1378,7 @@ unintended app video."
 
                 // Handle segment rotation (if enabled)
                 _ = async {
-                    match segment_timer.as_mut() {
+                    match self.segment_timer.as_mut() {
                         Some(timer) => timer.tick().await,
                         None => std::future::pending().await,
                     }
@@ -1372,7 +1390,7 @@ unintended app video."
                         }
                     } else if self.is_paused {
                         // Keep timer disarmed while paused so pause state is stable.
-                        self.reset_segment_timer(&mut segment_timer);
+                        self.reset_segment_timer();
                     }
                 }
 
@@ -1412,7 +1430,7 @@ unintended app video."
                     let was_paused = self.is_paused;
                     self.handle_idle_timeout();
                     if !was_paused && self.is_paused {
-                        self.reset_segment_timer(&mut segment_timer);
+                        self.reset_segment_timer();
                     }
                 }
             }
@@ -1718,6 +1736,8 @@ unintended app video."
             self.send_status_force(EngineStatus::RecordingBlocked);
         }
 
+        self.reset_segment_timer();
+
         if self.config.recording.notify_on_start_stop && notifications_authorized() {
             show_recording_started_notification();
         }
@@ -1801,9 +1821,11 @@ unintended app video."
         self.recording_start_ns = None;
         self.main_session_id = None;
         self.segment_index = 0;
-        self.is_paused = false; // Reset paused state when stopping
-        self.idle_paused = false; // Reset idle-paused state when stopping
+        self.is_paused = false;
+        self.idle_paused = false;
         self.pending_app_switch = None;
+        self.capture_watchdog_exhausted_app = None;
+        self.segment_timer = None;
         self.clear_capture_watchdog();
         self.clear_pending_input_transition();
         self.last_emitted_context = None;
@@ -1829,11 +1851,6 @@ unintended app video."
             return;
         }
 
-        if self.is_paused {
-            debug!("Recording already paused");
-            return;
-        }
-
         info!("Pausing recording (video and keylog)...");
 
         // Pause the video recording - use block_in_place because libobs-wrapper
@@ -1841,7 +1858,8 @@ unintended app video."
         let result = tokio::task::block_in_place(|| self.capture_ctx.pause_recording());
         if let Err(e) = result {
             error!("Failed to pause video recording: {}", e);
-            return;
+            // Still mark as paused to prevent infinite retry loops —
+            // the intent to pause should stick even if OBS is degraded.
         }
 
         self.is_paused = true;
@@ -2223,6 +2241,7 @@ unintended app video."
             return;
         }
         self.idle_paused = false;
+        self.last_recorded_action_time = Instant::now();
 
         // Show notification if enabled
         if self.config.recording.notify_on_start_stop && notifications_authorized() {
@@ -2298,6 +2317,13 @@ unintended app video."
             }
         }
 
+        // Track user activity for idle detection regardless of capture state.
+        // Without this, the idle timer fires while the user is actively working
+        // but capture is disabled (e.g., source not ready).
+        if self.current_session.is_some() {
+            self.last_recorded_action_time = Instant::now();
+        }
+
         // Only buffer events if capture is enabled
         if !self.capture_enabled {
             if let Some(target_app) = transition_target.as_deref() {
@@ -2309,7 +2335,6 @@ unintended app video."
         let adjusted_event = self.adjust_input_event_timestamp(event);
 
         self.buffer_input_event(adjusted_event);
-        self.last_recorded_action_time = Instant::now();
 
         // Check if buffer should be flushed (e.g., every N events or time interval)
         if self.event_buffer.len() >= 10000 {

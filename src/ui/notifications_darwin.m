@@ -484,6 +484,38 @@ void notifications_show_update_installing(void) {
     }
 }
 
+// Show a notification after the app was updated in the background
+void notifications_show_update_completed(const char* version, const char* build) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"CrowdCast Updated";
+        if (version && build) {
+            content.body = [NSString stringWithFormat:@"Updated to version %s (build %s).",
+                           version, build];
+        } else {
+            content.body = @"A new version was installed in the background.";
+        }
+
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil];
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
 // Check if notifications are authorized
 // Returns: 1 if authorized, 0 if not, -1 on error
 int notifications_is_authorized(void) {

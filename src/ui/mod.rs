@@ -11,7 +11,7 @@ pub use notifications::{
     show_obs_download_started_notification, show_permissions_missing_notification,
     show_recording_started_notification, show_recording_stopped_notification,
     show_setup_configuring_notification, show_sources_refreshed_notification,
-    show_update_installing_notification, NotificationAction,
+    show_update_completed_notification, show_update_installing_notification, NotificationAction,
 };
 pub use tray::*;
 pub use updater::UpdaterController;
