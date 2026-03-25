@@ -12,7 +12,7 @@ static NSMenu *menu = nil;
 static struct tray *currentTray = nil;
 static BOOL shouldExit = NO;
 
-@interface TrayDelegate : NSObject <NSMenuDelegate>
+@interface TrayDelegate : NSObject <NSMenuDelegate, NSApplicationDelegate>
 @end
 
 @implementation TrayDelegate
@@ -26,6 +26,10 @@ static BOOL shouldExit = NO;
             m->cb(m);
         }
     }
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    return NSTerminateNow;
 }
 
 @end
@@ -65,14 +69,33 @@ static NSMenu *_tray_menu(struct tray_menu *m) {
 
 int tray_init(struct tray *tray) {
     @autoreleasepool {
-        // Initialize the app if not already running
         NSApplication *app = [NSApplication sharedApplication];
-        
-        // Ensure we can become active (needed for status bar items)
         [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
-        
+
         delegate = [[TrayDelegate alloc] init];
-        
+        [app setDelegate:delegate];
+
+        // Briefly start [NSApp run] and immediately stop it.
+        // [NSApp run] registers the Apple Event Mach port on the main run
+        // loop and installs default AE handlers (including kAEQuitApplication).
+        // Our custom event loop bypasses [NSApp run], so without this the
+        // Sparkle Updater's [NSRunningApplication terminate] Apple Event goes
+        // unhandled (-1708) and the app never quits for updates.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSApp stop:nil];
+            [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                                location:NSZeroPoint
+                                           modifierFlags:0
+                                               timestamp:0
+                                            windowNumber:0
+                                                 context:nil
+                                                 subtype:0
+                                                   data1:0
+                                                   data2:0]
+                     atStart:YES];
+        });
+        [NSApp run];
+
         // Must be called on main thread - dispatch if needed
         if ([NSThread isMainThread]) {
             statusItem = [[NSStatusBar systemStatusBar]
@@ -112,12 +135,18 @@ int tray_loop(int blocking) {
                                                inMode:NSDefaultRunLoopMode
                                               dequeue:YES])) {
                 [app sendEvent:event];
-                
+
                 // Check if we should exit after each event
                 if (shouldExit) {
                     return -1;
                 }
             }
+
+            // Drain the main GCD queue and run loop sources.
+            // Sparkle's XPC installer dispatches [NSApp terminate:] to the
+            // main queue — nextEventMatchingMask: alone won't process it.
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:[NSDate distantPast]];
             
             return shouldExit ? -1 : 0;
         } @catch (NSException *exception) {
