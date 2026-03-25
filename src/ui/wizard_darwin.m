@@ -1086,7 +1086,7 @@ void wizard_free_result(WizardConfig *config) {
 // Standalone App Selection Panel
 // ============================================================================
 
-@interface AppSelectionPanelController : NSWindowController <NSTableViewDataSource, NSTableViewDelegate>
+@interface AppSelectionPanelController : NSWindowController <NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate>
 @property (nonatomic, strong) NSTableView *tableView;
 @property (nonatomic, strong) NSButton *captureAllCheckbox;
 @property (nonatomic, strong) NSTextField *descLabel;
@@ -1108,6 +1108,7 @@ void wizard_free_result(WizardConfig *config) {
     self = [super initWithWindow:window];
     if (!self) return nil;
 
+    window.delegate = self;
     _selectedApps = [currentApps mutableCopy];
     _saved = NO;
 
@@ -1218,6 +1219,10 @@ void wizard_free_result(WizardConfig *config) {
     _saved = NO;
     [NSApp stopModal];
     [self.window close];
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    [NSApp stopModal];
 }
 
 // NSTableViewDataSource
