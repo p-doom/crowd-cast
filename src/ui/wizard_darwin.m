@@ -49,6 +49,7 @@ static BOOL g_wizard_running = NO;
 // App selection
 @property (nonatomic, strong) NSTableView *appTableView;
 @property (nonatomic, strong) NSButton *captureAllCheckbox;
+@property (nonatomic, strong) NSTextField *appSelectionDesc;
 
 // Autostart
 @property (nonatomic, strong) NSButton *autostartCheckbox;
@@ -448,21 +449,21 @@ static BOOL g_wizard_running = NO;
     [_appSelectionView addSubview:title];
     
     // Description
-    NSTextField *desc = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 280, 450, 35)];
-    desc.stringValue = @"Choose which applications to capture. Input will only be recorded when a selected app is active.";
-    desc.bezeled = NO;
-    desc.editable = NO;
-    desc.drawsBackground = NO;
-    desc.alignment = NSTextAlignmentCenter;
-    desc.font = [NSFont systemFontOfSize:13];
-    desc.textColor = [NSColor secondaryLabelColor];
-    [desc setLineBreakMode:NSLineBreakByWordWrapping];
-    [_appSelectionView addSubview:desc];
+    _appSelectionDesc = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 280, 450, 35)];
+    _appSelectionDesc.stringValue = @"Choose which applications to capture. Input will only be recorded when a selected app is active.";
+    _appSelectionDesc.bezeled = NO;
+    _appSelectionDesc.editable = NO;
+    _appSelectionDesc.drawsBackground = NO;
+    _appSelectionDesc.alignment = NSTextAlignmentCenter;
+    _appSelectionDesc.font = [NSFont systemFontOfSize:13];
+    _appSelectionDesc.textColor = [NSColor secondaryLabelColor];
+    [_appSelectionDesc setLineBreakMode:NSLineBreakByWordWrapping];
+    [_appSelectionView addSubview:_appSelectionDesc];
     
     // Capture all checkbox
     _captureAllCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(50, 245, 450, 22)];
     _captureAllCheckbox.buttonType = NSButtonTypeSwitch;
-    _captureAllCheckbox.title = @"Capture all applications";
+    _captureAllCheckbox.title = @"Record entire screen";
     _captureAllCheckbox.font = [NSFont boldSystemFontOfSize:13];
     _captureAllCheckbox.target = self;
     _captureAllCheckbox.action = @selector(captureAllChanged:);
@@ -513,8 +514,10 @@ static BOOL g_wizard_running = NO;
     _appTableView.enabled = !enabled;
     if (enabled) {
         _appTableView.alphaValue = 0.5;
+        _appSelectionDesc.stringValue = @"Everything visible on screen will be recorded, regardless of which app is active.";
     } else {
         _appTableView.alphaValue = 1.0;
+        _appSelectionDesc.stringValue = @"Choose which applications to capture. Input will only be recorded when a selected app is active.";
     }
 }
 
