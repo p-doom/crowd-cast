@@ -25,6 +25,12 @@ rm -rf "$HOME/Library/WebKit/${BUNDLE_ID}"
 rm -rf "$HOME/Library/Logs/crowd-cast"
 
 echo "Resetting macOS privacy permissions..."
+# Reset individual services first to fully remove stale UI entries,
+# then reset All as a catch-all. Without this, old entries can remain
+# visible in System Settings in a broken state after reinstall.
+for service in Accessibility ScreenCapture PostEvent ListenEvent Microphone Camera; do
+    tccutil reset "$service" "$BUNDLE_ID" 2>/dev/null || true
+done
 tccutil reset All "$BUNDLE_ID" || true
 
 echo
