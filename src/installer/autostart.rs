@@ -219,7 +219,10 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+    </dict>
     <key>ProcessType</key>
     <string>Interactive</string>
 </dict>

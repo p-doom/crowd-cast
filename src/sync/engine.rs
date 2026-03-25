@@ -1325,6 +1325,29 @@ unintended app video."
                                 self.refresh_capture_enabled_from_frontmost();
                             }
                         }
+                        EngineCommand::ReloadTargetApps { target_apps, capture_all } => {
+                            info!(
+                                "Reloading target apps: capture_all={}, apps={:?}",
+                                capture_all, target_apps
+                            );
+                            let was_recording = self.current_session.is_some();
+                            if was_recording {
+                                self.stop_recording().await?;
+                            }
+                            self.config.capture.target_apps = target_apps;
+                            self.config.capture.capture_all = capture_all;
+                            self.single_active_app_capture = !self.config.capture.capture_all
+                                && !self.config.capture.target_apps.is_empty()
+                                && cfg!(target_os = "macos")
+                                && self.config.capture.single_active_app_capture;
+                            self.capture_ctx
+                                .set_single_active_app_capture(self.single_active_app_capture);
+                            self.capture_ctx
+                                .setup_capture(&self.config.capture.target_apps)?;
+                            if was_recording {
+                                self.start_recording().await?;
+                            }
+                        }
                         EngineCommand::SwitchToDisplay { display_id } => {
                             info!("User requested switch to display {}", display_id);
                             self.switch_to_display(display_id);

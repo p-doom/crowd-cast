@@ -20,6 +20,7 @@ use crate::sync::{EngineCommand, EngineStatus};
 
 // Global state for callbacks (required because C callbacks can't capture Rust state)
 static CHECK_FOR_UPDATES_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CMD_SENDER: Mutex<Option<mpsc::Sender<EngineCommand>>> = Mutex::new(None);
 
@@ -152,7 +153,7 @@ impl TrayApp {
         let stop_text = CString::new("Stop Recording")?; // Index 5 - shown when recording/paused
         let refresh_text = CString::new("Refresh Capture")?;
         let updates_text = CString::new("Check for Updates...")?;
-        let config_text = CString::new("Open Config")?;
+        let config_text = CString::new("Settings...")?;
         let quit_text = CString::new("Quit")?;
 
         let menu_strings = vec![
@@ -238,10 +239,10 @@ impl TrayApp {
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[9].as_ptr(), // Open Config
+                text: menu_strings[9].as_ptr(), // Settings...
                 disabled: 0,
                 checked: 0,
-                cb: Some(on_open_config),
+                cb: Some(on_settings),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
@@ -305,6 +306,7 @@ impl TrayApp {
 
         QUIT_REQUESTED.store(false, Ordering::SeqCst);
         CHECK_FOR_UPDATES_REQUESTED.store(false, Ordering::SeqCst);
+        SETTINGS_REQUESTED.store(false, Ordering::SeqCst);
         self.updater.start();
         if let Some(reason) = self.updater.reason() {
             info!("Updater unavailable: {}", reason);
@@ -342,6 +344,10 @@ impl TrayApp {
                 // Send shutdown command to engine (use try_send to avoid blocking)
                 let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
                 break;
+            }
+
+            if SETTINGS_REQUESTED.swap(false, Ordering::SeqCst) {
+                self.show_settings_panel();
             }
 
             if CHECK_FOR_UPDATES_REQUESTED.swap(false, Ordering::SeqCst) {
@@ -511,6 +517,48 @@ impl TrayApp {
             tray_ffi::tray_update(&mut self.tray);
         }
     }
+
+    fn show_settings_panel(&self) {
+        let config = match crate::config::Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to load config for settings panel: {}", e);
+                return;
+            }
+        };
+
+        let result = match super::app_selector::show_panel(
+            &config.capture.target_apps,
+            config.capture.capture_all,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Settings panel error: {}", e);
+                return;
+            }
+        };
+
+        if !result.saved {
+            return;
+        }
+
+        // Save to config file
+        let mut config = config;
+        config.capture.target_apps = result.selected_apps.clone();
+        config.capture.capture_all = result.capture_all;
+        if let Err(e) = config.save() {
+            error!("Failed to save config: {}", e);
+            return;
+        }
+
+        // Tell the engine to reload
+        if let Err(e) = self.cmd_tx.try_send(EngineCommand::ReloadTargetApps {
+            target_apps: result.selected_apps,
+            capture_all: result.capture_all,
+        }) {
+            error!("Failed to send reload command: {}", e);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -654,11 +702,9 @@ unsafe extern "C" fn on_check_for_updates(_item: *mut TrayMenuItem) {
     CHECK_FOR_UPDATES_REQUESTED.store(true, Ordering::SeqCst);
 }
 
-unsafe extern "C" fn on_open_config(_item: *mut TrayMenuItem) {
-    info!("Open config requested via tray");
-    if let Err(e) = open_config() {
-        error!("Failed to open config: {}", e);
-    }
+unsafe extern "C" fn on_settings(_item: *mut TrayMenuItem) {
+    info!("Settings requested via tray");
+    SETTINGS_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 unsafe extern "C" fn on_quit(_item: *mut TrayMenuItem) {
@@ -790,31 +836,3 @@ fn apply_status_dot(img: &mut RgbaImage, color: [u8; 4]) {
     }
 }
 
-/// Open the config file in the default editor
-fn open_config() -> Result<()> {
-    let config = crate::config::Config::load()?;
-    let config_path = config.config_path();
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&config_path)
-            .spawn()?;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(&config_path)
-            .spawn()?;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("notepad")
-            .arg(&config_path)
-            .spawn()?;
-    }
-
-    Ok(())
-}

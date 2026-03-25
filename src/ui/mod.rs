@@ -1,5 +1,6 @@
 //! System tray UI and notifications
 
+pub mod app_selector;
 pub mod notifications;
 mod tray;
 pub mod tray_ffi;

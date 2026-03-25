@@ -77,6 +77,32 @@ void wizard_request_notifications(void);
 // Open System Preferences to Notifications pane
 void wizard_open_notifications_settings(void);
 
+// ============================================================================
+// App Selection Panel (standalone, shown from tray menu)
+// ============================================================================
+
+// Result structure for the app selection panel
+typedef struct {
+    bool capture_all;
+    const char **selected_apps;
+    size_t selected_apps_count;
+    bool saved;  // true if user clicked Save, false if cancelled
+} AppSelectionResult;
+
+// Show the app selection panel (blocks until closed)
+// current_apps/current_count: currently selected bundle IDs
+// capture_all: current capture_all setting
+// result: filled on return
+void show_app_selection_panel(
+    const char **current_apps,
+    size_t current_count,
+    bool capture_all,
+    AppSelectionResult *result
+);
+
+// Free memory allocated by the panel for selected_apps
+void app_selection_free_result(AppSelectionResult *result);
+
 #ifdef __cplusplus
 }
 #endif
