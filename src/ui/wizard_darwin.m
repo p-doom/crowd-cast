@@ -179,7 +179,7 @@ static BOOL g_wizard_running = NO;
     [_welcomeView addSubview:desc];
     
     // Setup steps
-    NSTextField *steps = [[NSTextField alloc] initWithFrame:NSMakeRect(100, 80, 350, 100)];
+    NSTextField *steps = [[NSTextField alloc] initWithFrame:NSMakeRect(100, 110, 350, 100)];
     steps.stringValue = @"Setup will:\n\n  1. Request necessary permissions\n  2. Let you select applications to capture\n  3. Configure automatic startup";
     steps.bezeled = NO;
     steps.editable = NO;
@@ -187,6 +187,18 @@ static BOOL g_wizard_running = NO;
     steps.font = [NSFont systemFontOfSize:13];
     steps.textColor = [NSColor labelColor];
     [_welcomeView addSubview:steps];
+
+    // Data notice
+    NSTextField *notice = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 20, 450, 75)];
+    notice.stringValue = @"CrowdCast records screencasts and keyboard/mouse input only for the applications you select. This data is uploaded and will be published as part of an open research dataset under a Creative Commons license. You can pause or stop recording at any time from the menu bar.";
+    notice.bezeled = NO;
+    notice.editable = NO;
+    notice.drawsBackground = NO;
+    notice.alignment = NSTextAlignmentCenter;
+    notice.font = [NSFont systemFontOfSize:11];
+    notice.textColor = [NSColor tertiaryLabelColor];
+    [notice setLineBreakMode:NSLineBreakByWordWrapping];
+    [_welcomeView addSubview:notice];
 }
 
 // ============================================================================
@@ -1082,6 +1094,298 @@ void wizard_free_result(WizardConfig *config) {
         free((void *)config->selected_apps);
         config->selected_apps = NULL;
         config->selected_apps_count = 0;
+    }
+}
+
+// ============================================================================
+// Standalone App Selection Panel
+// ============================================================================
+
+@interface AppSelectionPanelController : NSWindowController <NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate>
+@property (nonatomic, strong) NSTableView *tableView;
+@property (nonatomic, strong) NSButton *captureAllCheckbox;
+@property (nonatomic, strong) NSTextField *descLabel;
+@property (nonatomic, strong) NSMutableSet<NSString *> *selectedApps;
+@property (nonatomic) BOOL saved;
+@end
+
+@implementation AppSelectionPanelController
+
+- (instancetype)initWithCurrentApps:(NSSet<NSString *> *)currentApps captureAll:(BOOL)captureAll {
+    NSWindow *window = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, 500, 420)
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    window.title = @"CrowdCast Settings";
+    [window center];
+
+    self = [super initWithWindow:window];
+    if (!self) return nil;
+
+    window.delegate = self;
+    _selectedApps = [currentApps mutableCopy];
+    _saved = NO;
+
+    NSView *content = window.contentView;
+
+    // Title
+    NSTextField *title = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 370, 500, 30)];
+    title.stringValue = @"Select Applications";
+    title.bezeled = NO;
+    title.editable = NO;
+    title.drawsBackground = NO;
+    title.alignment = NSTextAlignmentCenter;
+    title.font = [NSFont boldSystemFontOfSize:18];
+    [content addSubview:title];
+
+    // Description
+    _descLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(30, 340, 440, 30)];
+    _descLabel.bezeled = NO;
+    _descLabel.editable = NO;
+    _descLabel.drawsBackground = NO;
+    _descLabel.alignment = NSTextAlignmentCenter;
+    _descLabel.font = [NSFont systemFontOfSize:12];
+    _descLabel.textColor = [NSColor secondaryLabelColor];
+    [_descLabel setLineBreakMode:NSLineBreakByWordWrapping];
+    [content addSubview:_descLabel];
+
+    // Capture all checkbox
+    _captureAllCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(30, 310, 440, 22)];
+    _captureAllCheckbox.buttonType = NSButtonTypeSwitch;
+    _captureAllCheckbox.title = @"Record entire screen";
+    _captureAllCheckbox.font = [NSFont boldSystemFontOfSize:13];
+    _captureAllCheckbox.state = captureAll ? NSControlStateValueOn : NSControlStateValueOff;
+    _captureAllCheckbox.target = self;
+    _captureAllCheckbox.action = @selector(captureAllToggled:);
+    [content addSubview:_captureAllCheckbox];
+
+    // Table
+    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(30, 60, 440, 240)];
+    scrollView.hasVerticalScroller = YES;
+    scrollView.autohidesScrollers = YES;
+    scrollView.borderType = NSBezelBorder;
+
+    _tableView = [[NSTableView alloc] initWithFrame:scrollView.bounds];
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    _tableView.rowHeight = 28;
+    _tableView.headerView = nil;
+    _tableView.usesAlternatingRowBackgroundColors = YES;
+    _tableView.selectionHighlightStyle = NSTableViewSelectionHighlightStyleNone;
+
+    NSTableColumn *checkCol = [[NSTableColumn alloc] initWithIdentifier:@"check"];
+    checkCol.width = 30; checkCol.minWidth = 30; checkCol.maxWidth = 30;
+    [_tableView addTableColumn:checkCol];
+
+    NSTableColumn *nameCol = [[NSTableColumn alloc] initWithIdentifier:@"name"];
+    nameCol.width = 200; nameCol.title = @"Application";
+    [_tableView addTableColumn:nameCol];
+
+    NSTableColumn *bundleCol = [[NSTableColumn alloc] initWithIdentifier:@"bundle"];
+    bundleCol.width = 200; bundleCol.title = @"Bundle ID";
+    [_tableView addTableColumn:bundleCol];
+
+    scrollView.documentView = _tableView;
+    [content addSubview:scrollView];
+
+    // Buttons
+    NSButton *cancelBtn = [[NSButton alloc] initWithFrame:NSMakeRect(290, 15, 90, 32)];
+    cancelBtn.bezelStyle = NSBezelStyleRounded;
+    cancelBtn.title = @"Cancel";
+    cancelBtn.target = self;
+    cancelBtn.action = @selector(cancelClicked:);
+    [content addSubview:cancelBtn];
+
+    NSButton *saveBtn = [[NSButton alloc] initWithFrame:NSMakeRect(390, 15, 90, 32)];
+    saveBtn.bezelStyle = NSBezelStyleRounded;
+    saveBtn.title = @"Save";
+    saveBtn.keyEquivalent = @"\r";
+    saveBtn.target = self;
+    saveBtn.action = @selector(saveClicked:);
+    [content addSubview:saveBtn];
+
+    // Set initial state
+    [self updateDescriptionAndTable];
+
+    return self;
+}
+
+- (void)updateDescriptionAndTable {
+    BOOL enabled = (_captureAllCheckbox.state == NSControlStateValueOn);
+    _tableView.enabled = !enabled;
+    _tableView.alphaValue = enabled ? 0.5 : 1.0;
+    _descLabel.stringValue = enabled
+        ? @"Everything visible on screen will be recorded, regardless of which app is active."
+        : @"Choose which applications to capture. Input will only be recorded when a selected app is active.";
+}
+
+- (void)captureAllToggled:(id)sender {
+    [self updateDescriptionAndTable];
+}
+
+- (void)saveClicked:(id)sender {
+    _saved = YES;
+    [NSApp stopModal];
+    [self.window close];
+}
+
+- (void)cancelClicked:(id)sender {
+    _saved = NO;
+    [NSApp stopModal];
+    [self.window close];
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    [NSApp stopModal];
+}
+
+// NSTableViewDataSource
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
+    return g_available_apps ? g_available_apps.count : 0;
+}
+
+// NSTableViewDelegate
+- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
+    if (row >= (NSInteger)g_available_apps.count) return nil;
+
+    NSDictionary *app = g_available_apps[row];
+    NSString *identifier = tableColumn.identifier;
+    CGFloat rowHeight = tableView.rowHeight;
+    CGFloat textHeight = 17.0;
+    CGFloat textY = floor((rowHeight - textHeight) / 2.0);
+
+    if ([identifier isEqualToString:@"check"]) {
+        NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, tableColumn.width, rowHeight)];
+        CGFloat checkboxSize = 18.0;
+        CGFloat checkboxY = floor((rowHeight - checkboxSize) / 2.0);
+        CGFloat checkboxX = floor((tableColumn.width - checkboxSize) / 2.0);
+        NSButton *checkbox = [[NSButton alloc] initWithFrame:NSMakeRect(checkboxX, checkboxY, checkboxSize, checkboxSize)];
+        checkbox.buttonType = NSButtonTypeSwitch;
+        checkbox.title = @"";
+        checkbox.tag = row;
+        checkbox.target = self;
+        checkbox.action = @selector(appCheckboxChanged:);
+        NSString *bundleId = app[@"bundle_id"];
+        checkbox.state = [_selectedApps containsObject:bundleId] ? NSControlStateValueOn : NSControlStateValueOff;
+        [container addSubview:checkbox];
+        return container;
+    } else if ([identifier isEqualToString:@"name"]) {
+        NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, tableColumn.width, rowHeight)];
+        NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, textY, tableColumn.width, textHeight)];
+        field.stringValue = app[@"name"] ?: @"Unknown";
+        field.bezeled = NO; field.editable = NO; field.drawsBackground = NO;
+        field.font = [NSFont systemFontOfSize:12];
+        field.lineBreakMode = NSLineBreakByTruncatingTail;
+        [container addSubview:field];
+        return container;
+    } else if ([identifier isEqualToString:@"bundle"]) {
+        NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, tableColumn.width, rowHeight)];
+        NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, textY, tableColumn.width, textHeight)];
+        field.stringValue = app[@"bundle_id"] ?: @"";
+        field.bezeled = NO; field.editable = NO; field.drawsBackground = NO;
+        field.font = [NSFont systemFontOfSize:11];
+        field.textColor = [NSColor secondaryLabelColor];
+        field.lineBreakMode = NSLineBreakByTruncatingTail;
+        [container addSubview:field];
+        return container;
+    }
+    return nil;
+}
+
+- (void)appCheckboxChanged:(id)sender {
+    NSButton *checkbox = (NSButton *)sender;
+    NSInteger row = checkbox.tag;
+    if (row < 0 || row >= (NSInteger)g_available_apps.count) return;
+    NSString *bundleId = g_available_apps[row][@"bundle_id"];
+    if (!bundleId) return;
+    if (checkbox.state == NSControlStateValueOn) {
+        [_selectedApps addObject:bundleId];
+    } else {
+        [_selectedApps removeObject:bundleId];
+    }
+}
+
+@end
+
+// C API
+
+void show_app_selection_panel(
+    const char **current_apps,
+    size_t current_count,
+    bool capture_all,
+    AppSelectionResult *result
+) {
+    result->saved = false;
+    result->selected_apps = NULL;
+    result->selected_apps_count = 0;
+    result->capture_all = capture_all;
+
+    @autoreleasepool {
+        // Build current selection set
+        NSMutableSet<NSString *> *currentSet = [[NSMutableSet alloc] init];
+        for (size_t i = 0; i < current_count; i++) {
+            if (current_apps[i]) {
+                [currentSet addObject:[NSString stringWithUTF8String:current_apps[i]]];
+            }
+        }
+
+        // Refresh available apps list
+        NSArray<NSRunningApplication *> *running = [[NSWorkspace sharedWorkspace] runningApplications];
+        if (!g_available_apps) {
+            g_available_apps = [[NSMutableArray alloc] init];
+        }
+        [g_available_apps removeAllObjects];
+        NSMutableSet<NSString *> *seen = [[NSMutableSet alloc] init];
+        for (NSRunningApplication *app in running) {
+            if (app.bundleIdentifier == nil) continue;
+            if (app.activationPolicy != NSApplicationActivationPolicyRegular) continue;
+            if ([seen containsObject:app.bundleIdentifier]) continue;
+            [seen addObject:app.bundleIdentifier];
+            [g_available_apps addObject:@{
+                @"bundle_id": app.bundleIdentifier,
+                @"name": app.localizedName ?: @"Unknown",
+                @"pid": @(app.processIdentifier),
+            }];
+        }
+        // Sort by name
+        [g_available_apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]];
+        }];
+
+        AppSelectionPanelController *panel = [[AppSelectionPanelController alloc]
+            initWithCurrentApps:currentSet captureAll:capture_all];
+
+        [panel.window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+        [NSApp runModalForWindow:panel.window];
+
+        if (panel.saved) {
+            result->saved = true;
+            result->capture_all = (panel.captureAllCheckbox.state == NSControlStateValueOn);
+
+            if (!result->capture_all) {
+                NSArray<NSString *> *apps = [panel.selectedApps allObjects];
+                size_t count = apps.count;
+                const char **appArray = (const char **)malloc(sizeof(char *) * count);
+                for (size_t i = 0; i < count; i++) {
+                    appArray[i] = strdup(apps[i].UTF8String);
+                }
+                result->selected_apps = appArray;
+                result->selected_apps_count = count;
+            }
+        }
+    }
+}
+
+void app_selection_free_result(AppSelectionResult *result) {
+    if (result->selected_apps) {
+        for (size_t i = 0; i < result->selected_apps_count; i++) {
+            free((void *)result->selected_apps[i]);
+        }
+        free((void *)result->selected_apps);
+        result->selected_apps = NULL;
+        result->selected_apps_count = 0;
     }
 }
 

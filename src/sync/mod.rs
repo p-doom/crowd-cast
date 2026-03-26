@@ -19,6 +19,11 @@ pub enum EngineCommand {
     PrepareForUpdate,
     /// Recreate the active capture source
     RefreshCaptureSource,
+    /// Reload target apps (user changed settings via UI)
+    ReloadTargetApps {
+        target_apps: Vec<String>,
+        capture_all: bool,
+    },
     /// User requested switch to a specific display (from notification action)
     SwitchToDisplay { display_id: u32 },
     /// Shutdown the engine

@@ -40,6 +40,73 @@ use crate::upload::Uploader;
 
 use super::{EngineCommand, EngineStatus};
 
+/// Restart the current process with a clean OBS context.
+/// Uses Unix exec to replace this process with a fresh one.
+fn restart_process() -> ! {
+    info!("Restarting process for fresh OBS context...");
+    let exe = std::env::current_exe().expect("Failed to get current executable path");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        // exec() only returns on error
+        error!("exec failed: {}", err);
+        std::process::exit(1);
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(&exe)
+            .args(&args)
+            .spawn()
+            .expect("Failed to restart process");
+        std::process::exit(0);
+    }
+}
+
+/// Persisted recording state — survives restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistedRecordingState {
+    Recording,
+    Paused,
+    Stopped,
+}
+
+fn recording_state_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+        .map(|p| p.data_dir().join("recording_state"))
+}
+
+fn read_recording_state() -> Option<PersistedRecordingState> {
+    let path = recording_state_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    match content.trim() {
+        "recording" => Some(PersistedRecordingState::Recording),
+        "paused" => Some(PersistedRecordingState::Paused),
+        "stopped" => Some(PersistedRecordingState::Stopped),
+        _ => None,
+    }
+}
+
+fn write_recording_state(state: PersistedRecordingState) {
+    let Some(path) = recording_state_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let s = match state {
+        PersistedRecordingState::Recording => "recording",
+        PersistedRecordingState::Paused => "paused",
+        PersistedRecordingState::Stopped => "stopped",
+    };
+    if let Err(e) = std::fs::write(&path, s) {
+        warn!("Failed to persist recording state: {}", e);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusKind {
     Idle,
@@ -842,6 +909,22 @@ unintended app video."
         }
 
         let target_app = desired_target;
+
+        // SCK sources only work when created before the OBS context's first
+        // recording. If a tracked app wasn't running at startup, it has no
+        // scene. The only reliable fix is to restart the process so all
+        // currently-running apps get scenes in a fresh OBS context.
+        if let Some(app) = target_app.as_deref() {
+            if self.capture_ctx.needs_scene_for_app(app) {
+                info!(
+                    "App '{}' wasn't running at startup — restarting to create its capture source",
+                    app
+                );
+                self.stop_recording().await.ok();
+                restart_process();
+            }
+        }
+
         match self
             .capture_ctx
             .switch_active_app_capture(target_app.as_deref())
@@ -1256,16 +1339,34 @@ unintended app video."
         // Broadcast initial status
         self.send_status_force(EngineStatus::Idle);
 
-        if self.config.recording.autostart_on_launch {
-            info!("Autostart recording on launch enabled");
-            if let Err(e) = self.start_recording().await {
-                error!("Failed to autostart recording: {}", e);
-                self.send_status_force(EngineStatus::Error(format!(
-                    "Autostart recording failed: {}",
-                    e
-                )));
+        // Restore recording state from previous session, or fall back to
+        // autostart_on_launch for fresh installs (no persisted state).
+        let desired_state = read_recording_state().unwrap_or_else(|| {
+            if self.config.recording.autostart_on_launch {
+                PersistedRecordingState::Recording
             } else {
-                self.reset_segment_timer();
+                PersistedRecordingState::Stopped
+            }
+        });
+
+        match desired_state {
+            PersistedRecordingState::Recording | PersistedRecordingState::Paused => {
+                info!("Restoring recording state: {:?}", desired_state);
+                if let Err(e) = self.start_recording().await {
+                    error!("Failed to start recording: {}", e);
+                    self.send_status_force(EngineStatus::Error(format!(
+                        "Recording start failed: {}",
+                        e
+                    )));
+                } else {
+                    self.reset_segment_timer();
+                    if desired_state == PersistedRecordingState::Paused {
+                        self.pause_recording();
+                    }
+                }
+            }
+            PersistedRecordingState::Stopped => {
+                info!("Recording state: stopped (not auto-starting)");
             }
         }
 
@@ -1282,17 +1383,20 @@ unintended app video."
                                     e
                                 )));
                             } else {
+                                write_recording_state(PersistedRecordingState::Recording);
                                 self.reset_segment_timer();
                             }
                         }
                         EngineCommand::StopRecording => {
                             self.stop_recording().await?;
+                            write_recording_state(PersistedRecordingState::Stopped);
                             self.reset_segment_timer();
                         }
                         EngineCommand::PauseRecording => {
                             let was_paused = self.is_paused;
                             self.pause_recording();
                             if !was_paused && self.is_paused {
+                                write_recording_state(PersistedRecordingState::Paused);
                                 self.reset_segment_timer();
                             }
                         }
@@ -1300,6 +1404,7 @@ unintended app video."
                             let was_paused = self.is_paused;
                             self.resume_recording();
                             if was_paused && !self.is_paused {
+                                write_recording_state(PersistedRecordingState::Recording);
                                 self.reset_segment_timer();
                             }
                         }
@@ -1323,6 +1428,29 @@ unintended app video."
                             } else {
                                 self.clear_capture_watchdog();
                                 self.refresh_capture_enabled_from_frontmost();
+                            }
+                        }
+                        EngineCommand::ReloadTargetApps { target_apps, capture_all } => {
+                            info!(
+                                "Reloading target apps: capture_all={}, apps={:?}",
+                                capture_all, target_apps
+                            );
+                            let was_recording = self.current_session.is_some();
+                            if was_recording {
+                                self.stop_recording().await?;
+                            }
+                            self.config.capture.target_apps = target_apps;
+                            self.config.capture.capture_all = capture_all;
+                            self.single_active_app_capture = !self.config.capture.capture_all
+                                && !self.config.capture.target_apps.is_empty()
+                                && cfg!(target_os = "macos")
+                                && self.config.capture.single_active_app_capture;
+                            self.capture_ctx
+                                .set_single_active_app_capture(self.single_active_app_capture);
+                            self.capture_ctx
+                                .setup_capture(&self.config.capture.target_apps)?;
+                            if was_recording {
+                                self.start_recording().await?;
                             }
                         }
                         EngineCommand::SwitchToDisplay { display_id } => {
@@ -2317,10 +2445,14 @@ unintended app video."
             }
         }
 
-        // Track user activity for idle detection regardless of capture state.
-        // Without this, the idle timer fires while the user is actively working
-        // but capture is disabled (e.g., source not ready).
-        if self.current_session.is_some() {
+        // Track user activity for idle detection when on a tracked app.
+        // Uses should_capture (frontmost app is tracked) rather than capture_enabled
+        // (which also requires source readiness). This way:
+        // - On a tracked app with source not ready: timestamp updates, no spurious idle
+        // - On an untracked app: timestamp goes stale, idle fires after timeout
+        if self.current_session.is_some() && self.config.should_capture_app(
+            self.last_frontmost_app.as_deref().unwrap_or(""),
+        ) {
             self.last_recorded_action_time = Instant::now();
         }
 
