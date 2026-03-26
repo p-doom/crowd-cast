@@ -1,10 +1,29 @@
----
-
-   
+<div align="center">
+  <img src="https://github.com/p-doom/crowd-code/blob/main/img/pdoom-logo.png?raw=true" width="60%" alt="p(doom)" />
+</div>
+<hr>
+<div align="center" style="line-height: 1;">
+  <a href="https://www.pdoom.org/"><img alt="Homepage"
+    src="https://img.shields.io/badge/Homepage-p%28doom%29-white?logo=home&logoColor=black"/></a>
+  <a href="https://huggingface.co/p-doom"><img alt="Hugging Face"
+    src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-p--doom-ffc107?color=ffc107&logoColor=white"/></a>
+  <br>
+  <a href="https://discord.gg/G4JNuPX2VR"><img alt="Discord"
+    src="https://img.shields.io/badge/Discord-p%28doom%29-7289da?logo=discord&logoColor=white&color=7289da"/></a>
+  <a href="https://github.com/p-doom"><img alt="GitHub"
+    src="https://img.shields.io/badge/GitHub-p--doom-24292e?logo=github&logoColor=white"/></a>
+  <a href="https://twitter.com/prob_doom"><img alt="Twitter Follow"
+    src="https://img.shields.io/badge/Twitter-prob__doom-white?logo=x&logoColor=white"/></a>
+  <br>
+  <a href="LICENSE.md" style="margin: 2px;">
+    <img alt="License" src="https://img.shields.io/badge/License-MIT-f5de53?&color=f5de53" style="display: inline-block; vertical-align: middle;"/>
+  </a>
+  <br>
+</div>
 
 # `crowd-cast`:  Crowd-Sourcing Months-Long Trajectories of Human Computer Work
 
-Cross-platform infrastructure for capturing paired screencast and keyboard/mouse input data.
+Infrastructure for capturing paired screencast and keyboard/mouse input data.
 
 ## Overview
 
@@ -52,17 +71,17 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 
 - **Single binary**: No external OBS installation required (libobs is embedded)
 - **Privacy-aware capture**: Only records when selected applications are in the foreground
-- **Silent auto-updates**: Sparkle framework keeps the app up to date in the background
+- **Automatic updates**: Sparkle framework keeps the app up to date in the background
 - **Idle detection**: Automatically pauses recording when you step away, resumes on return
 - **Hardware acceleration**: Uses native encoding (VideoToolbox on macOS)
 - **Efficient uploads**: Streaming uploads via pre-signed S3 URLs with retry/backoff
-- **Easy setup**: Native wizard handles permissions and application selection
+- **Easy setup**: Wizard handles permissions and application selection
 
 ## Quick Start
 
 ### For users
 
-See [USER_INSTALL.md](USER_INSTALL.md) for download and installation instructions.
+Download `CrowdCast.dmg` from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest), open it and follow the instructions in the wizard. 
 
 ### Building from source
 
@@ -97,7 +116,7 @@ scripts/setup-macos-signing.sh \
   --p12 /path/to/developer-id.p12
 ```
 
-For a full release (build, sign, notarize, publish to GitHub Releases + S3 appcast):
+For a full release (build, sign, notarize, publish to GitHub Releases + upload appcast to S3):
 
 ```bash
 scripts/build-and-publish-macos.sh \
@@ -111,7 +130,7 @@ scripts/build-and-publish-macos.sh \
   --sparkle-private-ed-key-file /path/to/private-key.txt
 ```
 
-The release DMG uses a drag-and-drop layout with `CrowdCast.app` and an `Applications` link. Auto-updates are delivered via Sparkle using an appcast hosted on S3.
+Auto-updates are delivered via Sparkle using an appcast hosted on S3.
 
 ### Linux/Windows
 
@@ -119,7 +138,7 @@ Support coming soon...
 
 ## Configuration
 
-Most settings are managed through the setup wizard and the **Settings** tray menu item. The configuration file is at:
+Most settings are managed through the setup wizard and the tray menu. The configuration file is at:
 
 - macOS: `~/Library/Application Support/dev.crowd-cast.agent/config.toml`
 
@@ -143,53 +162,6 @@ delete_after_upload = true
 
 Upload endpoint is set at build time via `CROWD_CAST_API_GATEWAY_URL`.
 
-## Usage
-
-### First Run (Recommended)
-
-```bash
-crowd-cast-agent --setup
-```
-
-This runs the interactive setup wizard that guides you through configuration.
-
-### Normal Usage
-
-```bash
-crowd-cast-agent
-```
-
-The agent will:
-
-1. Bootstrap OBS libraries (downloads if needed)
-2. Initialize embedded libobs for capture
-3. Show in your system tray
-4. Capture input when selected apps are in foreground
-
-### Command Line Options
-
-```
-crowd-cast-agent [OPTIONS]
-
-OPTIONS:
-    -h, --help    Print help message
-    -s, --setup   Run the setup wizard (re-select apps, etc.)
-
-ENVIRONMENT:
-    RUST_LOG      Set log level (e.g., debug, info, warn)
-    CROWD_CAST_LOG_PATH
-                  Override log directory (default: ~/Library/Logs/crowd-cast on macOS)
-    CROWD_CAST_API_GATEWAY_URL
-                  Lambda endpoint for pre-signed S3 URLs (set at build time)
-```
-
-### Application Selection
-
-The native setup wizard lets you select which applications to capture. You can change your selection at any time via **Settings** in the tray menu.
-
-When "Record entire screen" is checked, everything visible on screen is recorded regardless of which app is active. Otherwise, only the selected applications are captured. Switching to an untracked app shows a blank frame and pauses input recording.
-
-If a tracked application is launched after CrowdCast starts, the app automatically restarts to pick it up.
 
 ## Data Format
 
@@ -215,7 +187,6 @@ Event types:
 - `MouseScroll`: `[delta_x, delta_y, x, y]`
 
 Timestamps are microseconds relative to the segment start. Video and input files share the same session/segment IDs for alignment.
-
 
 ## Utilities
 
@@ -274,19 +245,42 @@ def handler(event, context):
 
 This section is for contributors who want to modify crowd-cast.
 
-### Project Structure
+### First Run (Recommended)
+
+```bash
+crowd-cast-agent --setup
+```
+
+This runs the interactive setup wizard that guides you through configuration.
+
+### Normal Usage
+
+```bash
+crowd-cast-agent
+```
+
+The agent will:
+
+1. Bootstrap OBS libraries (downloads if needed)
+2. Initialize embedded libobs for capture
+3. Show in your system tray
+4. Capture input when selected apps are in foreground
+
+### Command Line Options
 
 ```
-crowd-cast/
-├── src/
-│   ├── capture/       # libobs integration, frontmost app detection
-│   ├── input/         # Keyboard/mouse capture backends
-│   ├── sync/          # Sync engine coordinating capture + input
-│   ├── installer/     # Setup wizard, permissions
-│   └── ui/            # System tray
-├── Cargo.toml
-├── libobs-rs/             # Fork of libobs-rs with macOS support
-└── scripts/               # Utility scripts
+crowd-cast-agent [OPTIONS]
+
+OPTIONS:
+    -h, --help    Print help message
+    -s, --setup   Run the setup wizard (re-select apps, etc.)
+
+ENVIRONMENT:
+    RUST_LOG      Set log level (e.g., debug, info, warn)
+    CROWD_CAST_LOG_PATH
+                  Override log directory (default: ~/Library/Logs/crowd-cast on macOS)
+    CROWD_CAST_API_GATEWAY_URL
+                  Lambda endpoint for pre-signed S3 URLs (set at build time)
 ```
 
 ### Building from Source
@@ -298,16 +292,6 @@ crowd-cast/
 ```bash
 brew install simde       # Required for ARM builds
 brew install create-dmg  # Required for release DMG packaging
-```
-
-**Linux:**
-
-```bash
-# Ubuntu/Debian
-sudo apt install libgtk-3-dev libayatana-appindicator3-dev
-
-# Fedora
-sudo dnf install gtk3-devel libappindicator-gtk3-devel
 ```
 
 #### Build Steps
