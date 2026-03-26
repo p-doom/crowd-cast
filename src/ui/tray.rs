@@ -350,7 +350,7 @@ impl TrayApp {
             // Periodic background update check (bypasses Sparkle's scheduler
             // which relies on NSUserDefaults that may not persist).
             // Interval matches SUScheduledCheckInterval in Info.plist (default 60s for testing, 86400 for production).
-            const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
             if self.last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
                 if self.updater.can_check_for_updates() {
                     info!("Scheduled background update check");

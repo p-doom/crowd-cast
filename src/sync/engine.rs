@@ -66,6 +66,47 @@ fn restart_process() -> ! {
     }
 }
 
+/// Persisted recording state — survives restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistedRecordingState {
+    Recording,
+    Paused,
+    Stopped,
+}
+
+fn recording_state_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+        .map(|p| p.data_dir().join("recording_state"))
+}
+
+fn read_recording_state() -> Option<PersistedRecordingState> {
+    let path = recording_state_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    match content.trim() {
+        "recording" => Some(PersistedRecordingState::Recording),
+        "paused" => Some(PersistedRecordingState::Paused),
+        "stopped" => Some(PersistedRecordingState::Stopped),
+        _ => None,
+    }
+}
+
+fn write_recording_state(state: PersistedRecordingState) {
+    let Some(path) = recording_state_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let s = match state {
+        PersistedRecordingState::Recording => "recording",
+        PersistedRecordingState::Paused => "paused",
+        PersistedRecordingState::Stopped => "stopped",
+    };
+    if let Err(e) = std::fs::write(&path, s) {
+        warn!("Failed to persist recording state: {}", e);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusKind {
     Idle,
@@ -1298,16 +1339,34 @@ unintended app video."
         // Broadcast initial status
         self.send_status_force(EngineStatus::Idle);
 
-        if self.config.recording.autostart_on_launch {
-            info!("Autostart recording on launch enabled");
-            if let Err(e) = self.start_recording().await {
-                error!("Failed to autostart recording: {}", e);
-                self.send_status_force(EngineStatus::Error(format!(
-                    "Autostart recording failed: {}",
-                    e
-                )));
+        // Restore recording state from previous session, or fall back to
+        // autostart_on_launch for fresh installs (no persisted state).
+        let desired_state = read_recording_state().unwrap_or_else(|| {
+            if self.config.recording.autostart_on_launch {
+                PersistedRecordingState::Recording
             } else {
-                self.reset_segment_timer();
+                PersistedRecordingState::Stopped
+            }
+        });
+
+        match desired_state {
+            PersistedRecordingState::Recording | PersistedRecordingState::Paused => {
+                info!("Restoring recording state: {:?}", desired_state);
+                if let Err(e) = self.start_recording().await {
+                    error!("Failed to start recording: {}", e);
+                    self.send_status_force(EngineStatus::Error(format!(
+                        "Recording start failed: {}",
+                        e
+                    )));
+                } else {
+                    self.reset_segment_timer();
+                    if desired_state == PersistedRecordingState::Paused {
+                        self.pause_recording();
+                    }
+                }
+            }
+            PersistedRecordingState::Stopped => {
+                info!("Recording state: stopped (not auto-starting)");
             }
         }
 
@@ -1324,17 +1383,20 @@ unintended app video."
                                     e
                                 )));
                             } else {
+                                write_recording_state(PersistedRecordingState::Recording);
                                 self.reset_segment_timer();
                             }
                         }
                         EngineCommand::StopRecording => {
                             self.stop_recording().await?;
+                            write_recording_state(PersistedRecordingState::Stopped);
                             self.reset_segment_timer();
                         }
                         EngineCommand::PauseRecording => {
                             let was_paused = self.is_paused;
                             self.pause_recording();
                             if !was_paused && self.is_paused {
+                                write_recording_state(PersistedRecordingState::Paused);
                                 self.reset_segment_timer();
                             }
                         }
@@ -1342,6 +1404,7 @@ unintended app video."
                             let was_paused = self.is_paused;
                             self.resume_recording();
                             if was_paused && !self.is_paused {
+                                write_recording_state(PersistedRecordingState::Recording);
                                 self.reset_segment_timer();
                             }
                         }

@@ -168,7 +168,7 @@ plist_set_string "$INFO_PLIST" "CFBundleShortVersionString" "$APP_VERSION"
 plist_set_string "$INFO_PLIST" "CFBundleVersion" "$BUILD_NUMBER"
 plist_set_bool "$INFO_PLIST" "SUEnableAutomaticChecks" "$( [[ "$SPARKLE_AUTO_CHECKS" -eq 1 ]] && echo true || echo false )"
 plist_set_bool "$INFO_PLIST" "SUAutomaticallyUpdate" "$( [[ "$SPARKLE_AUTO_UPDATE" -eq 1 ]] && echo true || echo false )"
-plist_set_int "$INFO_PLIST" "SUScheduledCheckInterval" "60"
+plist_set_int "$INFO_PLIST" "SUScheduledCheckInterval" "600"
 
 if [[ -n "$SPARKLE_FEED_URL" ]]; then
     plist_set_string "$INFO_PLIST" "SUFeedURL" "$SPARKLE_FEED_URL"

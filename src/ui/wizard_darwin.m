@@ -178,7 +178,7 @@ static BOOL g_wizard_running = NO;
     [_welcomeView addSubview:desc];
     
     // Setup steps
-    NSTextField *steps = [[NSTextField alloc] initWithFrame:NSMakeRect(100, 80, 350, 100)];
+    NSTextField *steps = [[NSTextField alloc] initWithFrame:NSMakeRect(100, 110, 350, 100)];
     steps.stringValue = @"Setup will:\n\n  1. Request necessary permissions\n  2. Let you select applications to capture\n  3. Configure automatic startup";
     steps.bezeled = NO;
     steps.editable = NO;
@@ -186,6 +186,18 @@ static BOOL g_wizard_running = NO;
     steps.font = [NSFont systemFontOfSize:13];
     steps.textColor = [NSColor labelColor];
     [_welcomeView addSubview:steps];
+
+    // Data notice
+    NSTextField *notice = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 20, 450, 75)];
+    notice.stringValue = @"CrowdCast records screencasts and keyboard/mouse input only for the applications you select. This data is uploaded and will be published as part of an open research dataset under a Creative Commons license. You can pause or stop recording at any time from the menu bar.";
+    notice.bezeled = NO;
+    notice.editable = NO;
+    notice.drawsBackground = NO;
+    notice.alignment = NSTextAlignmentCenter;
+    notice.font = [NSFont systemFontOfSize:11];
+    notice.textColor = [NSColor tertiaryLabelColor];
+    [notice setLineBreakMode:NSLineBreakByWordWrapping];
+    [_welcomeView addSubview:notice];
 }
 
 // ============================================================================
