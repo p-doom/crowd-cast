@@ -16,7 +16,7 @@ use libobs_wrapper::context::ObsContext;
 use libobs_wrapper::data::video::ObsVideoInfoBuilder;
 use libobs_wrapper::scenes::ObsSceneRef;
 use libobs_wrapper::utils::{ObsPath, StartupInfo, StartupPaths};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -309,7 +309,45 @@ impl CaptureContext {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
 
+        // Only create scenes for apps that are currently running.
+        // Apps launched later get their scenes created lazily on first switch.
+        // This avoids stale SCK filters for apps not running at startup.
+        let running_bundles: HashSet<String> = {
+            #[cfg(target_os = "macos")]
+            {
+                use objc::runtime::{Class, Object};
+                use objc::{msg_send, sel, sel_impl};
+                let mut bundles = HashSet::new();
+                unsafe {
+                    let cls = Class::get("NSWorkspace").unwrap();
+                    let workspace: *mut Object = msg_send![cls, sharedWorkspace];
+                    let apps: *mut Object = msg_send![workspace, runningApplications];
+                    let count: usize = msg_send![apps, count];
+                    for i in 0..count {
+                        let app: *mut Object = msg_send![apps, objectAtIndex: i];
+                        let bid: *mut Object = msg_send![app, bundleIdentifier];
+                        if !bid.is_null() {
+                            let cstr: *const std::os::raw::c_char = msg_send![bid, UTF8String];
+                            if !cstr.is_null() {
+                                if let Ok(s) = std::ffi::CStr::from_ptr(cstr).to_str() {
+                                    bundles.insert(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                bundles
+            }
+            #[cfg(not(target_os = "macos"))]
+            HashSet::new()
+        };
+
         for bundle_id in &target_apps {
+            if !running_bundles.contains(bundle_id.as_str()) {
+                debug!("Skipping scene for '{}' (not running)", bundle_id);
+                continue;
+            }
+
             let scene_name = Self::build_scene_name(&format!("scene_{}", bundle_id));
             let mut scene = context
                 .scene(scene_name.as_str())
@@ -792,11 +830,15 @@ impl CaptureContext {
         self.active_capture_app.as_deref()
     }
 
-    /// Switch the single-active application capture source to a new target app.
-    ///
-    /// Passing `None` clears the current application source and leaves the scene blank.
+    /// Check if an app needs a scene created (wasn't running at startup).
+    pub fn needs_scene_for_app(&self, bundle_id: &str) -> bool {
+        self.use_single_active_app_capture()
+            && self.target_apps.iter().any(|a| a == bundle_id)
+            && !self.app_scenes.contains_key(bundle_id)
+    }
+
     /// Switch to a different app's pre-created scene.
-    /// Instant — just activates the target scene on channel 0, no source lifecycle churn.
+    /// Instant — just activates the target scene on channel 0.
     pub fn switch_active_app_capture(&mut self, active_app: Option<&str>) -> Result<bool> {
         if !self.use_single_active_app_capture() {
             return Ok(false);
@@ -816,12 +858,11 @@ impl CaptureContext {
                         bundle_id
                     );
                 } else {
-                    // App not in our pre-created scenes — show blank
                     if let Some(blank) = self.blank_scene.as_mut() {
                         Self::activate_scene(blank)?;
                     }
                     warn!(
-                        "No pre-created scene for '{}'; showing blank",
+                        "No scene for '{}'; showing blank",
                         bundle_id
                     );
                 }

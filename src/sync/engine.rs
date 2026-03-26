@@ -40,6 +40,32 @@ use crate::upload::Uploader;
 
 use super::{EngineCommand, EngineStatus};
 
+/// Restart the current process with a clean OBS context.
+/// Uses Unix exec to replace this process with a fresh one.
+fn restart_process() -> ! {
+    info!("Restarting process for fresh OBS context...");
+    let exe = std::env::current_exe().expect("Failed to get current executable path");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        // exec() only returns on error
+        error!("exec failed: {}", err);
+        std::process::exit(1);
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(&exe)
+            .args(&args)
+            .spawn()
+            .expect("Failed to restart process");
+        std::process::exit(0);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusKind {
     Idle,
@@ -842,6 +868,22 @@ unintended app video."
         }
 
         let target_app = desired_target;
+
+        // SCK sources only work when created before the OBS context's first
+        // recording. If a tracked app wasn't running at startup, it has no
+        // scene. The only reliable fix is to restart the process so all
+        // currently-running apps get scenes in a fresh OBS context.
+        if let Some(app) = target_app.as_deref() {
+            if self.capture_ctx.needs_scene_for_app(app) {
+                info!(
+                    "App '{}' wasn't running at startup — restarting to create its capture source",
+                    app
+                );
+                self.stop_recording().await.ok();
+                restart_process();
+            }
+        }
+
         match self
             .capture_ctx
             .switch_active_app_capture(target_app.as_deref())
@@ -2340,10 +2382,14 @@ unintended app video."
             }
         }
 
-        // Track user activity for idle detection regardless of capture state.
-        // Without this, the idle timer fires while the user is actively working
-        // but capture is disabled (e.g., source not ready).
-        if self.current_session.is_some() {
+        // Track user activity for idle detection when on a tracked app.
+        // Uses should_capture (frontmost app is tracked) rather than capture_enabled
+        // (which also requires source readiness). This way:
+        // - On a tracked app with source not ready: timestamp updates, no spurious idle
+        // - On an untracked app: timestamp goes stale, idle fires after timeout
+        if self.current_session.is_some() && self.config.should_capture_app(
+            self.last_frontmost_app.as_deref().unwrap_or(""),
+        ) {
             self.last_recorded_action_time = Instant::now();
         }
 
