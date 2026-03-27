@@ -13,6 +13,8 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
@@ -272,6 +274,8 @@ pub struct SyncEngine {
     segment_duration_secs: u64,
     /// Whether to delete files after upload
     delete_after_upload: bool,
+    /// Shared flag to pause/resume uploads from the tray
+    uploads_paused: Arc<AtomicBool>,
     /// Upload receiver (taken once when run() starts)
     upload_rx: Option<mpsc::UnboundedReceiver<UploadMessage>>,
     /// Notification action receiver (taken once when run() starts)
@@ -383,6 +387,7 @@ unintended app video."
             uploader,
             segment_duration_secs,
             delete_after_upload,
+            uploads_paused: Arc::new(AtomicBool::new(false)),
             upload_rx: Some(upload_rx),
             notification_rx: Some(notification_rx),
             pending_display_refresh: None,
@@ -1121,10 +1126,12 @@ unintended app video."
         mut upload_rx: mpsc::UnboundedReceiver<UploadMessage>,
         uploader: Uploader,
         delete_after_upload: bool,
+        uploads_paused: Arc<AtomicBool>,
     ) {
         const BASE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
         const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2 * 60 * 60);
         const MAX_RETRY_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
+        const UPLOAD_PAUSE_NOTIFY_THRESHOLD: usize = 50;
 
         tokio::spawn(async move {
             let mut retry_queue: BinaryHeap<RetryEntry> = BinaryHeap::new();
@@ -1211,6 +1218,31 @@ unintended app video."
                                     }
                                 } else {
                                     active_session_id = Some(segment_session_id);
+                                }
+
+                                // If uploads are paused, queue the segment for later
+                                if uploads_paused.load(AtomicOrdering::SeqCst) {
+                                    info!("Uploads paused, queuing segment {} for later", chunk_id);
+                                    let now = Instant::now();
+                                    sequence = sequence.wrapping_add(1);
+                                    retry_queue.push(RetryEntry {
+                                        next_attempt_at: now,
+                                        sequence,
+                                        item: RetryItem {
+                                            segment,
+                                            attempts: 0,
+                                            first_failed_at: now,
+                                            next_attempt_at: now,
+                                        },
+                                    });
+                                    if retry_queue.len() == UPLOAD_PAUSE_NOTIFY_THRESHOLD {
+                                        warn!("{} segments waiting to upload. Resume uploads from the tray menu.", UPLOAD_PAUSE_NOTIFY_THRESHOLD);
+                                        extern "C" {
+                                            fn notifications_show_upload_queue_warning();
+                                        }
+                                        unsafe { notifications_show_upload_queue_warning(); }
+                                    }
+                                    continue;
                                 }
 
                                 info!("Background upload starting for segment {}", chunk_id);
@@ -1319,7 +1351,7 @@ unintended app video."
 
         // Spawn background upload task (must be done inside async context)
         if let Some(upload_rx) = self.upload_rx.take() {
-            Self::spawn_upload_task(upload_rx, self.uploader.clone(), self.delete_after_upload);
+            Self::spawn_upload_task(upload_rx, self.uploader.clone(), self.delete_after_upload, self.uploads_paused.clone());
         }
 
         // Take notification receiver for the main loop
@@ -1452,6 +1484,14 @@ unintended app video."
                             if was_recording {
                                 self.start_recording().await?;
                             }
+                        }
+                        EngineCommand::PauseUploads => {
+                            info!("Uploads paused");
+                            self.uploads_paused.store(true, AtomicOrdering::SeqCst);
+                        }
+                        EngineCommand::ResumeUploads => {
+                            info!("Uploads resumed");
+                            self.uploads_paused.store(false, AtomicOrdering::SeqCst);
                         }
                         EngineCommand::SwitchToDisplay { display_id } => {
                             info!("User requested switch to display {}", display_id);
