@@ -151,6 +151,7 @@ impl TrayApp {
         let pause_text = CString::new("Pause Recording")?;
         let resume_text = CString::new("Resume Recording")?;
         let stop_text = CString::new("Stop Recording")?;
+        let panic_text = CString::new("Panic (delete recent recordings)")?;
         let settings_text = CString::new("Settings")?;
         let updates_text = CString::new("Check for Updates")?;
         let quit_text = CString::new("Quit")?;
@@ -162,15 +163,16 @@ impl TrayApp {
             pause_text,        // 3
             resume_text,       // 4
             stop_text,         // 5
-            separator.clone(), // 6
-            settings_text,     // 7
-            updates_text,      // 8
-            separator.clone(), // 9
-            quit_text,         // 10
+            panic_text,        // 6
+            separator.clone(), // 7
+            settings_text,     // 8
+            updates_text,      // 9
+            separator.clone(), // 10
+            quit_text,         // 11
         ];
 
         // Build menu items array (NULL-terminated)
-        // Menu indices: 0=status, 1=sep, 2=start, 3=pause, 4=resume, 5=stop, 6=sep, 7=settings, 8=updates, 9=sep, 10=quit
+        // Menu indices: 0=status, 1=sep, 2=start, 3=pause, 4=resume, 5=stop, 6=panic, 7=sep, 8=settings, 9=updates, 10=sep, 11=quit
         let mut menu_items = vec![
             TrayMenuItem {
                 text: menu_strings[0].as_ptr(), // Status
@@ -215,35 +217,42 @@ impl TrayApp {
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[6].as_ptr(), // separator
+                text: menu_strings[6].as_ptr(), // Panic
+                disabled: 0,
+                checked: 0,
+                cb: Some(on_panic),
+                submenu: std::ptr::null_mut(),
+            },
+            TrayMenuItem {
+                text: menu_strings[7].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[7].as_ptr(), // Settings
+                text: menu_strings[8].as_ptr(), // Settings
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_settings),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[8].as_ptr(), // Check for Updates
+                text: menu_strings[9].as_ptr(), // Check for Updates
                 disabled: 1,
                 checked: 0,
                 cb: Some(on_check_for_updates),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[9].as_ptr(), // separator
+                text: menu_strings[10].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[10].as_ptr(), // Quit
+                text: menu_strings[11].as_ptr(), // Quit
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_quit),
@@ -500,7 +509,7 @@ impl TrayApp {
         }
 
         self.last_updater_can_check = Some(can_check);
-        self._menu_items[8].disabled = if can_check { 0 } else { 1 };
+        self._menu_items[9].disabled = if can_check { 0 } else { 1 };
 
         self.tray.menu = self._menu_items.as_mut_ptr();
         unsafe {
@@ -681,6 +690,15 @@ unsafe extern "C" fn on_resume_recording(_item: *mut TrayMenuItem) {
 unsafe extern "C" fn on_check_for_updates(_item: *mut TrayMenuItem) {
     info!("Check for updates requested via tray");
     CHECK_FOR_UPDATES_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+unsafe extern "C" fn on_panic(_item: *mut TrayMenuItem) {
+    warn!("Panic button pressed via tray");
+    if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
+        if let Err(e) = sender.try_send(EngineCommand::Panic) {
+            error!("Failed to send panic command: {}", e);
+        }
+    }
 }
 
 unsafe extern "C" fn on_settings(_item: *mut TrayMenuItem) {

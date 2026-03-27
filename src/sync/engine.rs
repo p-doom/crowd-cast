@@ -266,6 +266,9 @@ pub struct SyncEngine {
     segment_index: u32,
     /// Channel for completed segments to upload
     upload_tx: mpsc::UnboundedSender<UploadMessage>,
+    /// Buffer for completed segments — held for 10 minutes before uploading
+    /// so the panic button can delete recent recordings without a backend call.
+    upload_buffer: std::collections::VecDeque<(Instant, CompletedSegment)>,
     /// Uploader instance
     uploader: Uploader,
     /// Segment duration in seconds (cached from config)
@@ -383,6 +386,7 @@ unintended app video."
             uploader,
             segment_duration_secs,
             delete_after_upload,
+            upload_buffer: std::collections::VecDeque::new(),
             upload_rx: Some(upload_rx),
             notification_rx: Some(notification_rx),
             pending_display_refresh: None,
@@ -457,6 +461,69 @@ unintended app video."
             ));
         } else {
             self.segment_timer = None;
+        }
+    }
+
+    /// Buffer a completed segment for delayed upload (10-minute hold).
+    fn buffer_segment_for_upload(&mut self, segment: CompletedSegment, segment_id: String) {
+        if self.uploader.is_configured() {
+            info!("Buffering segment {} for delayed upload", segment_id);
+            self.upload_buffer.push_back((Instant::now(), segment));
+        }
+    }
+
+    /// Graduate buffered segments older than 10 minutes to the upload task.
+    fn graduate_upload_buffer(&mut self) {
+        const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
+        let now = Instant::now();
+
+        while let Some((created_at, _)) = self.upload_buffer.front() {
+            if now.duration_since(*created_at) >= UPLOAD_BUFFER_DELAY {
+                let (_, segment) = self.upload_buffer.pop_front().unwrap();
+                let chunk_id = segment.chunk.chunk_id.clone();
+                info!("Graduating segment {} from upload buffer", chunk_id);
+                if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
+                    error!("Failed to send graduated segment: {}", e);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Flush all buffered segments to the upload task immediately (for graceful shutdown).
+    fn flush_upload_buffer(&mut self) {
+        let count = self.upload_buffer.len();
+        if count > 0 {
+            info!("Flushing {} buffered segment(s) to upload queue", count);
+        }
+        while let Some((_, segment)) = self.upload_buffer.pop_front() {
+            let chunk_id = segment.chunk.chunk_id.clone();
+            if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
+                error!("Failed to flush segment {}: {}", chunk_id, e);
+            }
+        }
+    }
+
+    /// Panic: delete all buffered segments from disk.
+    fn purge_upload_buffer(&mut self) {
+        let count = self.upload_buffer.len();
+        if count > 0 {
+            info!("Panic: deleting {} buffered segment(s)", count);
+        }
+        while let Some((_, segment)) = self.upload_buffer.pop_front() {
+            if let Some(ref video_path) = segment.chunk.video_path {
+                if let Err(e) = std::fs::remove_file(video_path) {
+                    warn!("Failed to delete video {:?}: {}", video_path, e);
+                } else {
+                    debug!("Deleted video: {:?}", video_path);
+                }
+            }
+            if let Err(e) = std::fs::remove_file(&segment.input_path) {
+                warn!("Failed to delete input {:?}: {}", segment.input_path, e);
+            } else {
+                debug!("Deleted input: {:?}", segment.input_path);
+            }
         }
     }
 
@@ -1453,6 +1520,41 @@ unintended app video."
                                 self.start_recording().await?;
                             }
                         }
+                        EngineCommand::Panic => {
+                            warn!("PANIC: deleting recent recordings");
+                            // Stop recording without buffering the final segment
+                            if self.current_session.is_some() {
+                                let session = tokio::task::block_in_place(|| self.capture_ctx.stop_recording())?;
+                                if let Some(session) = session {
+                                    // Delete current segment files
+                                    if let Err(e) = std::fs::remove_file(&session.output_path) {
+                                        warn!("Failed to delete video {:?}: {}", session.output_path, e);
+                                    }
+                                    // Delete any input files for current segment
+                                    let seg_id = self.current_segment_id();
+                                    let prefix = format!("input_{}", seg_id);
+                                    if let Ok(entries) = std::fs::read_dir(&self.output_dir) {
+                                        for entry in entries.flatten() {
+                                            let name = entry.file_name();
+                                            if name.to_string_lossy().starts_with(&prefix) {
+                                                let _ = std::fs::remove_file(entry.path());
+                                            }
+                                        }
+                                    }
+                                }
+                                self.current_session = None;
+                                self.recording_start_ns = None;
+                                self.segment_timer = None;
+                                self.clear_event_buffer();
+                            }
+                            // Purge the upload buffer (delete files for buffered segments)
+                            self.purge_upload_buffer();
+                            // Start fresh recording
+                            write_recording_state(PersistedRecordingState::Recording);
+                            if let Err(e) = self.start_recording().await {
+                                error!("Failed to restart recording after panic: {}", e);
+                            }
+                        }
                         EngineCommand::SwitchToDisplay { display_id } => {
                             info!("User requested switch to display {}", display_id);
                             self.switch_to_display(display_id);
@@ -1460,6 +1562,7 @@ unintended app video."
                         EngineCommand::Shutdown => {
                             info!("Shutdown command received");
                             self.stop_recording().await?;
+                            self.flush_upload_buffer();
                             break;
                         }
                     }
@@ -1492,6 +1595,7 @@ unintended app video."
                 _ = poll_timer.tick() => {
                     self.poll_frontmost_app().await;
                     self.check_display_changes().await;
+                    self.graduate_upload_buffer();
                 }
 
                 // Apply a queued app-driven capture source switch
@@ -1627,18 +1731,9 @@ unintended app video."
             end_time_us,
         };
 
-        // Queue for background upload (if uploader is configured)
-        if self.uploader.is_configured() {
-            let segment = CompletedSegment { chunk, input_path };
-
-            if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
-                error!("Failed to queue segment for upload: {}", e);
-            } else {
-                self.send_status_force(EngineStatus::Uploading {
-                    chunk_id: segment_id,
-                });
-            }
-        }
+        // Buffer for delayed upload (10-minute hold for panic button)
+        let segment = CompletedSegment { chunk, input_path };
+        self.buffer_segment_for_upload(segment, segment_id);
 
         // Clear recording state before starting new segment
         // This ensures we're in a consistent non-recording state if start fails
@@ -1925,14 +2020,7 @@ unintended app video."
                 };
 
                 let segment = CompletedSegment { chunk, input_path };
-
-                if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
-                    error!("Failed to queue final segment for upload: {}", e);
-                } else {
-                    self.send_status_force(EngineStatus::Uploading {
-                        chunk_id: segment_id,
-                    });
-                }
+                self.buffer_segment_for_upload(segment, segment_id);
             }
         } else {
             // Just stop recording without upload
