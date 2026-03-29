@@ -24,6 +24,8 @@ pub enum EngineCommand {
         target_apps: Vec<String>,
         capture_all: bool,
     },
+    /// Panic: delete current + buffered recordings
+    Panic,
     /// User requested switch to a specific display (from notification action)
     SwitchToDisplay { display_id: u32 },
     /// Shutdown the engine
