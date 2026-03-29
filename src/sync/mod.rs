@@ -28,6 +28,8 @@ pub enum EngineCommand {
     PauseUploads,
     /// Resume uploads (drain the pending queue)
     ResumeUploads,
+    /// Panic: delete current + buffered recordings
+    Panic,
     /// User requested switch to a specific display (from notification action)
     SwitchToDisplay { display_id: u32 },
     /// Shutdown the engine
