@@ -19,7 +19,7 @@ APP_NAME="CrowdCast"
 # --- Publish-specific args (not passed to release-macos.sh) ---
 GITHUB_REPO="${CROWD_CAST_GITHUB_REPO:-}"
 S3_BUCKET="${CROWD_CAST_S3_BUCKET:-}"
-S3_APPCAST_KEY="${CROWD_CAST_S3_APPCAST_KEY:-appcast.xml}"
+CHANNEL="${CROWD_CAST_CHANNEL:-dev}"
 DRY_RUN=0
 
 # --- Args we need to extract but also pass through ---
@@ -62,8 +62,8 @@ while [[ $# -gt 0 ]]; do
             S3_BUCKET="$2"
             shift 2
             ;;
-        --s3-appcast-key)
-            S3_APPCAST_KEY="$2"
+        --channel)
+            CHANNEL="$2"
             shift 2
             ;;
         --dry-run)
@@ -116,6 +116,18 @@ if [[ -z "$S3_BUCKET" ]]; then
 fi
 if [[ -z "$BUILD_NUMBER" ]]; then
     echo "Missing --build-number." >&2
+    exit 1
+fi
+
+# --- Channel config ---
+if [[ "$CHANNEL" == "prod" ]]; then
+    S3_APPCAST_KEY="appcast.xml"
+    GH_PRERELEASE=""
+elif [[ "$CHANNEL" == "dev" ]]; then
+    S3_APPCAST_KEY="appcast-dev.xml"
+    GH_PRERELEASE="--prerelease"
+else
+    echo "Unknown channel: $CHANNEL (use 'dev' or 'prod')" >&2
     exit 1
 fi
 
@@ -176,7 +188,8 @@ else
         "$DMG_PATH" \
         --repo "$GITHUB_REPO" \
         --title "$RELEASE_TAG" \
-        --generate-notes
+        --generate-notes \
+        $GH_PRERELEASE
 fi
 
 # --- Upload appcast.xml to S3 (publicly readable) ---
