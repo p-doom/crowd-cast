@@ -97,13 +97,16 @@ pub struct RecordingConfig {
     pub max_output_height: u32,
     /// Frames per second
     pub fps: u32,
+    /// Quality for CRF-based encoding (0-100, higher = better).
+    /// When set, supported encoders use CRF instead of fixed bitrate.
+    /// Recommended: 75-85 for screen recording.
+    pub crf: Option<u32>,
 }
 
 impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
-            // 3 Mbps, assuming 720p30 screen capture with HEVC
-            // Good balance between storage efficiency and text legibility
+            // Fallback bitrate for encoders that don't support CRF
             video_bitrate: 3000,
             // 160 Kbps - good quality for system audio (if enabled)
             audio_bitrate: 160,
@@ -115,10 +118,12 @@ impl Default for RecordingConfig {
             quality_preset: HardwarePreset::Balanced,
             // Hybrid MP4 - recoverable and widely compatible
             format: OutputFormat::HybridMP4,
-            // 720p max height
-            max_output_height: 720,
+            // 1080p max height
+            max_output_height: 1080,
             // 30 FPS
             fps: 30,
+            // CRF quality 80 - sharp text at any resolution
+            crf: Some(80),
         }
     }
 }
@@ -134,9 +139,9 @@ impl RecordingConfig {
             codec_preference: VideoCodecPreference::HevcPreferred,
             quality_preset: HardwarePreset::Quality,
             format: OutputFormat::HybridMP4,
-            // 0 = native resolution
             max_output_height: 0,
             fps: 30,
+            crf: Some(90),
         }
     }
 
@@ -152,6 +157,7 @@ impl RecordingConfig {
             format: OutputFormat::HybridMP4,
             max_output_height: 720,
             fps: 30,
+            crf: Some(65),
         }
     }
 
@@ -167,6 +173,7 @@ impl RecordingConfig {
             format: OutputFormat::Mpeg4,
             max_output_height: 720,
             fps: 30,
+            crf: Some(80),
         }
     }
 
@@ -225,11 +232,17 @@ impl RecordingOutput {
         // audio capture is controlled at the source level via ScreenCaptureSource.
         // When config.enable_audio is false, no audio sources are added, so the
         // audio track will be silent.
-        let output = SimpleOutputBuilder::new(context, "recording", obs_path)
+        let mut builder = SimpleOutputBuilder::new(context, "recording", obs_path)
             .video_bitrate(config.video_bitrate)
             .audio_bitrate(config.audio_bitrate)
             .hardware_encoder(codec, config.quality_preset)
-            .format(config.format)
+            .format(config.format);
+
+        if let Some(crf) = config.crf {
+            builder = builder.crf(crf);
+        }
+
+        let output = builder
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to create recording output: {}", e))?;
 
