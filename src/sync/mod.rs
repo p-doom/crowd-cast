@@ -24,6 +24,10 @@ pub enum EngineCommand {
         target_apps: Vec<String>,
         capture_all: bool,
     },
+    /// Pause uploads (segments accumulate on disk)
+    PauseUploads,
+    /// Resume uploads (drain the pending queue)
+    ResumeUploads,
     /// Panic: delete current + buffered recordings
     Panic,
     /// User requested switch to a specific display (from notification action)

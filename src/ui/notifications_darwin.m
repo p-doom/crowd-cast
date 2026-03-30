@@ -516,6 +516,33 @@ void notifications_show_update_completed(const char* version, const char* build)
     }
 }
 
+// Show a warning when too many segments are queued while uploads are paused
+void notifications_show_upload_queue_warning(void) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"Uploads Paused";
+        content.body = @"50 segments waiting to upload. Resume uploads from the tray menu to free disk space.";
+
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil];
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
 // Check if notifications are authorized
 // Returns: 1 if authorized, 0 if not, -1 on error
 int notifications_is_authorized(void) {

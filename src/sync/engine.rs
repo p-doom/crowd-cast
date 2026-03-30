@@ -13,6 +13,8 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
@@ -105,6 +107,28 @@ fn write_recording_state(state: PersistedRecordingState) {
     if let Err(e) = std::fs::write(&path, s) {
         warn!("Failed to persist recording state: {}", e);
     }
+}
+
+fn uploads_paused_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+        .map(|p| p.data_dir().join("uploads_paused"))
+}
+
+fn read_uploads_paused() -> bool {
+    uploads_paused_path()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .map(|s| s.trim() == "true")
+        .unwrap_or(false)
+}
+
+fn write_uploads_paused(paused: bool) {
+    let Some(path) = uploads_paused_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, if paused { "true" } else { "false" });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +299,8 @@ pub struct SyncEngine {
     segment_duration_secs: u64,
     /// Whether to delete files after upload
     delete_after_upload: bool,
+    /// Shared flag to pause/resume uploads from the tray
+    uploads_paused: Arc<AtomicBool>,
     /// Upload receiver (taken once when run() starts)
     upload_rx: Option<mpsc::UnboundedReceiver<UploadMessage>>,
     /// Notification action receiver (taken once when run() starts)
@@ -386,6 +412,7 @@ unintended app video."
             uploader,
             segment_duration_secs,
             delete_after_upload,
+            uploads_paused: Arc::new(AtomicBool::new(read_uploads_paused())),
             upload_buffer: std::collections::VecDeque::new(),
             upload_rx: Some(upload_rx),
             notification_rx: Some(notification_rx),
@@ -1188,15 +1215,18 @@ unintended app video."
         mut upload_rx: mpsc::UnboundedReceiver<UploadMessage>,
         uploader: Uploader,
         delete_after_upload: bool,
+        uploads_paused: Arc<AtomicBool>,
     ) {
         const BASE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
         const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2 * 60 * 60);
         const MAX_RETRY_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
+        const UPLOAD_PAUSE_NOTIFY_THRESHOLD: usize = 50;
 
         tokio::spawn(async move {
             let mut retry_queue: BinaryHeap<RetryEntry> = BinaryHeap::new();
             let mut sequence: u64 = 0;
             let mut active_session_id: Option<String> = None;
+            let mut upload_pause_notified = false;
 
             fn jitter_multiplier(chunk_id: &str, attempts: u32) -> f64 {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1253,33 +1283,44 @@ unintended app video."
                     Some(msg) = upload_rx.recv() => {
                         match msg {
                             UploadMessage::StartSession(session_id) => {
-                                if active_session_id.as_ref() != Some(&session_id) {
-                                    if !retry_queue.is_empty() {
-                                        warn!(
-                                            "Clearing {} queued retries due to new session {}",
-                                            retry_queue.len(),
-                                            session_id
-                                        );
-                                    }
-                                    retry_queue.clear();
-                                }
                                 active_session_id = Some(session_id);
                             }
                             UploadMessage::Segment(segment) => {
                                 let chunk_id = segment.chunk.chunk_id.clone();
                                 let segment_session_id = segment.chunk.session_id.clone();
-                                if let Some(active) = active_session_id.as_ref() {
-                                    if active != &segment_session_id {
-                                        warn!(
-                                            "Dropping segment {} from session {} (active session {})",
-                                            chunk_id, segment_session_id, active
-                                        );
-                                        continue;
-                                    }
-                                } else {
+                                // Always accept segments — the upload buffer means
+                                // segments from older sessions are delayed, not stale.
+                                if active_session_id.as_ref() != Some(&segment_session_id) {
                                     active_session_id = Some(segment_session_id);
                                 }
 
+                                // If uploads are paused, queue the segment for later
+                                if uploads_paused.load(AtomicOrdering::SeqCst) {
+                                    info!("Uploads paused, queuing segment {} for later", chunk_id);
+                                    let now = Instant::now();
+                                    sequence = sequence.wrapping_add(1);
+                                    retry_queue.push(RetryEntry {
+                                        next_attempt_at: now,
+                                        sequence,
+                                        item: RetryItem {
+                                            segment,
+                                            attempts: 0,
+                                            first_failed_at: now,
+                                            next_attempt_at: now,
+                                        },
+                                    });
+                                    if retry_queue.len() >= UPLOAD_PAUSE_NOTIFY_THRESHOLD && !upload_pause_notified {
+                                        upload_pause_notified = true;
+                                        warn!("{} segments waiting to upload. Resume uploads from the tray menu.", UPLOAD_PAUSE_NOTIFY_THRESHOLD);
+                                        extern "C" {
+                                            fn notifications_show_upload_queue_warning();
+                                        }
+                                        unsafe { notifications_show_upload_queue_warning(); }
+                                    }
+                                    continue;
+                                }
+
+                                upload_pause_notified = false;
                                 info!("Background upload starting for segment {}", chunk_id);
                                 match upload_and_cleanup(&uploader, &segment, delete_after_upload).await {
                                     Ok(()) => {
@@ -1319,22 +1360,14 @@ unintended app video."
                         }
                     } => {
                         let now = Instant::now();
+                        // Don't process retries while uploads are paused
+                        if uploads_paused.load(AtomicOrdering::SeqCst) {
+                            continue;
+                        }
                         while retry_queue.peek().map(|entry| entry.next_attempt_at <= now).unwrap_or(false) {
                             let entry = retry_queue.pop().expect("retry queue peeked");
                             let mut item = entry.item;
                             let chunk_id = item.segment.chunk.chunk_id.clone();
-
-                            if let Some(active) = active_session_id.as_ref() {
-                                if active != &item.segment.chunk.session_id {
-                                    warn!(
-                                        "Dropping retry for segment {} from session {} (active session {})",
-                                        chunk_id,
-                                        item.segment.chunk.session_id,
-                                        active
-                                    );
-                                    continue;
-                                }
-                            }
 
                             if now.duration_since(item.first_failed_at) >= MAX_RETRY_WINDOW {
                                 warn!(
@@ -1386,7 +1419,7 @@ unintended app video."
 
         // Spawn background upload task (must be done inside async context)
         if let Some(upload_rx) = self.upload_rx.take() {
-            Self::spawn_upload_task(upload_rx, self.uploader.clone(), self.delete_after_upload);
+            Self::spawn_upload_task(upload_rx, self.uploader.clone(), self.delete_after_upload, self.uploads_paused.clone());
         }
 
         // Take notification receiver for the main loop
@@ -1520,17 +1553,24 @@ unintended app video."
                                 self.start_recording().await?;
                             }
                         }
+                        EngineCommand::PauseUploads => {
+                            info!("Uploads paused");
+                            self.uploads_paused.store(true, AtomicOrdering::SeqCst);
+                            write_uploads_paused(true);
+                        }
+                        EngineCommand::ResumeUploads => {
+                            info!("Uploads resumed");
+                            self.uploads_paused.store(false, AtomicOrdering::SeqCst);
+                            write_uploads_paused(false);
+                        }
                         EngineCommand::Panic => {
                             warn!("PANIC: deleting recent recordings");
-                            // Stop recording without buffering the final segment
                             if self.current_session.is_some() {
                                 let session = tokio::task::block_in_place(|| self.capture_ctx.stop_recording())?;
                                 if let Some(session) = session {
-                                    // Delete current segment files
                                     if let Err(e) = std::fs::remove_file(&session.output_path) {
                                         warn!("Failed to delete video {:?}: {}", session.output_path, e);
                                     }
-                                    // Delete any input files for current segment
                                     let seg_id = self.current_segment_id();
                                     let prefix = format!("input_{}", seg_id);
                                     if let Ok(entries) = std::fs::read_dir(&self.output_dir) {
@@ -1547,9 +1587,7 @@ unintended app video."
                                 self.segment_timer = None;
                                 self.clear_event_buffer();
                             }
-                            // Purge the upload buffer (delete files for buffered segments)
                             self.purge_upload_buffer();
-                            // Start fresh recording
                             write_recording_state(PersistedRecordingState::Recording);
                             if let Err(e) = self.start_recording().await {
                                 error!("Failed to restart recording after panic: {}", e);
@@ -2609,4 +2647,130 @@ pub fn create_engine_channels() -> (
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (status_tx, status_rx) = broadcast::channel(16);
     (cmd_tx, cmd_rx, status_tx, status_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("crowd-cast-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn make_test_segment(dir: &PathBuf, name: &str) -> CompletedSegment {
+        let video_path = dir.join(format!("{}.mp4", name));
+        let input_path = dir.join(format!("{}.msgpack", name));
+        std::fs::write(&video_path, b"fake video").unwrap();
+        std::fs::write(&input_path, b"fake input").unwrap();
+
+        CompletedSegment {
+            chunk: crate::data::CompletedChunk {
+                session_id: "test-session".to_string(),
+                chunk_id: name.to_string(),
+                video_path: Some(video_path),
+                events: vec![],
+                start_time_us: 0,
+                end_time_us: 1000,
+            },
+            input_path,
+        }
+    }
+
+    #[test]
+    fn purge_upload_buffer_deletes_files() {
+        let dir = test_dir("purge");
+        let seg1 = make_test_segment(&dir, "seg1");
+        let seg2 = make_test_segment(&dir, "seg2");
+
+        let video1 = seg1.chunk.video_path.clone().unwrap();
+        let input1 = seg1.input_path.clone();
+        let video2 = seg2.chunk.video_path.clone().unwrap();
+        let input2 = seg2.input_path.clone();
+
+        assert!(video1.exists());
+        assert!(input1.exists());
+        assert!(video2.exists());
+        assert!(input2.exists());
+
+        let mut buffer: std::collections::VecDeque<(Instant, CompletedSegment)> =
+            std::collections::VecDeque::new();
+        buffer.push_back((Instant::now(), seg1));
+        buffer.push_back((Instant::now(), seg2));
+
+        // Purge
+        while let Some((_, segment)) = buffer.pop_front() {
+            if let Some(ref video_path) = segment.chunk.video_path {
+                let _ = std::fs::remove_file(video_path);
+            }
+            let _ = std::fs::remove_file(&segment.input_path);
+        }
+
+        assert!(!video1.exists());
+        assert!(!input1.exists());
+        assert!(!video2.exists());
+        assert!(!input2.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_pause_persistence_roundtrip() {
+        let dir = test_dir("pause-persist");
+        let path = dir.join("uploads_paused");
+
+        assert!(!path.exists());
+
+        std::fs::write(&path, "true").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "true");
+
+        std::fs::write(&path, "false").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim() == "true",
+            false
+        );
+
+        std::fs::write(&path, "true").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim() == "true",
+            true
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graduate_buffer_respects_delay() {
+        let dir = test_dir("graduate");
+        let seg_old = make_test_segment(&dir, "old");
+        let seg_new = make_test_segment(&dir, "new");
+
+        let mut buffer: std::collections::VecDeque<(Instant, CompletedSegment)> =
+            std::collections::VecDeque::new();
+
+        // Old segment: created 20 minutes ago
+        buffer.push_back((Instant::now() - Duration::from_secs(1200), seg_old));
+        // New segment: created just now
+        buffer.push_back((Instant::now(), seg_new));
+
+        let delay = Duration::from_secs(600);
+        let now = Instant::now();
+        let mut graduated = vec![];
+
+        while let Some((created_at, _)) = buffer.front() {
+            if now.duration_since(*created_at) >= delay {
+                let (_, segment) = buffer.pop_front().unwrap();
+                graduated.push(segment.chunk.chunk_id.clone());
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(graduated.len(), 1);
+        assert_eq!(graduated[0], "old");
+        assert_eq!(buffer.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
