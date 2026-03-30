@@ -757,7 +757,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crowd-cast-agent"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -769,14 +769,12 @@ dependencies = [
  "directories",
  "evdev",
  "futures",
- "hex",
  "image",
  "libc",
  "libobs",
  "libobs-bootstrapper",
  "libobs-simple",
  "libobs-wrapper",
- "machine-uid",
  "notify",
  "objc",
  "pkg-config",
@@ -785,7 +783,6 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
- "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
@@ -2149,15 +2146,6 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
-]
-
-[[package]]
-name = "machine-uid"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26141aceb9f046065617266f41a4a652e4583da643472a10a89b4b3664d99eb6"
-dependencies = [
- "winreg",
 ]
 
 [[package]]
@@ -4855,16 +4843,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "winreg"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a1a57ff50e9b408431e8f97d5456f2807f8eb2a2cd79b06068fc87f8ecf189"
-dependencies = [
- "cfg-if",
- "winapi",
 ]
 
 [[package]]

@@ -5,10 +5,9 @@
 use anyhow::{Context, Result};
 use reqwest::{Body, Client};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::data::CompletedChunk;
@@ -58,15 +57,31 @@ impl Uploader {
         option_env!("CROWD_CAST_API_GATEWAY_URL")
     }
 
+    fn user_id_path() -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+            .map(|p| p.data_dir().join("user_id"))
+    }
+
     fn compute_user_id() -> String {
-        let user_name = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "coder".to_string());
-        let machine_id = machine_uid::get().unwrap_or_else(|_| "unknown-machine".to_string());
-        let raw_id = format!("{}:{}", machine_id, user_name);
-        let mut hasher = Sha256::new();
-        hasher.update(raw_id.as_bytes());
-        hex::encode(hasher.finalize())
+        if let Some(path) = Self::user_id_path() {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                let id = contents.trim().to_string();
+                if !id.is_empty() {
+                    return id;
+                }
+            }
+
+            let id = uuid::Uuid::new_v4().to_string();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&path, &id) {
+                warn!("Failed to persist user ID to {:?}: {}", path, e);
+            }
+            return id;
+        }
+
+        uuid::Uuid::new_v4().to_string()
     }
 
     async fn request_presigned_url(
