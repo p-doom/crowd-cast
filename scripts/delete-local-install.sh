@@ -15,8 +15,11 @@ echo "Removing installed app copies..."
 rm -rf "/Applications/CrowdCast.app"
 rm -rf "$HOME/Applications/CrowdCast.app"
 
-echo "Removing app state..."
-rm -rf "$HOME/Library/Application Support/${BUNDLE_ID}"
+echo "Removing app state (preserving user_id)..."
+APP_SUPPORT="$HOME/Library/Application Support/${BUNDLE_ID}"
+if [ -d "$APP_SUPPORT" ]; then
+    find "$APP_SUPPORT" -mindepth 1 -maxdepth 1 ! -name "user_id" -exec rm -rf {} +
+fi
 rm -rf "$HOME/Library/Caches/${BUNDLE_ID}"
 rm -f "$HOME/Library/Preferences/${BUNDLE_ID}.plist"
 rm -rf "$HOME/Library/Saved Application State/${BUNDLE_ID}.savedState"
