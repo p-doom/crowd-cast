@@ -153,7 +153,7 @@ impl TrayApp {
         let pause_text = CString::new("Pause Recording")?;
         let resume_text = CString::new("Resume Recording")?;
         let stop_text = CString::new("Stop Recording")?;
-        let panic_text = CString::new("Panic (delete recent recordings)")?;
+        let panic_text = CString::new("Delete last 10 minutes")?;
         let pause_uploads_text = CString::new("Pause Uploads")?;
         let settings_text = CString::new("Settings")?;
         let updates_text = CString::new("Check for Updates")?;
