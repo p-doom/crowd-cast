@@ -68,6 +68,40 @@ fn restart_process() -> ! {
     }
 }
 
+/// Run a blocking OBS call with a watchdog timeout.
+///
+/// Spawns a background thread that waits `timeout` seconds. If the call
+/// completes before the timer, the watchdog is cancelled. If not, the
+/// process is restarted to recover from a stuck OBS runtime thread.
+///
+/// This is a safety net — normal OBS calls take <500ms. A 5-second
+/// timeout gives 10x margin while catching genuine hangs.
+fn obs_call_with_watchdog<F, T>(f: F, description: &str) -> T
+where
+    F: FnOnce() -> T,
+{
+    const OBS_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let completed = Arc::new(AtomicBool::new(false));
+    let completed_clone = completed.clone();
+    let desc = description.to_string();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(OBS_CALL_TIMEOUT);
+        if !completed_clone.load(AtomicOrdering::SeqCst) {
+            error!(
+                "OBS call '{}' hung for {:?} — restarting process",
+                desc, OBS_CALL_TIMEOUT
+            );
+            restart_process();
+        }
+    });
+
+    let result = f();
+    completed.store(true, AtomicOrdering::SeqCst);
+    result
+}
+
 /// Persisted recording state — survives restarts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PersistedRecordingState {
@@ -1566,7 +1600,10 @@ unintended app video."
                         EngineCommand::Panic => {
                             warn!("PANIC: deleting recent recordings");
                             if self.current_session.is_some() {
-                                let session = tokio::task::block_in_place(|| self.capture_ctx.stop_recording())?;
+                                let session = obs_call_with_watchdog(
+                                    || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
+                                    "panic: stop_recording",
+                                )?;
                                 if let Some(session) = session {
                                     if let Err(e) = std::fs::remove_file(&session.output_path) {
                                         warn!("Failed to delete video {:?}: {}", session.output_path, e);
@@ -1757,7 +1794,10 @@ unintended app video."
         info!("Saved {} events to {:?}", events.len(), input_path);
 
         // Stop the current recording
-        let _session = tokio::task::block_in_place(|| self.capture_ctx.stop_recording())?;
+        let _session = obs_call_with_watchdog(
+            || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
+            "rotate_segment: stop_recording",
+        )?;
 
         // Create completed segment for upload
         let chunk = CompletedChunk {
@@ -2035,9 +2075,11 @@ unintended app video."
 
             info!("Saved {} events to {:?}", events.len(), input_path);
 
-            // Stop libobs recording - use block_in_place because libobs-wrapper
-            // uses blocking_recv() internally which panics in async context
-            let session = tokio::task::block_in_place(|| self.capture_ctx.stop_recording())?;
+            // Stop libobs recording — watchdog restarts the process if OBS hangs.
+            let session = obs_call_with_watchdog(
+                || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
+                "stop_recording: with_upload",
+            )?;
             if let Some(session) = session {
                 info!(
                     "Recording stopped: session={}, output={:?}",
@@ -2062,7 +2104,10 @@ unintended app video."
             }
         } else {
             // Just stop recording without upload
-            let session = tokio::task::block_in_place(|| self.capture_ctx.stop_recording())?;
+            let session = obs_call_with_watchdog(
+                || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
+                "stop_recording: without_upload",
+            )?;
             if let Some(session) = session {
                 info!(
                     "Recording stopped: session={}, output={:?}",
@@ -2107,9 +2152,11 @@ unintended app video."
 
         info!("Pausing recording (video and keylog)...");
 
-        // Pause the video recording - use block_in_place because libobs-wrapper
-        // uses blocking_recv() internally which panics in async context
-        let result = tokio::task::block_in_place(|| self.capture_ctx.pause_recording());
+        // Pause the video recording — watchdog restarts the process if OBS hangs.
+        let result = obs_call_with_watchdog(
+            || tokio::task::block_in_place(|| self.capture_ctx.pause_recording()),
+            "pause_recording",
+        );
         if let Err(e) = result {
             error!("Failed to pause video recording: {}", e);
             // Still mark as paused to prevent infinite retry loops —
@@ -2156,9 +2203,11 @@ unintended app video."
             }
         };
 
-        // Resume the video recording - use block_in_place because libobs-wrapper
-        // uses blocking_recv() internally which panics in async context
-        let result = tokio::task::block_in_place(|| self.capture_ctx.resume_recording());
+        // Resume the video recording — watchdog restarts the process if OBS hangs.
+        let result = obs_call_with_watchdog(
+            || tokio::task::block_in_place(|| self.capture_ctx.resume_recording()),
+            "resume_recording",
+        );
         if let Err(e) = result {
             error!("Failed to resume video recording: {}", e);
             return;
