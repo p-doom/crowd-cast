@@ -205,6 +205,15 @@ enum UploadMessage {
     Segment(CompletedSegment),
 }
 
+/// Result sent back from a spawned upload task
+struct UploadResult {
+    chunk_id: String,
+    segment: CompletedSegment,
+    attempts: u32,
+    first_failed_at: Instant,
+    result: Result<()>,
+}
+
 #[derive(Debug)]
 struct RetryItem {
     segment: CompletedSegment,
@@ -1244,7 +1253,10 @@ unintended app video."
         self.push_context_event(app_id, self.current_capture_timestamp_us());
     }
 
-    /// Spawn background task for uploading completed segments
+    /// Spawn background task for uploading completed segments.
+    ///
+    /// Uploads run concurrently (up to MAX_CONCURRENT_UPLOADS) so that one
+    /// slow or failing upload does not block the entire pipeline.
     fn spawn_upload_task(
         mut upload_rx: mpsc::UnboundedReceiver<UploadMessage>,
         uploader: Uploader,
@@ -1255,12 +1267,19 @@ unintended app video."
         const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2 * 60 * 60);
         const MAX_RETRY_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
         const UPLOAD_PAUSE_NOTIFY_THRESHOLD: usize = 50;
+        const MAX_CONCURRENT_UPLOADS: usize = 3;
 
         tokio::spawn(async move {
             let mut retry_queue: BinaryHeap<RetryEntry> = BinaryHeap::new();
             let mut sequence: u64 = 0;
             let mut active_session_id: Option<String> = None;
             let mut upload_pause_notified = false;
+
+            // Semaphore limits concurrent uploads
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPLOADS));
+
+            // Channel for receiving upload results from spawned tasks
+            let (result_tx, mut result_rx) = mpsc::unbounded_channel::<UploadResult>();
 
             fn jitter_multiplier(chunk_id: &str, attempts: u32) -> f64 {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1281,39 +1300,59 @@ unintended app video."
                     .min(MAX_RETRY_BACKOFF)
             }
 
-            async fn upload_and_cleanup(
-                uploader: &Uploader,
-                segment: &CompletedSegment,
+            /// Spawn a concurrent upload task. Acquires a semaphore permit,
+            /// performs the upload, cleans up files, and sends the result back.
+            fn spawn_upload(
+                uploader: Uploader,
+                segment: CompletedSegment,
+                chunk_id: String,
+                attempts: u32,
+                first_failed_at: Option<Instant>,
                 delete_after_upload: bool,
-            ) -> Result<()> {
-                uploader.upload(&segment.chunk).await?;
+                semaphore: Arc<tokio::sync::Semaphore>,
+                result_tx: mpsc::UnboundedSender<UploadResult>,
+            ) {
+                tokio::spawn(async move {
+                    // Acquire a permit — blocks if MAX_CONCURRENT_UPLOADS are in flight
+                    let _permit = semaphore.acquire().await.expect("semaphore closed");
 
-                if delete_after_upload {
-                    if let Some(ref video_path) = segment.chunk.video_path {
-                        if let Err(e) = tokio::fs::remove_file(video_path).await {
-                            warn!("Failed to delete video file {:?}: {}", video_path, e);
-                        } else {
-                            debug!("Deleted video file: {:?}", video_path);
+                    let result = async {
+                        uploader.upload(&segment.chunk).await?;
+
+                        if delete_after_upload {
+                            if let Some(ref video_path) = segment.chunk.video_path {
+                                if let Err(e) = tokio::fs::remove_file(video_path).await {
+                                    warn!("Failed to delete video file {:?}: {}", video_path, e);
+                                } else {
+                                    debug!("Deleted video file: {:?}", video_path);
+                                }
+                            }
+                            if let Err(e) = tokio::fs::remove_file(&segment.input_path).await {
+                                warn!("Failed to delete input file {:?}: {}", segment.input_path, e);
+                            } else {
+                                debug!("Deleted input file: {:?}", segment.input_path);
+                            }
                         }
-                    }
 
-                    if let Err(e) = tokio::fs::remove_file(&segment.input_path).await {
-                        warn!(
-                            "Failed to delete input file {:?}: {}",
-                            segment.input_path, e
-                        );
-                    } else {
-                        debug!("Deleted input file: {:?}", segment.input_path);
+                        Ok::<(), anyhow::Error>(())
                     }
-                }
+                    .await;
 
-                Ok(())
+                    let _ = result_tx.send(UploadResult {
+                        chunk_id,
+                        segment,
+                        attempts,
+                        first_failed_at: first_failed_at.unwrap_or_else(Instant::now),
+                        result,
+                    });
+                });
             }
 
             loop {
                 let next_retry_at = retry_queue.peek().map(|entry| entry.next_attempt_at);
 
                 tokio::select! {
+                    // Branch 1: New segments from the graduation buffer
                     Some(msg) = upload_rx.recv() => {
                         match msg {
                             UploadMessage::StartSession(session_id) => {
@@ -1322,8 +1361,6 @@ unintended app video."
                             UploadMessage::Segment(segment) => {
                                 let chunk_id = segment.chunk.chunk_id.clone();
                                 let segment_session_id = segment.chunk.session_id.clone();
-                                // Always accept segments — the upload buffer means
-                                // segments from older sessions are delayed, not stale.
                                 if active_session_id.as_ref() != Some(&segment_session_id) {
                                     active_session_id = Some(segment_session_id);
                                 }
@@ -1356,37 +1393,56 @@ unintended app video."
 
                                 upload_pause_notified = false;
                                 info!("Background upload starting for segment {}", chunk_id);
-                                match upload_and_cleanup(&uploader, &segment, delete_after_upload).await {
-                                    Ok(()) => {
-                                        info!("Successfully uploaded segment {}", chunk_id);
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to upload segment {}: {}", chunk_id, e);
-                                        let now = Instant::now();
-                                        let attempt = 1;
-                                        let mut delay = backoff_for_attempt(attempt);
-                                        delay = delay.mul_f64(jitter_multiplier(&chunk_id, attempt));
-                                        if delay > MAX_RETRY_BACKOFF {
-                                            delay = MAX_RETRY_BACKOFF;
-                                        }
-                                        let retry_item = RetryItem {
-                                            segment,
-                                            attempts: attempt,
-                                            first_failed_at: now,
-                                            next_attempt_at: now + delay,
-                                        };
-                                        sequence = sequence.wrapping_add(1);
-                                        retry_queue.push(RetryEntry {
-                                            next_attempt_at: retry_item.next_attempt_at,
-                                            sequence,
-                                            item: retry_item,
-                                        });
-                                    }
-                                }
+                                spawn_upload(
+                                    uploader.clone(),
+                                    segment,
+                                    chunk_id,
+                                    0,
+                                    None,
+                                    delete_after_upload,
+                                    semaphore.clone(),
+                                    result_tx.clone(),
+                                );
                             }
                         }
                     }
 
+                    // Branch 2: Results from completed upload tasks
+                    Some(upload_result) = result_rx.recv() => {
+                        let UploadResult { chunk_id, segment, attempts, first_failed_at, result } = upload_result;
+                        match result {
+                            Ok(()) => {
+                                info!("Successfully uploaded segment {}", chunk_id);
+                            }
+                            Err(e) => {
+                                let attempt = attempts + 1;
+                                error!(
+                                    "Failed to upload segment {}: {} (attempt {}, retry queue: {})",
+                                    chunk_id, e, attempt, retry_queue.len()
+                                );
+                                let mut delay = backoff_for_attempt(attempt);
+                                delay = delay.mul_f64(jitter_multiplier(&chunk_id, attempt));
+                                if delay > MAX_RETRY_BACKOFF {
+                                    delay = MAX_RETRY_BACKOFF;
+                                }
+                                let now = Instant::now();
+                                let retry_item = RetryItem {
+                                    segment,
+                                    attempts: attempt,
+                                    first_failed_at,
+                                    next_attempt_at: now + delay,
+                                };
+                                sequence = sequence.wrapping_add(1);
+                                retry_queue.push(RetryEntry {
+                                    next_attempt_at: retry_item.next_attempt_at,
+                                    sequence,
+                                    item: retry_item,
+                                });
+                            }
+                        }
+                    }
+
+                    // Branch 3: Retry timer fires
                     _ = async {
                         match next_retry_at {
                             Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -1394,13 +1450,12 @@ unintended app video."
                         }
                     } => {
                         let now = Instant::now();
-                        // Don't process retries while uploads are paused
                         if uploads_paused.load(AtomicOrdering::SeqCst) {
                             continue;
                         }
                         while retry_queue.peek().map(|entry| entry.next_attempt_at <= now).unwrap_or(false) {
                             let entry = retry_queue.pop().expect("retry queue peeked");
-                            let mut item = entry.item;
+                            let item = entry.item;
                             let chunk_id = item.segment.chunk.chunk_id.clone();
 
                             if now.duration_since(item.first_failed_at) >= MAX_RETRY_WINDOW {
@@ -1417,28 +1472,16 @@ unintended app video."
                                 item.attempts + 1
                             );
 
-                            match upload_and_cleanup(&uploader, &item.segment, delete_after_upload).await {
-                                Ok(()) => {
-                                    info!("Successfully uploaded segment {}", chunk_id);
-                                }
-                                Err(e) => {
-                                    error!("Retry failed for segment {}: {}", chunk_id, e);
-                                    let attempt = item.attempts + 1;
-                                    let mut delay = backoff_for_attempt(attempt);
-                                    delay = delay.mul_f64(jitter_multiplier(&chunk_id, attempt));
-                                    if delay > MAX_RETRY_BACKOFF {
-                                        delay = MAX_RETRY_BACKOFF;
-                                    }
-                                    item.attempts = attempt;
-                                    item.next_attempt_at = Instant::now() + delay;
-                                    sequence = sequence.wrapping_add(1);
-                                    retry_queue.push(RetryEntry {
-                                        next_attempt_at: item.next_attempt_at,
-                                        sequence,
-                                        item,
-                                    });
-                                }
-                            }
+                            spawn_upload(
+                                uploader.clone(),
+                                item.segment,
+                                chunk_id,
+                                item.attempts,
+                                Some(item.first_failed_at),
+                                delete_after_upload,
+                                semaphore.clone(),
+                                result_tx.clone(),
+                            );
                         }
                     }
                 }
