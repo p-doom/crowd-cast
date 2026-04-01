@@ -7,7 +7,7 @@ use reqwest::{Body, Client};
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::data::CompletedChunk;
@@ -47,7 +47,7 @@ impl Uploader {
         Self {
             client: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(600)) // 10 min for large uploads
+                // No global timeout — per-request timeouts are set on each call
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         }
@@ -187,16 +187,27 @@ impl Uploader {
                 presign.content_type.as_str()
             };
 
-            self.client
+            let response = self
+                .client
                 .put(&presign.upload_url)
                 .header("Content-Type", content_type)
                 .header("Content-Length", file_size)
+                .timeout(std::time::Duration::from_secs(120))
                 .body(body)
                 .send()
                 .await
-                .context("Failed to upload video file")?
-                .error_for_status()
-                .context("Video upload returned error status")?;
+                .context("Failed to send video upload request")?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body_text = response.text().await.unwrap_or_default();
+                let preview = &body_text[..body_text.len().min(500)];
+                error!(
+                    "Video upload failed for chunk {}: HTTP {} — {}",
+                    chunk.chunk_id, status, preview
+                );
+                anyhow::bail!("Video upload returned HTTP {}", status);
+            }
 
             info!(
                 "Uploaded video for chunk {} ({:.2} MB)",
@@ -215,15 +226,26 @@ impl Uploader {
             keylog_presign.content_type.as_str()
         };
 
-        self.client
+        let response = self
+            .client
             .put(&keylog_presign.upload_url)
             .header("Content-Type", keylog_content_type)
+            .timeout(std::time::Duration::from_secs(30))
             .body(input_bytes)
             .send()
             .await
-            .context("Failed to upload input log")?
-            .error_for_status()
-            .context("Input log upload returned error status")?;
+            .context("Failed to send keylog upload request")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            let preview = &body_text[..body_text.len().min(500)];
+            error!(
+                "Keylog upload failed for chunk {}: HTTP {} — {}",
+                chunk.chunk_id, status, preview
+            );
+            anyhow::bail!("Keylog upload returned HTTP {}", status);
+        }
 
         info!(
             "Uploaded input log for chunk {} ({} events)",
