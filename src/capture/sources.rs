@@ -189,6 +189,7 @@ impl ScreenCaptureSource {
         ScreenCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
             .context("Failed to create source updater")?
             .set_application(bundle_id)
+            .set_audio_capture(false)
             .update()
             .context("Failed to update application")?;
 
@@ -216,6 +217,7 @@ impl ScreenCaptureSource {
         ScreenCaptureSourceUpdater::create_update(runtime, &mut self.source)
             .context("Failed to create source updater")?
             .set_display_uuid(display_uuid)
+            .set_audio_capture(false)
             .update()
             .context("Failed to update display UUID")?;
 
