@@ -1485,7 +1485,7 @@ unintended app video."
                             Err(e) => {
                                 let attempt = attempts + 1;
                                 error!(
-                                    "Failed to upload segment {}: {} (attempt {}, retry queue: {})",
+                                    "Failed to upload segment {}: {:#} (attempt {}, retry queue: {})",
                                     chunk_id, e, attempt, retry_queue.len()
                                 );
                                 let mut delay = backoff_for_attempt(attempt);
@@ -2476,6 +2476,9 @@ unintended app video."
             debug!("Cancelling pending display refresh retry due to new display change");
             self.pending_display_refresh = None;
         }
+
+        // Clear watchdog exhaustion so sources get a fresh chance to initialize
+        self.capture_watchdog_exhausted_app = None;
 
         let restart_recording = self.current_session.is_some();
 

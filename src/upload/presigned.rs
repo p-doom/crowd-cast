@@ -192,7 +192,7 @@ impl Uploader {
                 .put(&presign.upload_url)
                 .header("Content-Type", content_type)
                 .header("Content-Length", file_size)
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(600))
                 .body(body)
                 .send()
                 .await
