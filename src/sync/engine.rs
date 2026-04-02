@@ -1772,23 +1772,11 @@ unintended app video."
                                 "Reloading target apps: capture_all={}, apps={:?}",
                                 capture_all, target_apps
                             );
-                            let was_recording = self.current_session.is_some();
-                            if was_recording {
-                                self.stop_recording().await?;
-                            }
-                            self.config.capture.target_apps = target_apps;
-                            self.config.capture.capture_all = capture_all;
-                            self.single_active_app_capture = !self.config.capture.capture_all
-                                && !self.config.capture.target_apps.is_empty()
-                                && cfg!(target_os = "macos")
-                                && self.config.capture.single_active_app_capture;
-                            self.capture_ctx
-                                .set_single_active_app_capture(self.single_active_app_capture);
-                            self.capture_ctx
-                                .setup_capture(&self.config.capture.target_apps)?;
-                            if was_recording {
-                                self.start_recording().await?;
-                            }
+                            // Config is already persisted to disk by the tray before sending
+                            // this command. Restart to get a fresh OBS context — SCK sources
+                            // only work reliably when created before the first recording.
+                            self.stop_recording().await.ok();
+                            restart_process();
                         }
                         EngineCommand::PauseUploads => {
                             info!("Uploads paused");
