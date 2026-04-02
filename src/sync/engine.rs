@@ -9,6 +9,7 @@
 //! immediately to minimize storage overhead.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
@@ -163,6 +164,61 @@ fn write_uploads_paused(paused: bool) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&path, if paused { "true" } else { "false" });
+}
+
+// --- Pending uploads manifest (persists upload queue across restarts) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingUploadEntry {
+    chunk_id: String,
+    session_id: String,
+    video_path: Option<PathBuf>,
+    input_path: PathBuf,
+    buffered_at_epoch_s: u64,
+}
+
+fn pending_uploads_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+        .map(|p| p.data_dir().join("pending_uploads.json"))
+}
+
+fn read_pending_uploads() -> Vec<PendingUploadEntry> {
+    pending_uploads_path()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_pending_uploads(entries: &[PendingUploadEntry]) {
+    let Some(path) = pending_uploads_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string(entries) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                warn!("Failed to write pending uploads manifest: {}", e);
+            }
+        }
+        Err(e) => warn!("Failed to serialize pending uploads: {}", e),
+    }
+}
+
+fn append_pending_upload(entry: PendingUploadEntry) {
+    let mut entries = read_pending_uploads();
+    entries.push(entry);
+    write_pending_uploads(&entries);
+}
+
+fn remove_pending_upload(chunk_id: &str) {
+    let mut entries = read_pending_uploads();
+    let before = entries.len();
+    entries.retain(|e| e.chunk_id != chunk_id);
+    if entries.len() != before {
+        write_pending_uploads(&entries);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -538,6 +594,16 @@ unintended app video."
     fn buffer_segment_for_upload(&mut self, segment: CompletedSegment, segment_id: String) {
         if self.uploader.is_configured() {
             info!("Buffering segment {} for delayed upload", segment_id);
+            append_pending_upload(PendingUploadEntry {
+                chunk_id: segment.chunk.chunk_id.clone(),
+                session_id: segment.chunk.session_id.clone(),
+                video_path: segment.chunk.video_path.clone(),
+                input_path: segment.input_path.clone(),
+                buffered_at_epoch_s: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
             self.upload_buffer.push_back((Instant::now(), segment));
         }
     }
@@ -575,7 +641,7 @@ unintended app video."
         }
     }
 
-    /// Panic: delete all buffered segments from disk.
+    /// Panic: delete all buffered segments from disk and clear the manifest.
     fn purge_upload_buffer(&mut self) {
         let count = self.upload_buffer.len();
         if count > 0 {
@@ -595,6 +661,7 @@ unintended app video."
                 debug!("Deleted input: {:?}", segment.input_path);
             }
         }
+        write_pending_uploads(&[]);
     }
 
     fn active_video_target(&self) -> Option<&str> {
@@ -1413,6 +1480,7 @@ unintended app video."
                         match result {
                             Ok(()) => {
                                 info!("Successfully uploaded segment {}", chunk_id);
+                                remove_pending_upload(&chunk_id);
                             }
                             Err(e) => {
                                 let attempt = attempts + 1;
@@ -1463,6 +1531,7 @@ unintended app video."
                                     "Giving up on segment {} after {} attempts (retry window exceeded)",
                                     chunk_id, item.attempts
                                 );
+                                remove_pending_upload(&chunk_id);
                                 continue;
                             }
 
@@ -1544,6 +1613,97 @@ unintended app video."
             }
             PersistedRecordingState::Stopped => {
                 info!("Recording state: stopped (not auto-starting)");
+            }
+        }
+
+        // Recover pending uploads from previous session
+        if self.uploader.is_configured() {
+            let pending = read_pending_uploads();
+            if !pending.is_empty() {
+                let mut recovered = 0;
+                let mut cleaned = 0;
+                for entry in &pending {
+                    let input_exists = entry.input_path.exists();
+                    if !input_exists {
+                        debug!(
+                            "Skipping orphaned segment {} (msgpack missing)",
+                            entry.chunk_id
+                        );
+                        cleaned += 1;
+                        continue;
+                    }
+
+                    let video_exists = entry
+                        .video_path
+                        .as_ref()
+                        .map(|p| p.exists())
+                        .unwrap_or(true);
+
+                    let events: Vec<InputEvent> =
+                        match std::fs::read(&entry.input_path).and_then(|bytes| {
+                            rmp_serde::from_slice(&bytes).map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                            })
+                        }) {
+                            Ok(events) => events,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to read events for segment {}: {}",
+                                    entry.chunk_id, e
+                                );
+                                cleaned += 1;
+                                continue;
+                            }
+                        };
+
+                    let start_time_us = events.first().map(|e| e.timestamp_us).unwrap_or(0);
+                    let end_time_us = events.last().map(|e| e.timestamp_us).unwrap_or(0);
+
+                    let chunk = CompletedChunk {
+                        chunk_id: entry.chunk_id.clone(),
+                        session_id: entry.session_id.clone(),
+                        video_path: entry.video_path.clone().filter(|_| video_exists),
+                        events,
+                        start_time_us,
+                        end_time_us,
+                    };
+
+                    let segment = CompletedSegment {
+                        chunk,
+                        input_path: entry.input_path.clone(),
+                    };
+
+                    if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
+                        error!("Failed to re-queue recovered segment {}: {}", entry.chunk_id, e);
+                    } else {
+                        recovered += 1;
+                    }
+                }
+
+                if recovered > 0 {
+                    info!(
+                        "Recovered {} pending upload(s) from previous session",
+                        recovered
+                    );
+                }
+                if cleaned > 0 {
+                    // Remove entries for segments we couldn't recover
+                    let valid: Vec<_> = pending
+                        .into_iter()
+                        .filter(|e| {
+                            e.input_path.exists()
+                                && std::fs::read(&e.input_path)
+                                    .and_then(|b| {
+                                        rmp_serde::from_slice::<Vec<InputEvent>>(&b).map_err(|e| {
+                                            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                                        })
+                                    })
+                                    .is_ok()
+                        })
+                        .collect();
+                    write_pending_uploads(&valid);
+                    info!("Cleaned {} unrecoverable segment(s) from manifest", cleaned);
+                }
             }
         }
 
