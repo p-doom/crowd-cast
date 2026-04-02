@@ -287,9 +287,12 @@ impl CaptureContext {
             anyhow::bail!("OBS context not initialized");
         }
 
-        // Clean up any existing app scenes
+        // Clean up all capture resources (both modes) to prevent cross-mode
+        // leaks when switching between single-active and display/multi modes.
         self.app_scenes.clear();
         self.blank_scene = None;
+        self.capture_sources.clear();
+        self.scene = None;
 
         // Create blank scene (shown when no tracked app is frontmost)
         let blank_scene_name = Self::build_scene_name("blank");
@@ -394,8 +397,12 @@ impl CaptureContext {
             anyhow::bail!("OBS context not initialized");
         }
 
+        // Clean up all capture resources (both modes) to prevent cross-mode
+        // leaks when switching between single-active and display/multi modes.
         self.capture_sources.clear();
         self.scene = None;
+        self.app_scenes.clear();
+        self.blank_scene = None;
 
         let scene_name = Self::build_scene_name("main_scene");
         let mut scene = self.create_scene(&scene_name)?;
