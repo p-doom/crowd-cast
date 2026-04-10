@@ -418,6 +418,10 @@ pub struct SyncEngine {
     last_emitted_context: Option<String>,
     /// Number of buffered non-context input events for O(1) status updates
     buffered_non_context_event_count: usize,
+    /// Whether any capture source has ever been ready during this session
+    any_source_ever_ready: bool,
+    /// Whether we've already shown the "restart your Mac" alert this session
+    restart_alert_shown: bool,
 }
 
 impl SyncEngine {
@@ -505,6 +509,8 @@ unintended app video."
             pending_input_transition: None,
             last_emitted_context: None,
             buffered_non_context_event_count: 0,
+            any_source_ever_ready: false,
+            restart_alert_shown: false,
         }
     }
 
@@ -944,6 +950,10 @@ unintended app video."
             self.clear_pending_input_transition();
         }
 
+        if self.capture_enabled {
+            self.any_source_ever_ready = true;
+        }
+
         if self.capture_enabled != was_capturing {
             if self.capture_enabled {
                 debug!("Input capture enabled");
@@ -1157,6 +1167,7 @@ unintended app video."
                         watchdog.expected_app, width, height
                     );
                 }
+                self.any_source_ever_ready = true;
                 self.clear_capture_watchdog();
                 self.refresh_capture_enabled_from_frontmost();
             }
@@ -1834,6 +1845,7 @@ unintended app video."
                     self.poll_frontmost_app().await;
                     self.check_display_changes().await;
                     self.graduate_upload_buffer();
+                    self.check_capture_health();
                 }
 
                 // Apply a queued app-driven capture source switch
@@ -2426,6 +2438,56 @@ unintended app video."
     ///
     /// On macOS, when displays are disconnected and reconnected, ScreenCaptureKit
     /// caches stale display IDs. This method detects such changes and either:
+    /// Check if screen capture is fundamentally broken (SCK system-level failure).
+    ///
+    /// If recording has been active for 60+ seconds and no source has ever become
+    /// ready, SCK is likely broken at the system level (e.g., after sleep/wake on
+    /// certain macOS configurations). Shows a modal alert telling the user to
+    /// restart their Mac.
+    fn check_capture_health(&mut self) {
+        const CAPTURE_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
+
+        if self.restart_alert_shown
+            || self.any_source_ever_ready
+            || self.is_paused
+            || self.current_session.is_none()
+        {
+            return;
+        }
+
+        // Check if recording has been active long enough
+        let Some(start_ns) = self.recording_start_ns else {
+            return;
+        };
+        let current_ns = self.capture_ctx.get_video_frame_time().unwrap_or(start_ns);
+        let elapsed = Duration::from_nanos(current_ns.saturating_sub(start_ns));
+        if elapsed < CAPTURE_HEALTH_TIMEOUT {
+            return;
+        }
+
+        // At least one watchdog must have exhausted (not just slow to start)
+        if self.capture_watchdog_exhausted_app.is_none() {
+            return;
+        }
+
+        error!(
+            "No capture source has become ready in {:?} since recording started — \
+             screen capture appears broken at the system level",
+            elapsed
+        );
+        self.restart_alert_shown = true;
+
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn show_restart_mac_alert();
+            }
+            unsafe {
+                show_restart_mac_alert();
+            }
+        }
+    }
+
     /// - Auto-recovers if the original display returns
     /// - Shows a notification to let the user decide if switching to a new display
     async fn check_display_changes(&mut self) {
