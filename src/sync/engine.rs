@@ -33,8 +33,7 @@ use crate::data::{
 use crate::input::{create_input_backend, InputBackend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
-    is_authorized as notifications_authorized, show_capture_resumed_notification,
-    show_display_change_notification, show_idle_paused_notification,
+    is_authorized as notifications_authorized, show_idle_paused_notification,
     show_idle_resumed_notification, show_permissions_missing_notification,
     show_recording_paused_notification, show_recording_resumed_notification,
     show_recording_started_notification, show_recording_stopped_notification, NotificationAction,
@@ -309,25 +308,6 @@ impl PartialEq for RetryEntry {
 
 impl Eq for RetryEntry {}
 
-/// Pending display refresh retry state
-#[derive(Debug)]
-struct PendingDisplayRefresh {
-    /// Display name for logging
-    display_name: String,
-    /// Number of retry attempts made
-    attempt: u32,
-    /// When to attempt the next retry
-    next_retry_at: Instant,
-    /// Whether to restart recording after reinit
-    restart_recording: bool,
-    /// Whether to show a capture resumed notification on success
-    show_resumed_notification: bool,
-    /// Whether to stop recording before reinit (needed if previous stop failed)
-    stop_recording_first: bool,
-    /// Whether to do a full libobs context reinitialization (true) or just recreate sources (false)
-    full_reinit: bool,
-}
-
 #[derive(Debug, Clone)]
 struct PendingAppSwitch {
     target_app: Option<String>,
@@ -347,11 +327,6 @@ struct PendingInputTransition {
     events: Vec<InputEvent>,
 }
 
-/// Maximum number of display refresh retry attempts
-const MAX_DISPLAY_REFRESH_RETRIES: u32 = 5;
-
-/// Base delay between display refresh retries (doubles each attempt)
-const DISPLAY_REFRESH_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TRANSITION_INPUT_EVENTS: usize = 512;
 
@@ -404,8 +379,6 @@ pub struct SyncEngine {
     upload_rx: Option<mpsc::UnboundedReceiver<UploadMessage>>,
     /// Notification action receiver (taken once when run() starts)
     notification_rx: Option<mpsc::UnboundedReceiver<NotificationAction>>,
-    /// Pending display refresh retry (for when SCK isn't ready immediately)
-    pending_display_refresh: Option<PendingDisplayRefresh>,
     /// Last time an input event was recorded (buffered for upload)
     last_recorded_action_time: Instant,
     /// Whether we're currently auto-paused due to idle (vs user-initiated pause)
@@ -515,7 +488,6 @@ unintended app video."
             upload_buffer: std::collections::VecDeque::new(),
             upload_rx: Some(upload_rx),
             notification_rx: Some(notification_rx),
-            pending_display_refresh: None,
             last_recorded_action_time: Instant::now(),
             idle_paused: false,
             idle_timeout,
@@ -1892,15 +1864,6 @@ unintended app video."
                     }
                 }
 
-                // Handle pending display refresh retries (for when SCK isn't ready immediately)
-                _ = async {
-                    match &self.pending_display_refresh {
-                        Some(pending) => tokio::time::sleep_until(pending.next_retry_at).await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    self.retry_display_refresh().await;
-                }
 
                 // Verify that a newly switched active app source has started producing frames
                 _ = async {
@@ -2471,37 +2434,20 @@ unintended app video."
             return;
         };
 
-        // Cancel any pending retry since display configuration changed again
-        if self.pending_display_refresh.is_some() {
-            debug!("Cancelling pending display refresh retry due to new display change");
-            self.pending_display_refresh = None;
-        }
-
-        // Clear watchdog exhaustion so sources get a fresh chance to initialize
-        self.capture_watchdog_exhausted_app = None;
-
-        let restart_recording = self.current_session.is_some();
-
         match event {
             DisplayChangeEvent::OriginalReturned {
                 display_id,
                 uuid: _,
                 display_name,
             } => {
-                // Original display came back - auto-recover with light reinit
-                // (same resolution expected, just recreate sources)
+                // Display returned (e.g., wake from sleep) — restart for fresh
+                // OBS context. SCK sources can't be reliably recreated in-place.
                 info!(
-                    "Original display '{}' (id={}) returned, auto-recovering...",
+                    "Original display '{}' (id={}) returned — restarting for fresh capture context",
                     display_name, display_id
                 );
-                self.try_reinitialize_with_retry(
-                    &display_name,
-                    restart_recording,
-                    true,
-                    true,
-                    false,
-                )
-                .await;
+                self.stop_recording().await.ok();
+                restart_process();
             }
 
             DisplayChangeEvent::SwitchedToNew {
@@ -2511,188 +2457,20 @@ unintended app video."
                 to_name,
                 to_uuid: _,
             } => {
-                // Switched to a different display - use reset_video() to update resolution
-                // This is safe (uses obs_reset_video, doesn't drop context, no SIGABRT)
+                // Switched to a different display — restart for fresh OBS context
+                // with correct resolution.
                 info!(
-                    "Display changed: '{}' (id={}) -> '{}' (id={})",
+                    "Display changed: '{}' (id={}) -> '{}' (id={}) — restarting for fresh capture context",
                     from_name, from_id, to_name, to_id
                 );
-
-                if restart_recording && notifications_authorized() {
-                    show_display_change_notification(&from_name, &to_name, to_id);
-                }
-
-                // Use full_reinit: true to reset video resolution for new display
-                self.try_reinitialize_with_retry(&to_name, restart_recording, false, true, true)
-                    .await;
+                self.stop_recording().await.ok();
+                restart_process();
             }
 
             DisplayChangeEvent::AllDisconnected => {
-                // All displays disconnected - just log and wait
+                // All displays disconnected (e.g., sleep) - just log and wait.
+                // On reconnect, OriginalReturned or SwitchedToNew will restart.
                 info!("All displays disconnected, waiting for reconnection...");
-                // Don't spam notifications - just wait quietly
-            }
-        }
-    }
-
-    /// Reinitialize OBS and optionally restart recording for display changes
-    ///
-    /// When `full_reinit` is false, only recreates capture sources without dropping the
-    /// libobs context. This is safer when the display resolution hasn't changed
-    /// (e.g., when the original display returns after being disconnected).
-    async fn reinitialize_after_display_change(
-        &mut self,
-        display_name: &str,
-        restart_recording: bool,
-        show_resumed_notification: bool,
-        stop_recording_first: bool,
-        full_reinit: bool,
-    ) -> Result<()> {
-        let mut restore_capture = None;
-        if stop_recording_first {
-            restore_capture = Some(self.capture_enabled);
-            self.capture_enabled = false;
-
-            if restart_recording {
-                self.stop_recording().await?;
-            }
-        }
-
-        if full_reinit {
-            // Resolution may have changed - use reset_video() which is safe
-            // (doesn't drop the context, avoids SIGABRT crash)
-            self.capture_ctx.reset_video_and_recreate_sources()?;
-        } else {
-            // Light reinitialization - just recreate capture sources without
-            // touching the libobs context or video settings. This is fastest
-            // and safest when the same display returns at the same resolution.
-            self.capture_ctx.fully_recreate_sources()?;
-        }
-
-        if restart_recording {
-            self.start_recording().await?;
-        }
-
-        if show_resumed_notification && notifications_authorized() {
-            show_capture_resumed_notification(display_name);
-        }
-
-        if let Some(prev) = restore_capture {
-            if !restart_recording && self.current_session.is_some() {
-                self.capture_enabled = prev;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Try to reinitialize capture after a display change, scheduling a retry if it fails
-    ///
-    /// SCK sometimes isn't ready immediately after display changes (especially
-    /// when coming out of clamshell mode). This method handles that by scheduling
-    /// retries with exponential backoff.
-    ///
-    /// When `full_reinit` is false, only recreates capture sources (faster, safer).
-    /// When `full_reinit` is true, drops and recreates the entire libobs context.
-    async fn try_reinitialize_with_retry(
-        &mut self,
-        display_name: &str,
-        restart_recording: bool,
-        show_resumed_notification: bool,
-        stop_recording_first: bool,
-        full_reinit: bool,
-    ) {
-        match self
-            .reinitialize_after_display_change(
-                display_name,
-                restart_recording,
-                show_resumed_notification,
-                stop_recording_first,
-                full_reinit,
-            )
-            .await
-        {
-            Ok(()) => {
-                info!(
-                    "Successfully reinitialized capture for display '{}'",
-                    display_name
-                );
-                self.pending_display_refresh = None;
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to reinitialize capture for display '{}': {} (will retry)",
-                    display_name, e
-                );
-
-                // Schedule a retry
-                self.pending_display_refresh = Some(PendingDisplayRefresh {
-                    display_name: display_name.to_string(),
-                    attempt: 1,
-                    next_retry_at: Instant::now() + DISPLAY_REFRESH_RETRY_BASE_DELAY,
-                    restart_recording,
-                    show_resumed_notification,
-                    stop_recording_first,
-                    full_reinit,
-                });
-            }
-        }
-    }
-
-    /// Retry a pending display refresh
-    async fn retry_display_refresh(&mut self) {
-        let Some(pending) = self.pending_display_refresh.take() else {
-            return;
-        };
-
-        info!(
-            "Retrying display refresh for '{}' (attempt {}/{})",
-            pending.display_name,
-            pending.attempt + 1,
-            MAX_DISPLAY_REFRESH_RETRIES
-        );
-
-        match self
-            .reinitialize_after_display_change(
-                &pending.display_name,
-                pending.restart_recording,
-                pending.show_resumed_notification,
-                pending.stop_recording_first,
-                pending.full_reinit,
-            )
-            .await
-        {
-            Ok(()) => {
-                info!(
-                    "Successfully reinitialized capture for display '{}' on retry",
-                    pending.display_name
-                );
-                // Success - don't reschedule
-            }
-            Err(e) => {
-                if pending.attempt >= MAX_DISPLAY_REFRESH_RETRIES {
-                    error!(
-                        "Failed to reinitialize capture for display '{}' after {} attempts: {}. Giving up.",
-                        pending.display_name, MAX_DISPLAY_REFRESH_RETRIES, e
-                    );
-                    // Don't reschedule - we've exhausted retries
-                } else {
-                    // Schedule another retry with exponential backoff
-                    let delay = DISPLAY_REFRESH_RETRY_BASE_DELAY * (1 << pending.attempt);
-                    warn!(
-                        "Retry failed for display '{}': {}. Will retry in {:?}",
-                        pending.display_name, e, delay
-                    );
-                    self.pending_display_refresh = Some(PendingDisplayRefresh {
-                        display_name: pending.display_name,
-                        attempt: pending.attempt + 1,
-                        next_retry_at: Instant::now() + delay,
-                        restart_recording: pending.restart_recording,
-                        show_resumed_notification: pending.show_resumed_notification,
-                        stop_recording_first: pending.stop_recording_first,
-                        full_reinit: pending.full_reinit,
-                    });
-                }
             }
         }
     }
