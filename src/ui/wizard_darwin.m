@@ -1454,3 +1454,27 @@ void wizard_open_notifications_settings(void) {
         [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.notifications"]];
     }
 }
+
+// ============================================================================
+// System Restart Alert
+// ============================================================================
+
+void show_restart_mac_alert(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSApp activateIgnoringOtherApps:YES];
+
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Screen Recording Is Not Working";
+        alert.informativeText =
+            @"CrowdCast cannot capture your screen. This usually happens "
+             "after a display configuration change.\n\n"
+             "Please restart your Mac to fix this.";
+        alert.alertStyle = NSAlertStyleCritical;
+        [alert addButtonWithTitle:@"OK"];
+
+        // Make the alert window float above everything
+        alert.window.level = NSFloatingWindowLevel;
+
+        [alert runModal];
+    });
+}

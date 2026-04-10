@@ -103,6 +103,14 @@ void show_app_selection_panel(
 // Free memory allocated by the panel for selected_apps
 void app_selection_free_result(AppSelectionResult *result);
 
+// ============================================================================
+// System Restart Alert (shown when SCK is broken at system level)
+// ============================================================================
+
+// Show a modal alert telling the user to restart their Mac.
+// Blocks until the user dismisses it.
+void show_restart_mac_alert(void);
+
 #ifdef __cplusplus
 }
 #endif
