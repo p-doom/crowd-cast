@@ -219,10 +219,7 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>Crashed</key>
-        <true/>
-    </dict>
+    <true/>
     <key>ProcessType</key>
     <string>Interactive</string>
 </dict>
@@ -296,8 +293,11 @@ fn is_current_macos_launch_agent_healthy(config: &AutostartConfig) -> Result<boo
     let contents = std::fs::read_to_string(&plist_path)
         .with_context(|| format!("Failed to read LaunchAgent plist at {:?}", plist_path))?;
 
+    // Check label, exe path, and that KeepAlive is unconditional (not the
+    // old dict form with Crashed/SuccessfulExit which doesn't work correctly).
     Ok(contents.contains(MACOS_AUTOSTART_LABEL)
-        && contents.contains(&format!("<string>{}</string>", expected_exe)))
+        && contents.contains(&format!("<string>{}</string>", expected_exe))
+        && !contents.contains("<key>Crashed</key>"))
 }
 
 #[cfg(target_os = "macos")]

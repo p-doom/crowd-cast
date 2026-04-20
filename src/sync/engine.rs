@@ -2445,7 +2445,7 @@ unintended app video."
     /// certain macOS configurations). Shows a modal alert telling the user to
     /// restart their Mac.
     fn check_capture_health(&mut self) {
-        const CAPTURE_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
+        const CAPTURE_HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 
         if self.restart_alert_shown
             || self.any_source_ever_ready
