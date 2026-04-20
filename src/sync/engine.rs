@@ -1730,6 +1730,18 @@ unintended app video."
                         }
                         EngineCommand::PrepareForUpdate => {
                             info!("Preparing for update install");
+                            // Disable launchd service so KeepAlive doesn't restart
+                            // the old version while Sparkle installs the update.
+                            // reconcile_autostart re-enables on next startup.
+                            #[cfg(target_os = "macos")]
+                            {
+                                let uid = unsafe { libc::getuid() };
+                                let service = format!("gui/{}/dev.crowd-cast.agent", uid);
+                                let _ = std::process::Command::new("launchctl")
+                                    .args(["disable", &service])
+                                    .output();
+                                info!("Disabled launchd service for update");
+                            }
                             self.stop_recording().await?;
                             self.reset_segment_timer();
                         }
