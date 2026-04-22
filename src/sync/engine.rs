@@ -397,16 +397,10 @@ pub struct SyncEngine {
     blank_video_on_untracked_app: bool,
     /// Timeout for the active-source readiness watchdog
     capture_watchdog_timeout: Duration,
-    /// Number of automatic source-refresh retries before giving up
-    capture_watchdog_max_retries: u32,
     /// Pending app source switch awaiting application
     pending_app_switch: Option<PendingAppSwitch>,
     /// Pending active-source readiness watchdog
     pending_capture_watchdog: Option<PendingCaptureWatchdog>,
-    /// Bundle ID of the app whose capture source failed to become ready after
-    /// all watchdog retries. Prevents infinite create/destroy cycles.
-    /// Cleared on app switch, recording stop/start, or display change.
-    capture_watchdog_exhausted_app: Option<String>,
     /// Segment rotation timer — fires every `segment_duration_secs` to split
     /// the recording into manageable chunks. Stored as a struct field so that
     /// every code path that starts/stops recording (including display recovery)
@@ -458,8 +452,6 @@ impl SyncEngine {
         let blank_video_on_untracked_app = config.capture.blank_video_on_untracked_app;
         let capture_watchdog_timeout =
             Duration::from_millis(config.capture.capture_watchdog_timeout_ms);
-        let capture_watchdog_max_retries = config.capture.capture_watchdog_max_retries;
-
         if config.capture.capture_all && single_active_app_capture {
             warn!(
                 "capture.capture_all=true with non-empty target_apps and single_active_app_capture enabled \
@@ -501,10 +493,8 @@ unintended app video."
             single_active_app_capture,
             blank_video_on_untracked_app,
             capture_watchdog_timeout,
-            capture_watchdog_max_retries,
             pending_app_switch: None,
             pending_capture_watchdog: None,
-            capture_watchdog_exhausted_app: None,
             segment_timer: None,
             pending_input_transition: None,
             last_emitted_context: None,
@@ -802,13 +792,6 @@ unintended app video."
             .map(|pending| pending.expected_app == target_app)
             .unwrap_or(false)
         {
-            return;
-        }
-
-        // Don't restart the watchdog if we already exhausted retries for this
-        // exact app — prevents infinite create/destroy cycles when a source
-        // never becomes ready (e.g., certain Electron apps).
-        if self.capture_watchdog_exhausted_app.as_deref() == Some(target_app) {
             return;
         }
 
@@ -1118,7 +1101,6 @@ unintended app video."
             Ok(switched) => {
                 if switched {
                     info!("Applied active capture switch to {:?}", target_app);
-                    self.capture_watchdog_exhausted_app = None;
                 }
                 if let Some(app) = target_app.as_deref() {
                     self.schedule_capture_watchdog(app, 0);
@@ -1172,28 +1154,22 @@ unintended app video."
                 self.refresh_capture_enabled_from_frontmost();
             }
             Ok(false) => {
-                if watchdog.attempt >= self.capture_watchdog_max_retries {
+                // Log at warn for early attempts, debug for subsequent to avoid spam.
+                // The check_capture_health() alert at 180s is the backstop for
+                // sources that never become ready.
+                if watchdog.attempt < 3 {
                     warn!(
-                        "Active capture source for '{}' did not become ready after {} retry attempt(s); \
-                         suppressing further retries until app switch",
-                        watchdog.expected_app, watchdog.attempt
+                        "Active capture source for '{}' is not ready yet; refreshing (attempt {})",
+                        watchdog.expected_app,
+                        watchdog.attempt + 1,
                     );
-                    self.capture_watchdog_exhausted_app =
-                        Some(watchdog.expected_app.clone());
-                    self.clear_capture_watchdog();
-                    if surface_failure {
-                        self.send_status_force(EngineStatus::RecordingBlocked);
-                    }
-                    self.refresh_capture_enabled_from_frontmost();
-                    return;
+                } else if watchdog.attempt % 20 == 0 {
+                    warn!(
+                        "Active capture source for '{}' still not ready (attempt {})",
+                        watchdog.expected_app,
+                        watchdog.attempt + 1,
+                    );
                 }
-
-                warn!(
-                    "Active capture source for '{}' is not ready yet; refreshing (attempt {}/{})",
-                    watchdog.expected_app,
-                    watchdog.attempt + 1,
-                    self.capture_watchdog_max_retries + 1
-                );
 
                 match self.capture_ctx.refresh_active_capture_source() {
                     Ok(_) => {
@@ -2301,7 +2277,6 @@ unintended app video."
         self.is_paused = false;
         self.idle_paused = false;
         self.pending_app_switch = None;
-        self.capture_watchdog_exhausted_app = None;
         self.segment_timer = None;
         self.clear_capture_watchdog();
         self.clear_pending_input_transition();
@@ -2474,11 +2449,6 @@ unintended app video."
         let current_ns = self.capture_ctx.get_video_frame_time().unwrap_or(start_ns);
         let elapsed = Duration::from_nanos(current_ns.saturating_sub(start_ns));
         if elapsed < CAPTURE_HEALTH_TIMEOUT {
-            return;
-        }
-
-        // At least one watchdog must have exhausted (not just slow to start)
-        if self.capture_watchdog_exhausted_app.is_none() {
             return;
         }
 
