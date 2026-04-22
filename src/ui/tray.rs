@@ -435,6 +435,19 @@ impl TrayApp {
             ) {
                 PrepareForUpdateAction::SendCommand => {
                     info!("Auto-update requested a clean stop before install");
+                    // Disable launchd BEFORE sending the command to the engine.
+                    // Must happen synchronously on the main thread to prevent
+                    // KeepAlive from restarting the old process while Sparkle
+                    // installs the update.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let uid = unsafe { libc::getuid() };
+                        let service = format!("gui/{}/dev.crowd-cast.agent", uid);
+                        let _ = std::process::Command::new("launchctl")
+                            .args(["disable", &service])
+                            .output();
+                        info!("Disabled launchd service for update");
+                    }
                     match self.cmd_tx.try_send(EngineCommand::PrepareForUpdate) {
                         Ok(()) => {
                             self.pending_prepare_for_update = false;
