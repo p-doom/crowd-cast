@@ -232,14 +232,13 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
     fs::write(&plist_path, plist_content)
         .with_context(|| format!("Failed to write LaunchAgent plist to {:?}", plist_path))?;
 
-    info!(
-        "Configured LaunchAgent at {:?} (applies at next login; no immediate launch)",
-        plist_path
-    );
+    info!("Configured LaunchAgent at {:?}", plist_path);
+
+    let domain = macos_launch_agent_domain_target();
+    let service = macos_launch_agent_service_target();
 
     // Ensure launchd state is not disabled for this service.
     if is_current_macos_launch_agent_disabled()? {
-        let service = macos_launch_agent_service_target();
         let status = std::process::Command::new("launchctl")
             .args(["enable", &service])
             .status()
@@ -251,6 +250,16 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
             anyhow::bail!("launchctl enable failed for {}", service);
         }
     }
+
+    // Reload the service so launchd picks up plist changes (KeepAlive, etc.).
+    // bootout may fail if the service isn't loaded — that's fine.
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &service])
+        .output();
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist_path.to_string_lossy()])
+        .output();
+    info!("Reloaded LaunchAgent service in launchd");
 
     Ok(())
 }
