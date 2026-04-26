@@ -435,14 +435,17 @@ pub fn reconcile_autostart(config: &AutostartConfig, should_enable: bool) -> Res
     if should_enable {
         #[cfg(target_os = "macos")]
         {
-            // Check if the user explicitly quit via tray menu. If the marker
-            // is recent (<30s), this is a launchd auto-restart after quit —
-            // exit to respect the user's intent. If stale, the user manually
-            // reopened the app — clean up and continue normally.
+            // Check if the user explicitly quit or an update is in progress.
+            // Exit only if ALL of:
+            //   1. Marker file exists (quit/update wrote it)
+            //   2. Started by launchd (XPC_SERVICE_NAME set) — not Sparkle/user
+            //   3. Marker is recent (<30s) — not a stale marker from a previous session
             let quit_marker = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
                 .map(|p| p.data_dir().join("quit_requested"));
             if let Some(ref path) = quit_marker {
                 if path.exists() {
+                    let started_by_launchd =
+                        std::env::var("XPC_SERVICE_NAME").is_ok();
                     let is_recent = std::fs::metadata(path)
                         .and_then(|m| m.modified())
                         .ok()
@@ -452,11 +455,11 @@ pub fn reconcile_autostart(config: &AutostartConfig, should_enable: bool) -> Res
 
                     let _ = std::fs::remove_file(path);
 
-                    if is_recent {
-                        info!("Recent quit detected — exiting to respect user intent");
+                    if started_by_launchd && is_recent {
+                        info!("Launchd auto-restart after quit/update — exiting");
                         std::process::exit(0);
                     } else {
-                        info!("Stale quit marker cleaned up — continuing normally");
+                        info!("Quit marker cleaned up — continuing normally");
                     }
                 }
             }

@@ -360,16 +360,12 @@ impl TrayApp {
 
             // Run one iteration of the native event loop (non-blocking)
             let loop_result = unsafe { tray_ffi::tray_loop(0) };
-            if loop_result < 0 {
-                info!("Tray loop signaled exit");
-                break;
-            }
 
-            // Check if quit was requested via callback
+            // Check quit BEFORE the tray_loop exit check — on_quit() calls
+            // tray_exit() which makes tray_loop return -1, but we need to
+            // run the disable + marker logic first.
             if QUIT_REQUESTED.load(Ordering::SeqCst) {
                 info!("Quit requested via tray menu");
-                // Disable launchd service and write a marker so reconcile_autostart
-                // doesn't re-enable on the (brief) restarted process.
                 #[cfg(target_os = "macos")]
                 {
                     let uid = unsafe { libc::getuid() };
@@ -385,6 +381,11 @@ impl TrayApp {
                     info!("Disabled launchd service for clean quit");
                 }
                 let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
+                break;
+            }
+
+            if loop_result < 0 {
+                info!("Tray loop signaled exit");
                 break;
             }
 
@@ -450,6 +451,13 @@ impl TrayApp {
                         let _ = std::process::Command::new("launchctl")
                             .args(["disable", &service])
                             .output();
+                        // Write marker so if launchd restarts before disable
+                        // takes effect, the restarted process exits immediately.
+                        if let Some(path) = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+                            .map(|p| p.data_dir().join("quit_requested"))
+                        {
+                            let _ = std::fs::write(&path, "1");
+                        }
                         info!("Disabled launchd service for update");
                     }
                     match self.cmd_tx.try_send(EngineCommand::PrepareForUpdate) {
