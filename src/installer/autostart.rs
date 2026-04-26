@@ -445,8 +445,9 @@ enum QuitMarkerAction {
 /// - `started_by_launchd`: true if XPC_SERVICE_NAME env var is set
 /// - `marker_age_secs`: age of the marker file in seconds (None if unknown)
 ///
-/// Exit only if ALL: started by launchd AND marker is recent (<30s).
-const QUIT_MARKER_MAX_AGE_SECS: u64 = 30;
+//// Exit only if ALL: started by launchd AND marker is recent (<120s).
+// 120s gives 12 launchd throttle cycles (10s each) for disable to take effect.
+const QUIT_MARKER_MAX_AGE_SECS: u64 = 120;
 
 fn check_quit_marker(started_by_launchd: bool, marker_age_secs: Option<u64>) -> QuitMarkerAction {
     let is_recent = marker_age_secs
@@ -550,7 +551,7 @@ mod tests {
 
     #[test]
     fn quit_marker_launchd_recent_exits() {
-        // launchd auto-restart within 30s of quit → should exit
+        // launchd auto-restart within 120s of quit → should exit
         assert_eq!(
             check_quit_marker(true, Some(0)),
             QuitMarkerAction::ExitKeepMarker
@@ -560,16 +561,16 @@ mod tests {
             QuitMarkerAction::ExitKeepMarker
         );
         assert_eq!(
-            check_quit_marker(true, Some(29)),
+            check_quit_marker(true, Some(119)),
             QuitMarkerAction::ExitKeepMarker
         );
     }
 
     #[test]
     fn quit_marker_launchd_stale_continues() {
-        // launchd start with stale marker (>30s, e.g. next login) → clean up, continue
+        // launchd start with stale marker (>120s, e.g. next login) → clean up, continue
         assert_eq!(
-            check_quit_marker(true, Some(30)),
+            check_quit_marker(true, Some(120)),
             QuitMarkerAction::ContinueDeleteMarker
         );
         assert_eq!(
@@ -614,7 +615,7 @@ mod tests {
 
     #[test]
     fn quit_marker_launchd_throttle_retries_exit() {
-        // launchd 10s throttle restart (marker still <30s) → should still exit
+        // launchd 10s throttle restarts (marker still <120s) → should still exit
         assert_eq!(
             check_quit_marker(true, Some(10)),
             QuitMarkerAction::ExitKeepMarker
@@ -623,18 +624,26 @@ mod tests {
             check_quit_marker(true, Some(20)),
             QuitMarkerAction::ExitKeepMarker
         );
+        assert_eq!(
+            check_quit_marker(true, Some(60)),
+            QuitMarkerAction::ExitKeepMarker
+        );
+        assert_eq!(
+            check_quit_marker(true, Some(110)),
+            QuitMarkerAction::ExitKeepMarker
+        );
     }
 
     #[test]
-    fn quit_marker_boundary_at_30s() {
-        // Exactly 30s → stale (not recent)
+    fn quit_marker_boundary_at_120s() {
+        // Exactly 120s → stale (not recent)
         assert_eq!(
-            check_quit_marker(true, Some(30)),
+            check_quit_marker(true, Some(120)),
             QuitMarkerAction::ContinueDeleteMarker
         );
-        // 29s → still recent
+        // 119s → still recent
         assert_eq!(
-            check_quit_marker(true, Some(29)),
+            check_quit_marker(true, Some(119)),
             QuitMarkerAction::ExitKeepMarker
         );
     }
