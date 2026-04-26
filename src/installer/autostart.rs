@@ -429,37 +429,64 @@ pub fn has_any_autostart_entry() -> bool {
     is_autostart_enabled()
 }
 
+/// What to do when a quit marker file is found on startup.
+#[derive(Debug, PartialEq, Eq)]
+enum QuitMarkerAction {
+    /// This is a launchd auto-restart after quit/update — exit immediately.
+    /// Keep the marker so subsequent launchd restart attempts also exit
+    /// (launchd throttles with 10s delays between restarts).
+    ExitKeepMarker,
+    /// This is a Sparkle/user launch, or a stale marker — delete it and continue.
+    ContinueDeleteMarker,
+}
+
+/// Decide what to do with a quit marker.
+///
+/// - `started_by_launchd`: true if XPC_SERVICE_NAME env var is set
+/// - `marker_age_secs`: age of the marker file in seconds (None if unknown)
+///
+/// Exit only if ALL: started by launchd AND marker is recent (<30s).
+const QUIT_MARKER_MAX_AGE_SECS: u64 = 30;
+
+fn check_quit_marker(started_by_launchd: bool, marker_age_secs: Option<u64>) -> QuitMarkerAction {
+    let is_recent = marker_age_secs
+        .map(|age| age < QUIT_MARKER_MAX_AGE_SECS)
+        .unwrap_or(false);
+
+    if started_by_launchd && is_recent {
+        QuitMarkerAction::ExitKeepMarker
+    } else {
+        QuitMarkerAction::ContinueDeleteMarker
+    }
+}
+
 /// Reconciles OS autostart state with desired configuration.
 /// This is safe to call on every application startup.
 pub fn reconcile_autostart(config: &AutostartConfig, should_enable: bool) -> Result<()> {
     if should_enable {
         #[cfg(target_os = "macos")]
         {
-            // Check if the user explicitly quit or an update is in progress.
-            // Exit only if ALL of:
-            //   1. Marker file exists (quit/update wrote it)
-            //   2. Started by launchd (XPC_SERVICE_NAME set) — not Sparkle/user
-            //   3. Marker is recent (<30s) — not a stale marker from a previous session
             let quit_marker = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
                 .map(|p| p.data_dir().join("quit_requested"));
             if let Some(ref path) = quit_marker {
                 if path.exists() {
                     let started_by_launchd =
                         std::env::var("XPC_SERVICE_NAME").is_ok();
-                    let is_recent = std::fs::metadata(path)
+                    let marker_age_secs = std::fs::metadata(path)
                         .and_then(|m| m.modified())
                         .ok()
                         .and_then(|t| t.elapsed().ok())
-                        .map(|age| age.as_secs() < 30)
-                        .unwrap_or(false);
+                        .map(|age| age.as_secs());
 
-                    let _ = std::fs::remove_file(path);
-
-                    if started_by_launchd && is_recent {
-                        info!("Launchd auto-restart after quit/update — exiting");
-                        std::process::exit(0);
-                    } else {
-                        info!("Quit marker cleaned up — continuing normally");
+                    match check_quit_marker(started_by_launchd, marker_age_secs) {
+                        QuitMarkerAction::ExitKeepMarker => {
+                            info!("Launchd auto-restart after quit/update — exiting");
+                            std::process::exit(0);
+                        }
+                        QuitMarkerAction::ContinueDeleteMarker => {
+                            let _ = std::fs::remove_file(path);
+                            info!("Quit marker cleaned up — continuing normally");
+                        }
                     }
                 }
             }
@@ -517,5 +544,98 @@ mod tests {
     fn test_is_autostart_enabled() {
         let enabled = is_autostart_enabled();
         println!("Autostart enabled: {}", enabled);
+    }
+
+    // === Quit marker tests ===
+
+    #[test]
+    fn quit_marker_launchd_recent_exits() {
+        // launchd auto-restart within 30s of quit → should exit
+        assert_eq!(
+            check_quit_marker(true, Some(0)),
+            QuitMarkerAction::ExitKeepMarker
+        );
+        assert_eq!(
+            check_quit_marker(true, Some(5)),
+            QuitMarkerAction::ExitKeepMarker
+        );
+        assert_eq!(
+            check_quit_marker(true, Some(29)),
+            QuitMarkerAction::ExitKeepMarker
+        );
+    }
+
+    #[test]
+    fn quit_marker_launchd_stale_continues() {
+        // launchd start with stale marker (>30s, e.g. next login) → clean up, continue
+        assert_eq!(
+            check_quit_marker(true, Some(30)),
+            QuitMarkerAction::ContinueDeleteMarker
+        );
+        assert_eq!(
+            check_quit_marker(true, Some(3600)),
+            QuitMarkerAction::ContinueDeleteMarker
+        );
+        assert_eq!(
+            check_quit_marker(true, Some(86400)),
+            QuitMarkerAction::ContinueDeleteMarker
+        );
+    }
+
+    #[test]
+    fn quit_marker_sparkle_continues() {
+        // Sparkle/user launch (no XPC_SERVICE_NAME) → clean up, continue regardless of age
+        assert_eq!(
+            check_quit_marker(false, Some(0)),
+            QuitMarkerAction::ContinueDeleteMarker
+        );
+        assert_eq!(
+            check_quit_marker(false, Some(5)),
+            QuitMarkerAction::ContinueDeleteMarker
+        );
+        assert_eq!(
+            check_quit_marker(false, Some(3600)),
+            QuitMarkerAction::ContinueDeleteMarker
+        );
+    }
+
+    #[test]
+    fn quit_marker_unknown_age_continues() {
+        // Can't determine marker age → treat as stale, continue
+        assert_eq!(
+            check_quit_marker(true, None),
+            QuitMarkerAction::ContinueDeleteMarker
+        );
+        assert_eq!(
+            check_quit_marker(false, None),
+            QuitMarkerAction::ContinueDeleteMarker
+        );
+    }
+
+    #[test]
+    fn quit_marker_launchd_throttle_retries_exit() {
+        // launchd 10s throttle restart (marker still <30s) → should still exit
+        assert_eq!(
+            check_quit_marker(true, Some(10)),
+            QuitMarkerAction::ExitKeepMarker
+        );
+        assert_eq!(
+            check_quit_marker(true, Some(20)),
+            QuitMarkerAction::ExitKeepMarker
+        );
+    }
+
+    #[test]
+    fn quit_marker_boundary_at_30s() {
+        // Exactly 30s → stale (not recent)
+        assert_eq!(
+            check_quit_marker(true, Some(30)),
+            QuitMarkerAction::ContinueDeleteMarker
+        );
+        // 29s → still recent
+        assert_eq!(
+            check_quit_marker(true, Some(29)),
+            QuitMarkerAction::ExitKeepMarker
+        );
     }
 }
