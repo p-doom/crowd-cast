@@ -368,8 +368,8 @@ impl TrayApp {
             // Check if quit was requested via callback
             if QUIT_REQUESTED.load(Ordering::SeqCst) {
                 info!("Quit requested via tray menu");
-                // Disable launchd service so KeepAlive doesn't restart after
-                // intentional quit. reconcile_autostart re-enables on next login.
+                // Disable launchd service and write a marker so reconcile_autostart
+                // doesn't re-enable on the (brief) restarted process.
                 #[cfg(target_os = "macos")]
                 {
                     let uid = unsafe { libc::getuid() };
@@ -377,9 +377,13 @@ impl TrayApp {
                     let _ = std::process::Command::new("launchctl")
                         .args(["disable", &service])
                         .output();
+                    if let Some(path) = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+                        .map(|p| p.data_dir().join("quit_requested"))
+                    {
+                        let _ = std::fs::write(&path, "1");
+                    }
                     info!("Disabled launchd service for clean quit");
                 }
-                // Send shutdown command to engine (use try_send to avoid blocking)
                 let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
                 break;
             }

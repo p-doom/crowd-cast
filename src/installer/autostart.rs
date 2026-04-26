@@ -435,6 +435,32 @@ pub fn reconcile_autostart(config: &AutostartConfig, should_enable: bool) -> Res
     if should_enable {
         #[cfg(target_os = "macos")]
         {
+            // Check if the user explicitly quit via tray menu. If the marker
+            // is recent (<30s), this is a launchd auto-restart after quit —
+            // exit to respect the user's intent. If stale, the user manually
+            // reopened the app — clean up and continue normally.
+            let quit_marker = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+                .map(|p| p.data_dir().join("quit_requested"));
+            if let Some(ref path) = quit_marker {
+                if path.exists() {
+                    let is_recent = std::fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .map(|age| age.as_secs() < 30)
+                        .unwrap_or(false);
+
+                    let _ = std::fs::remove_file(path);
+
+                    if is_recent {
+                        info!("Recent quit detected — exiting to respect user intent");
+                        std::process::exit(0);
+                    } else {
+                        info!("Stale quit marker cleaned up — continuing normally");
+                    }
+                }
+            }
+
             let healthy = is_current_macos_launch_agent_healthy(config).unwrap_or(false);
             let disabled = is_current_macos_launch_agent_disabled().unwrap_or(false);
 
