@@ -15,9 +15,39 @@ mod ui;
 mod upload;
 
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+/// Flag set by intentional exit paths (Quit menu, Sparkle update, Ctrl+C).
+/// When main() exits, it checks this flag to decide the exit code:
+///   true  → exit(0) → KeepAlive/Crashed does NOT restart (intentional)
+///   false → exit(1) → KeepAlive/Crashed DOES restart (unexpected termination)
+static INTENTIONAL_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Channel for the SIGINT handler to send shutdown commands.
+#[cfg(unix)]
+static CMD_SENDER_FOR_SIGNAL: std::sync::Mutex<Option<(mpsc::Sender<EngineCommand>, Arc<tokio::runtime::Runtime>)>> =
+    std::sync::Mutex::new(None);
+
+/// SIGINT handler: mark exit as intentional and trigger shutdown.
+#[cfg(unix)]
+extern "C" fn sigint_handler(_sig: libc::c_int) {
+    INTENTIONAL_EXIT.store(true, Ordering::SeqCst);
+    if let Ok(guard) = CMD_SENDER_FOR_SIGNAL.lock() {
+        if let Some((ref tx, ref rt)) = *guard {
+            let tx = tx.clone();
+            rt.spawn(async move {
+                let _ = tx.send(EngineCommand::Shutdown).await;
+            });
+        }
+    }
+    #[cfg(not(no_tray))]
+    unsafe {
+        ui::tray_ffi::tray_exit();
+    }
+}
 
 use config::Config;
 use installer::{needs_setup, reconcile_autostart, run_wizard_gui, AutostartConfig};
@@ -184,21 +214,20 @@ fn main() -> Result<()> {
         });
     });
 
-    // Set up Ctrl+C handler that sends shutdown command
-    let ctrl_c_tx = cmd_tx.clone();
-    let ctrl_c_runtime = runtime.clone();
-    ctrlc::set_handler(move || {
-        info!("Ctrl+C received, shutting down...");
-        let tx = ctrl_c_tx.clone();
-        ctrl_c_runtime.spawn(async move {
-            let _ = tx.send(EngineCommand::Shutdown).await;
-        });
-        // Also signal tray to exit
-        #[cfg(not(no_tray))]
+    // Handle SIGINT (Ctrl+C) only. SIGTERM is intentionally NOT caught so that
+    // macOS sleep/hibernate termination produces a non-zero exit, which triggers
+    // KeepAlive/Crashed restart. Ctrl+C sets INTENTIONAL_EXIT so the process
+    // exits with 0 (no restart).
+    #[cfg(unix)]
+    {
+        let sigint_tx = cmd_tx.clone();
+        let sigint_runtime = runtime.clone();
         unsafe {
-            ui::tray_ffi::tray_exit();
+            libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
         }
-    })?;
+        // Store the channel for the signal handler to use
+        *CMD_SENDER_FOR_SIGNAL.lock().unwrap() = Some((sigint_tx, sigint_runtime));
+    }
 
     // Run tray on main thread
     #[cfg(not(no_tray))]
@@ -239,8 +268,23 @@ fn main() -> Result<()> {
     // Wait for engine thread to finish
     let _ = engine_handle.join();
 
-    info!("Shutdown complete");
-    Ok(())
+    // Determine exit code: intentional exits (Quit menu, Sparkle update, Ctrl+C)
+    // exit with 0 so KeepAlive/Crashed does NOT restart. All other exits
+    // (SIGTERM from macOS sleep/hibernate, NSApp termination) exit with 1
+    // so KeepAlive/Crashed DOES restart on next login.
+    #[cfg(not(no_tray))]
+    let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst)
+        || ui::was_quit_requested();
+    #[cfg(no_tray)]
+    let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst);
+
+    if intentional {
+        info!("Intentional shutdown — exiting with code 0 (no restart)");
+        std::process::exit(0);
+    } else {
+        info!("Unexpected shutdown — exiting with code 1 (KeepAlive will restart)");
+        std::process::exit(1);
+    }
 }
 
 fn get_output_directory(config: &Config) -> std::path::PathBuf {
