@@ -55,9 +55,6 @@ tracing-appender = "0.2"
 anyhow = "1"
 thiserror = "1"
 
-# Ctrl+C handling (cross-platform)
-ctrlc = "3"
-
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 

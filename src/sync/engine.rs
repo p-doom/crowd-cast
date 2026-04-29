@@ -1706,8 +1706,6 @@ unintended app video."
                         }
                         EngineCommand::PrepareForUpdate => {
                             info!("Preparing for update install");
-                            // launchd service is already disabled by the tray
-                            // (synchronously, before sending this command).
                             self.stop_recording().await?;
                             self.reset_segment_timer();
                         }

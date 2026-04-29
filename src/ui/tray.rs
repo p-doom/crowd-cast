@@ -25,6 +25,11 @@ static TOGGLE_UPLOADS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CMD_SENDER: Mutex<Option<mpsc::Sender<EngineCommand>>> = Mutex::new(None);
 
+/// Check if the user explicitly quit via the tray menu.
+pub fn was_quit_requested() -> bool {
+    QUIT_REQUESTED.load(Ordering::SeqCst)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrepareForUpdateAction {
     Wait,
@@ -361,31 +366,15 @@ impl TrayApp {
             // Run one iteration of the native event loop (non-blocking)
             let loop_result = unsafe { tray_ffi::tray_loop(0) };
 
-            // Check quit BEFORE the tray_loop exit check — on_quit() calls
-            // tray_exit() which makes tray_loop return -1, but we need to
-            // run the disable + marker logic first.
-            if QUIT_REQUESTED.load(Ordering::SeqCst) {
-                info!("Quit requested via tray menu");
-                #[cfg(target_os = "macos")]
-                {
-                    let uid = unsafe { libc::getuid() };
-                    let service = format!("gui/{}/dev.crowd-cast.agent", uid);
-                    let _ = std::process::Command::new("launchctl")
-                        .args(["disable", &service])
-                        .output();
-                    if let Some(path) = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
-                        .map(|p| p.data_dir().join("quit_requested"))
-                    {
-                        let _ = std::fs::write(&path, "1");
-                    }
-                    info!("Disabled launchd service for clean quit");
-                }
-                let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
+            if loop_result < 0 {
+                info!("Tray loop signaled exit");
                 break;
             }
 
-            if loop_result < 0 {
-                info!("Tray loop signaled exit");
+            // Check if quit was requested via callback
+            if QUIT_REQUESTED.load(Ordering::SeqCst) {
+                info!("Quit requested via tray menu");
+                let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
                 break;
             }
 
@@ -440,26 +429,8 @@ impl TrayApp {
             ) {
                 PrepareForUpdateAction::SendCommand => {
                     info!("Auto-update requested a clean stop before install");
-                    // Disable launchd BEFORE sending the command to the engine.
-                    // Must happen synchronously on the main thread to prevent
-                    // KeepAlive from restarting the old process while Sparkle
-                    // installs the update.
-                    #[cfg(target_os = "macos")]
-                    {
-                        let uid = unsafe { libc::getuid() };
-                        let service = format!("gui/{}/dev.crowd-cast.agent", uid);
-                        let _ = std::process::Command::new("launchctl")
-                            .args(["disable", &service])
-                            .output();
-                        // Write marker so if launchd restarts before disable
-                        // takes effect, the restarted process exits immediately.
-                        if let Some(path) = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
-                            .map(|p| p.data_dir().join("quit_requested"))
-                        {
-                            let _ = std::fs::write(&path, "1");
-                        }
-                        info!("Disabled launchd service for update");
-                    }
+                    // Mark as intentional so main exits with 0 (no KeepAlive restart)
+                    crate::INTENTIONAL_EXIT.store(true, Ordering::SeqCst);
                     match self.cmd_tx.try_send(EngineCommand::PrepareForUpdate) {
                         Ok(()) => {
                             self.pending_prepare_for_update = false;
