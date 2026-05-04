@@ -29,7 +29,16 @@ static BOOL shouldExit = NO;
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
-    return NSTerminateNow;
+    // Called when macOS or Sparkle requests termination ([NSApp terminate:]).
+    // Check if this exit was intentional (Sparkle update, already preparing).
+    // If not (macOS sleep/hibernate/logout), exit with non-zero so
+    // KeepAlive/Crashed restarts the process.
+    extern bool is_intentional_exit(void);
+    if (is_intentional_exit()) {
+        return NSTerminateNow;  // exit(0), KeepAlive won't restart
+    }
+    _exit(1);  // Non-zero exit, KeepAlive/Crashed will restart
+    return NSTerminateCancel;  // Never reached
 }
 
 @end

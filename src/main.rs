@@ -26,6 +26,13 @@ use tracing::{error, info, warn};
 ///   false → exit(1) → KeepAlive/Crashed DOES restart (unexpected termination)
 static INTENTIONAL_EXIT: AtomicBool = AtomicBool::new(false);
 
+/// C-accessible function for the ObjC applicationShouldTerminate: delegate.
+/// Returns true if the exit was intentional (Quit, Sparkle update, Ctrl+C).
+#[no_mangle]
+pub extern "C" fn is_intentional_exit() -> bool {
+    INTENTIONAL_EXIT.load(Ordering::SeqCst)
+}
+
 /// Channel for the SIGINT handler to send shutdown commands.
 #[cfg(unix)]
 static CMD_SENDER_FOR_SIGNAL: std::sync::Mutex<Option<(mpsc::Sender<EngineCommand>, Arc<tokio::runtime::Runtime>)>> =
