@@ -2458,13 +2458,19 @@ unintended app video."
         }
     }
 
-    /// - Auto-recovers if the original display returns
-    /// - Shows a notification to let the user decide if switching to a new display
+    /// Reinitialize capture after a display change (in-place, no process restart).
+    ///
+    /// Uses in-place source recreation to avoid SIGSEGV crashes that occur when
+    /// creating SCK sources in a fresh OBS context after sleep/wake. Sources may
+    /// initially report 0x0 dimensions — the watchdog retries indefinitely until
+    /// SCK delivers frames.
     async fn check_display_changes(&mut self) {
         // Check if display configuration changed (macOS only, no-op on other platforms)
         let Some(event) = self.display_monitor.check_for_changes() else {
             return;
         };
+
+        let restart_recording = self.current_session.is_some();
 
         match event {
             DisplayChangeEvent::OriginalReturned {
@@ -2472,14 +2478,31 @@ unintended app video."
                 uuid: _,
                 display_name,
             } => {
-                // Display returned (e.g., wake from sleep) — restart for fresh
-                // OBS context. SCK sources can't be reliably recreated in-place.
+                // Same display returned (e.g., wake from sleep) — light reinit
+                // (same resolution expected, just recreate sources in-place).
                 info!(
-                    "Original display '{}' (id={}) returned — restarting for fresh capture context",
+                    "Original display '{}' (id={}) returned, reinitializing sources in-place",
                     display_name, display_id
                 );
-                self.stop_recording().await.ok();
-                restart_process();
+
+                if restart_recording {
+                    self.stop_recording().await.ok();
+                }
+
+                match self.capture_ctx.fully_recreate_sources() {
+                    Ok(count) => {
+                        info!("Recreated {} source(s) for display '{}'", count, display_name);
+                    }
+                    Err(e) => {
+                        error!("Failed to recreate sources for display '{}': {}", display_name, e);
+                    }
+                }
+
+                if restart_recording {
+                    if let Err(e) = self.start_recording().await {
+                        error!("Failed to restart recording after display change: {}", e);
+                    }
+                }
             }
 
             DisplayChangeEvent::SwitchedToNew {
@@ -2489,19 +2512,33 @@ unintended app video."
                 to_name,
                 to_uuid: _,
             } => {
-                // Switched to a different display — restart for fresh OBS context
-                // with correct resolution.
+                // Different display — reset video resolution and recreate sources.
                 info!(
-                    "Display changed: '{}' (id={}) -> '{}' (id={}) — restarting for fresh capture context",
+                    "Display changed: '{}' (id={}) -> '{}' (id={}), reinitializing in-place",
                     from_name, from_id, to_name, to_id
                 );
-                self.stop_recording().await.ok();
-                restart_process();
+
+                if restart_recording {
+                    self.stop_recording().await.ok();
+                }
+
+                match self.capture_ctx.reset_video_and_recreate_sources() {
+                    Ok(()) => {
+                        info!("Reset video and recreated sources for display '{}'", to_name);
+                    }
+                    Err(e) => {
+                        error!("Failed to reset video for display '{}': {}", to_name, e);
+                    }
+                }
+
+                if restart_recording {
+                    if let Err(e) = self.start_recording().await {
+                        error!("Failed to restart recording after display change: {}", e);
+                    }
+                }
             }
 
             DisplayChangeEvent::AllDisconnected => {
-                // All displays disconnected (e.g., sleep) - just log and wait.
-                // On reconnect, OriginalReturned or SwitchedToNew will restart.
                 info!("All displays disconnected, waiting for reconnection...");
             }
         }
