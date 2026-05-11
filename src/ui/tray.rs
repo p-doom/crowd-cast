@@ -22,6 +22,7 @@ use crate::sync::{EngineCommand, EngineStatus};
 static CHECK_FOR_UPDATES_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TOGGLE_UPLOADS_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SIGN_IN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CMD_SENDER: Mutex<Option<mpsc::Sender<EngineCommand>>> = Mutex::new(None);
 
@@ -126,6 +127,8 @@ pub struct TrayApp {
     pending_prepare_for_update: bool,
     last_update_check: std::time::Instant,
     uploads_paused: bool,
+    auth: Option<std::sync::Arc<tokio::sync::Mutex<crate::auth::AuthManager>>>,
+    auth_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
 }
 
 impl TrayApp {
@@ -133,6 +136,8 @@ impl TrayApp {
     pub fn new(
         cmd_tx: mpsc::Sender<EngineCommand>,
         status_rx: broadcast::Receiver<EngineStatus>,
+        auth: Option<std::sync::Arc<tokio::sync::Mutex<crate::auth::AuthManager>>>,
+        auth_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     ) -> Result<Self> {
         info!("Initializing system tray UI");
 
@@ -164,6 +169,21 @@ impl TrayApp {
         let updates_text = CString::new("Check for Updates")?;
         let quit_text = CString::new("Quit")?;
 
+        // Determine sign-in text based on auth state
+        let sign_in_text = if let Some(ref auth) = auth {
+            if let Ok(mgr) = auth.try_lock() {
+                if let Some(email) = mgr.email() {
+                    CString::new(format!("Signed in as {}", email))?
+                } else {
+                    CString::new("Sign in with Google")?
+                }
+            } else {
+                CString::new("Sign in with Google")?
+            }
+        } else {
+            CString::new("Sign in (not configured)")?
+        };
+
         let menu_strings = vec![
             status_text,          // 0
             separator.clone(),    // 1
@@ -174,15 +194,16 @@ impl TrayApp {
             panic_text,           // 6
             separator.clone(),    // 7
             pause_uploads_text,   // 8
-            settings_text,        // 9
-            updates_text,         // 10
-            separator.clone(),    // 11
-            quit_text,            // 12
+            sign_in_text,         // 9
+            settings_text,        // 10
+            updates_text,         // 11
+            separator.clone(),    // 12
+            quit_text,            // 13
         ];
 
         // Build menu items array (NULL-terminated)
         // Menu indices: 0=status, 1=sep, 2=start, 3=pause, 4=resume, 5=stop, 6=panic,
-        //   7=sep, 8=pause_uploads, 9=settings, 10=updates, 11=sep, 12=quit
+        //   7=sep, 8=pause_uploads, 9=sign_in, 10=settings, 11=updates, 12=sep, 13=quit
         let mut menu_items = vec![
             TrayMenuItem {
                 text: menu_strings[0].as_ptr(), // Status
@@ -248,28 +269,35 @@ impl TrayApp {
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[9].as_ptr(), // Settings
+                text: menu_strings[9].as_ptr(), // Sign in with Google
+                disabled: if auth.is_some() && auth.as_ref().map(|a| a.try_lock().ok().map(|m| m.is_authenticated()).unwrap_or(false)).unwrap_or(false) { 1 } else { 0 },
+                checked: 0,
+                cb: Some(on_sign_in),
+                submenu: std::ptr::null_mut(),
+            },
+            TrayMenuItem {
+                text: menu_strings[10].as_ptr(), // Settings
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_settings),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[10].as_ptr(), // Check for Updates
+                text: menu_strings[11].as_ptr(), // Check for Updates
                 disabled: 1,
                 checked: 0,
                 cb: Some(on_check_for_updates),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[11].as_ptr(), // separator
+                text: menu_strings[12].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[12].as_ptr(), // Quit
+                text: menu_strings[13].as_ptr(), // Quit
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_quit),
@@ -311,6 +339,8 @@ impl TrayApp {
                 .and_then(|p| std::fs::read_to_string(p.data_dir().join("uploads_paused")).ok())
                 .map(|s| s.trim() == "true")
                 .unwrap_or(false),
+            auth,
+            auth_runtime,
         })
     }
 
@@ -376,6 +406,10 @@ impl TrayApp {
                 info!("Quit requested via tray menu");
                 let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
                 break;
+            }
+
+            if SIGN_IN_REQUESTED.swap(false, Ordering::SeqCst) {
+                self.handle_sign_in();
             }
 
             if SETTINGS_REQUESTED.swap(false, Ordering::SeqCst) {
@@ -565,12 +599,41 @@ impl TrayApp {
         }
 
         self.last_updater_can_check = Some(can_check);
-        self._menu_items[10].disabled = if can_check { 0 } else { 1 };
+        self._menu_items[11].disabled = if can_check { 0 } else { 1 };
 
         self.tray.menu = self._menu_items.as_mut_ptr();
         unsafe {
             tray_ffi::tray_update(&mut self.tray);
         }
+    }
+
+    fn handle_sign_in(&mut self) {
+        let (Some(auth), Some(rt)) = (self.auth.clone(), self.auth_runtime.clone()) else {
+            warn!("Auth not configured — cannot sign in");
+            return;
+        };
+
+        info!("Starting Google sign-in flow...");
+
+        // Run the OAuth flow on a background thread (can't block the main/tray thread)
+        let auth_clone = auth.clone();
+        std::thread::spawn(move || {
+            let result = rt.block_on(async {
+                let mut mgr = auth_clone.lock().await;
+                mgr.login().await
+            });
+            match result {
+                Ok(state) => {
+                    info!("Sign-in successful: {}", state.email);
+                }
+                Err(e) => {
+                    error!("Sign-in failed: {}", e);
+                }
+            }
+        });
+
+        // The menu text will be updated on the next status update cycle
+        // when we check auth state. For now, just log.
     }
 
     fn show_settings_panel(&self) {
@@ -760,6 +823,11 @@ unsafe extern "C" fn on_panic(_item: *mut TrayMenuItem) {
 unsafe extern "C" fn on_toggle_uploads(_item: *mut TrayMenuItem) {
     info!("Toggle uploads requested via tray");
     TOGGLE_UPLOADS_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+unsafe extern "C" fn on_sign_in(_item: *mut TrayMenuItem) {
+    info!("Sign in requested via tray");
+    SIGN_IN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 unsafe extern "C" fn on_settings(_item: *mut TrayMenuItem) {

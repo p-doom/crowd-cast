@@ -9,6 +9,10 @@ use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, warn};
 
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+use crate::auth::AuthManager;
 use crate::config::Config;
 use crate::data::CompletedChunk;
 
@@ -38,19 +42,27 @@ struct PresignResponse {
 #[derive(Clone)]
 pub struct Uploader {
     client: Client,
+    auth: Option<Arc<Mutex<AuthManager>>>,
 }
 
 impl Uploader {
     /// Create a new uploader
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, auth: Option<Arc<Mutex<AuthManager>>>) -> Self {
         let _ = config;
         Self {
             client: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
-                // No global timeout — per-request timeouts are set on each call
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            auth,
         }
+    }
+
+    /// Get a valid auth token if authenticated, or None.
+    async fn get_auth_token(&self) -> Option<String> {
+        let auth = self.auth.as_ref()?;
+        let mut mgr = auth.lock().await;
+        mgr.get_valid_token().await
     }
 
     fn compile_time_endpoint() -> Option<&'static str> {
@@ -90,6 +102,7 @@ impl Uploader {
         file_name: &str,
         version: &str,
         user_id: &str,
+        auth_token: Option<&str>,
     ) -> Result<PresignResponse> {
         let presign_request = PresignRequest {
             file_name: file_name.to_string(),
@@ -97,11 +110,17 @@ impl Uploader {
             user_id: user_id.to_string(),
         };
 
-        let presign_response: PresignResponse = self
+        let mut req = self
             .client
             .post(endpoint)
             .json(&presign_request)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(30));
+
+        if let Some(token) = auth_token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let presign_response: PresignResponse = req
             .send()
             .await
             .context("Failed to request pre-signed URL")?
@@ -128,6 +147,8 @@ impl Uploader {
 
         let version = option_env!("CARGO_PKG_VERSION").unwrap_or("0.0.1");
         let user_id = Self::compute_user_id();
+        let auth_token = self.get_auth_token().await;
+        let auth_token_ref = auth_token.as_deref();
 
         // 1. Get pre-signed URL for video (if path is available)
         let mut video_presign: Option<PresignResponse> = None;
@@ -140,7 +161,7 @@ impl Uploader {
                 .context("Failed to get video filename")?;
             let file_name = format!("recordings/{}", video_file);
             let presign_response = self
-                .request_presigned_url(endpoint, &file_name, version, &user_id)
+                .request_presigned_url(endpoint, &file_name, version, &user_id, auth_token_ref)
                 .await?;
             debug!(
                 "Got pre-signed URL for video chunk {} (key: {})",
@@ -153,7 +174,7 @@ impl Uploader {
         // 2. Get pre-signed URL for keylogs
         let keylog_file_name = format!("keylogs/input_{}.msgpack", chunk.chunk_id);
         let keylog_presign = self
-            .request_presigned_url(endpoint, &keylog_file_name, version, &user_id)
+            .request_presigned_url(endpoint, &keylog_file_name, version, &user_id, auth_token_ref)
             .await?;
         debug!(
             "Got pre-signed URL for keylogs chunk {} (key: {})",

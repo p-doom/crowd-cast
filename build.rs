@@ -5,6 +5,7 @@
 
 fn main() {
     configure_upload_endpoint();
+    configure_google_oauth();
 
     // Tell Cargo about the no_tray cfg
     println!("cargo::rustc-check-cfg=cfg(no_tray)");
@@ -82,6 +83,17 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ui/updater_darwin.m");
     println!("cargo:rerun-if-changed=src/ui/wizard_darwin.h");
     println!("cargo:rerun-if-changed=src/ui/wizard_darwin.m");
+}
+
+fn configure_google_oauth() {
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_GOOGLE_CLIENT_ID");
+    // Optional: OAuth is disabled if not set
+    if let Ok(client_id) = std::env::var("CROWD_CAST_GOOGLE_CLIENT_ID") {
+        let client_id = client_id.trim();
+        if !client_id.is_empty() {
+            println!("cargo:rustc-env=CROWD_CAST_GOOGLE_CLIENT_ID={client_id}");
+        }
+    }
 }
 
 fn configure_upload_endpoint() {

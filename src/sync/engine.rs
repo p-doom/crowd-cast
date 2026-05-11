@@ -426,6 +426,7 @@ impl SyncEngine {
         cmd_rx: mpsc::Receiver<EngineCommand>,
         status_tx: broadcast::Sender<EngineStatus>,
         notification_rx: mpsc::UnboundedReceiver<NotificationAction>,
+        auth: Option<Arc<tokio::sync::Mutex<crate::auth::AuthManager>>>,
     ) -> Self {
         let output_dir = config
             .recording
@@ -434,7 +435,7 @@ impl SyncEngine {
             .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"));
 
         let (upload_tx, upload_rx) = mpsc::unbounded_channel();
-        let uploader = Uploader::new(&config);
+        let uploader = Uploader::new(&config, auth);
         let segment_duration_secs = config.recording.segment_duration_secs;
         let delete_after_upload = config.upload.delete_after_upload;
 

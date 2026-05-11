@@ -3,6 +3,7 @@
 //! Captures paired screencast and input data for dataset collection.
 //! Uses embedded libobs for single-binary distribution.
 
+mod auth;
 mod capture;
 mod config;
 mod crash;
@@ -198,6 +199,15 @@ fn main() -> Result<()> {
     // Create engine channels
     let (cmd_tx, cmd_rx, status_tx, _status_rx) = create_engine_channels();
 
+    // Initialize optional Google OAuth auth manager
+    let auth_manager = option_env!("CROWD_CAST_GOOGLE_CLIENT_ID").map(|client_id| {
+        let mgr = auth::AuthManager::new(client_id);
+        if mgr.is_authenticated() {
+            info!("Authenticated as {}", mgr.email().unwrap_or("unknown"));
+        }
+        std::sync::Arc::new(tokio::sync::Mutex::new(mgr))
+    });
+
     // Create sync engine
     let engine = SyncEngine::new(
         config.clone(),
@@ -205,6 +215,7 @@ fn main() -> Result<()> {
         cmd_rx,
         status_tx.clone(),
         notification_rx,
+        auth_manager.clone(),
     );
 
     // Wrap runtime in Arc for sharing with signal handler
@@ -244,7 +255,7 @@ fn main() -> Result<()> {
 
         info!("Starting system tray on main thread");
 
-        match ui::TrayApp::new(tray_cmd_tx, tray_status_rx) {
+        match ui::TrayApp::new(tray_cmd_tx, tray_status_rx, auth_manager.clone(), Some(runtime.clone())) {
             Ok(tray) => {
                 if let Err(e) = tray.run() {
                     error!("Tray error: {}", e);

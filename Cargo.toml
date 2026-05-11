@@ -58,6 +58,11 @@ thiserror = "1"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# OAuth PKCE
+sha2 = "0.10"
+rand = "0.8"
+urlencoding = "2"
+
 # UUID for session IDs
 uuid = { version = "1", features = ["v4", "serde"] }
 
