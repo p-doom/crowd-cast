@@ -12,6 +12,7 @@ static NSMenu *menu = nil;
 static struct tray *currentTray = nil;
 static BOOL shouldExit = NO;
 static BOOL screenUnlocked = NO;
+static CFAbsoluteTime trayInitTime = 0;
 
 @interface TrayDelegate : NSObject <NSMenuDelegate, NSApplicationDelegate>
 @end
@@ -109,11 +110,20 @@ int tray_init(struct tray *tray) {
         // Register for screen-unlock notification to trigger restart.
         // After sleep→wake→unlock, SCK capture sources are stale and need
         // a full process restart to reinitialise.
+        // Grace period: ignore unlocks within 30s of launch to avoid a
+        // restart loop (the freshly restarted process would see the same
+        // unlock notification and exit again).
+        trayInitTime = CFAbsoluteTimeGetCurrent();
         [[NSDistributedNotificationCenter defaultCenter]
             addObserverForName:@"com.apple.screenIsUnlocked"
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *note) {
+                        CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - trayInitTime;
+                        if (elapsed < 30.0) {
+                            NSLog(@"Screen unlocked — ignoring (%.1fs since launch, grace period)", elapsed);
+                            return;
+                        }
                         NSLog(@"Screen unlocked — scheduling restart for fresh capture sources");
                         screenUnlocked = YES;
                     }];
