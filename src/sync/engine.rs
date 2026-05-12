@@ -1787,6 +1787,7 @@ unintended app video."
                         }
                         EngineCommand::Shutdown => {
                             info!("Shutdown command received");
+                            self.input_backend.stop();
                             self.stop_recording().await?;
                             self.flush_upload_buffer();
                             break;

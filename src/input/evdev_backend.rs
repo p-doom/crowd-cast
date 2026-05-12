@@ -194,6 +194,10 @@ impl InputBackend for EvdevBackend {
         Ok(())
     }
 
+    fn stop(&mut self) {
+        self.capturing.store(false, Ordering::SeqCst);
+    }
+
     fn current_timestamp(&self) -> Option<u64> {
         self.start_time.map(|t| t.elapsed().as_micros() as u64)
     }

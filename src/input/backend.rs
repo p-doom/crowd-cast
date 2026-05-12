@@ -10,6 +10,10 @@ pub trait InputBackend: Send + Sync {
     /// Events are sent to the provided channel
     fn start(&mut self, tx: mpsc::UnboundedSender<InputEvent>) -> Result<()>;
 
+    /// Stop capturing input events.
+    /// Should be called before process exit to allow the event tap to drain cleanly.
+    fn stop(&mut self);
+
     /// Get the current timestamp in microseconds since the backend started.
     /// Returns None if the backend hasn't been started yet.
     /// This is used to synchronize input events with video recording start time.

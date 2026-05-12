@@ -123,6 +123,16 @@ impl InputBackend for RdevBackend {
         Ok(())
     }
 
+    fn stop(&mut self) {
+        if self.capturing.load(Ordering::SeqCst) {
+            info!("Stopping rdev input capture...");
+            self.capturing.store(false, Ordering::SeqCst);
+            // Give the event tap callback time to see the flag and stop
+            // processing events before the process tears down the CFRunLoop.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     fn current_timestamp(&self) -> Option<u64> {
         self.start_time.map(|t| t.elapsed().as_micros() as u64)
     }
