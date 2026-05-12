@@ -18,6 +18,8 @@ SPARKLE_ARCHIVE_PATH=""
 SIGN_IDENTITY="${CROWD_CAST_MACOS_SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${CROWD_CAST_NOTARY_PROFILE:-crowdcast-notary}"
 API_GATEWAY_URL="${CROWD_CAST_API_GATEWAY_URL:-}"
+GOOGLE_CLIENT_ID="${CROWD_CAST_GOOGLE_CLIENT_ID:-}"
+GOOGLE_CLIENT_SECRET="${CROWD_CAST_GOOGLE_CLIENT_SECRET:-}"
 DMG_BACKGROUND="resources/macos/dmg-background@2x.png"
 NOTARIZE=0
 APP_VERSION="${CROWD_CAST_APP_VERSION:-}"
@@ -190,6 +192,16 @@ if [[ -z "$API_GATEWAY_URL" ]]; then
     exit 1
 fi
 
+if [[ -z "$GOOGLE_CLIENT_ID" ]]; then
+    echo "Missing Google OAuth client ID. Set CROWD_CAST_GOOGLE_CLIENT_ID." >&2
+    exit 1
+fi
+
+if [[ -z "$GOOGLE_CLIENT_SECRET" ]]; then
+    echo "Missing Google OAuth client secret. Set CROWD_CAST_GOOGLE_CLIENT_SECRET." >&2
+    exit 1
+fi
+
 APP_VERSION="${APP_VERSION:-$(default_version)}"
 BUILD_NUMBER="${BUILD_NUMBER:-$(date -u +%Y%m%d%H%M%S)}"
 
@@ -221,7 +233,10 @@ fi
 
 echo "Step 1/5: Build and sign app bundle..."
 if [[ "$BUILD_TYPE" == "debug" ]]; then
-    CROWD_CAST_API_GATEWAY_URL="$API_GATEWAY_URL" scripts/bundle-macos.sh \
+    CROWD_CAST_API_GATEWAY_URL="$API_GATEWAY_URL" \
+    CROWD_CAST_GOOGLE_CLIENT_ID="$GOOGLE_CLIENT_ID" \
+    CROWD_CAST_GOOGLE_CLIENT_SECRET="$GOOGLE_CLIENT_SECRET" \
+    scripts/bundle-macos.sh \
         --debug \
         --identity "$SIGN_IDENTITY" \
         --version "$APP_VERSION" \
@@ -230,7 +245,10 @@ if [[ "$BUILD_TYPE" == "debug" ]]; then
         --sparkle-public-ed-key "$SPARKLE_PUBLIC_ED_KEY" \
         --no-verify
 else
-    CROWD_CAST_API_GATEWAY_URL="$API_GATEWAY_URL" scripts/bundle-macos.sh \
+    CROWD_CAST_API_GATEWAY_URL="$API_GATEWAY_URL" \
+    CROWD_CAST_GOOGLE_CLIENT_ID="$GOOGLE_CLIENT_ID" \
+    CROWD_CAST_GOOGLE_CLIENT_SECRET="$GOOGLE_CLIENT_SECRET" \
+    scripts/bundle-macos.sh \
         --identity "$SIGN_IDENTITY" \
         --version "$APP_VERSION" \
         --build-number "$BUILD_NUMBER" \
