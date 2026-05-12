@@ -1,6 +1,6 @@
 [package]
 name = "crowd-cast-agent"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "crowd-cast data collection agent - captures paired screencast and input data"
 license = "MIT"
