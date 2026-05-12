@@ -49,6 +49,9 @@ extern "C" {
 
     /// Signal the event loop to exit
     pub fn tray_exit();
+
+    /// Returns true (once) if the screen was unlocked since last check
+    pub fn tray_screen_was_unlocked() -> bool;
 }
 
 // Stub implementations when tray is not available
@@ -68,6 +71,11 @@ pub unsafe fn tray_update(_tray: *mut Tray) {}
 
 #[cfg(no_tray)]
 pub unsafe fn tray_exit() {}
+
+#[cfg(no_tray)]
+pub unsafe fn tray_screen_was_unlocked() -> bool {
+    false
+}
 
 impl Default for Tray {
     fn default() -> Self {

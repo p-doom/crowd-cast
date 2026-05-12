@@ -11,6 +11,7 @@ static NSStatusItem *statusItem = nil;
 static NSMenu *menu = nil;
 static struct tray *currentTray = nil;
 static BOOL shouldExit = NO;
+static BOOL screenUnlocked = NO;
 
 @interface TrayDelegate : NSObject <NSMenuDelegate, NSApplicationDelegate>
 @end
@@ -104,6 +105,18 @@ int tray_init(struct tray *tray) {
                      atStart:YES];
         });
         [NSApp run];
+
+        // Register for screen-unlock notification to trigger restart.
+        // After sleep→wake→unlock, SCK capture sources are stale and need
+        // a full process restart to reinitialise.
+        [[NSDistributedNotificationCenter defaultCenter]
+            addObserverForName:@"com.apple.screenIsUnlocked"
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+                        NSLog(@"Screen unlocked — scheduling restart for fresh capture sources");
+                        screenUnlocked = YES;
+                    }];
 
         // Must be called on main thread - dispatch if needed
         if ([NSThread isMainThread]) {
@@ -213,4 +226,12 @@ void tray_update(struct tray *tray) {
 
 void tray_exit(void) {
     shouldExit = YES;
+}
+
+bool tray_screen_was_unlocked(void) {
+    if (screenUnlocked) {
+        screenUnlocked = NO;
+        return true;
+    }
+    return false;
 }

@@ -428,6 +428,15 @@ impl TrayApp {
                 break;
             }
 
+            // Check if screen was unlocked — restart for fresh capture sources
+            if unsafe { tray_ffi::tray_screen_was_unlocked() } {
+                info!("Screen unlocked — restarting for fresh capture sources");
+                let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
+                // Don't set QUIT_REQUESTED — we want a non-intentional exit
+                // so launchd restarts us via KeepAlive/Crashed.
+                break;
+            }
+
             if SIGN_IN_REQUESTED.swap(false, Ordering::SeqCst) {
                 self.handle_sign_in();
             }
