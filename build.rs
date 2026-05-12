@@ -87,11 +87,18 @@ fn main() {
 
 fn configure_google_oauth() {
     println!("cargo:rerun-if-env-changed=CROWD_CAST_GOOGLE_CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_GOOGLE_CLIENT_SECRET");
     // Optional: OAuth is disabled if not set
     if let Ok(client_id) = std::env::var("CROWD_CAST_GOOGLE_CLIENT_ID") {
         let client_id = client_id.trim();
         if !client_id.is_empty() {
             println!("cargo:rustc-env=CROWD_CAST_GOOGLE_CLIENT_ID={client_id}");
+        }
+    }
+    if let Ok(client_secret) = std::env::var("CROWD_CAST_GOOGLE_CLIENT_SECRET") {
+        let client_secret = client_secret.trim();
+        if !client_secret.is_empty() {
+            println!("cargo:rustc-env=CROWD_CAST_GOOGLE_CLIENT_SECRET={client_secret}");
         }
     }
 }

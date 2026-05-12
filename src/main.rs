@@ -201,7 +201,8 @@ fn main() -> Result<()> {
 
     // Initialize optional Google OAuth auth manager
     let auth_manager = option_env!("CROWD_CAST_GOOGLE_CLIENT_ID").map(|client_id| {
-        let mgr = auth::AuthManager::new(client_id);
+        let client_secret = option_env!("CROWD_CAST_GOOGLE_CLIENT_SECRET").unwrap_or("");
+        let mgr = auth::AuthManager::new(client_id, client_secret);
         if mgr.is_authenticated() {
             info!("Authenticated as {}", mgr.email().unwrap_or("unknown"));
         }

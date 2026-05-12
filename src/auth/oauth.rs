@@ -29,11 +29,13 @@ pub struct AuthManager {
     state: Option<AuthState>,
     /// Google OAuth client ID (compile-time).
     client_id: String,
+    /// Google OAuth client secret (compile-time, not confidential for desktop apps).
+    client_secret: String,
 }
 
 impl AuthManager {
     /// Create a new AuthManager, loading persisted state if available.
-    pub fn new(client_id: &str) -> Self {
+    pub fn new(client_id: &str, client_secret: &str) -> Self {
         let state = Self::auth_path()
             .and_then(|p| std::fs::read_to_string(&p).ok())
             .and_then(|s| serde_json::from_str::<AuthState>(&s).ok());
@@ -45,6 +47,7 @@ impl AuthManager {
         Self {
             state,
             client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
         }
     }
 
@@ -147,6 +150,7 @@ impl AuthManager {
         info!("Exchanging authorization code for tokens...");
         let token_response = Self::exchange_code(
             &self.client_id,
+            &self.client_secret,
             &auth_code,
             &redirect_uri,
             &code_verifier,
@@ -197,6 +201,7 @@ impl AuthManager {
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &state.refresh_token),
                 ("client_id", &self.client_id),
+                ("client_secret", &self.client_secret),
             ])
             .send()
             .await
@@ -302,6 +307,7 @@ impl AuthManager {
     /// Exchange the authorization code for tokens.
     async fn exchange_code(
         client_id: &str,
+        client_secret: &str,
         code: &str,
         redirect_uri: &str,
         code_verifier: &str,
@@ -314,6 +320,7 @@ impl AuthManager {
                 ("code", code),
                 ("redirect_uri", redirect_uri),
                 ("client_id", client_id),
+                ("client_secret", client_secret),
                 ("code_verifier", code_verifier),
             ])
             .send()
