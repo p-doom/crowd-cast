@@ -256,7 +256,7 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
     // Note: plist changes (e.g., KeepAlive) take effect on next launchd service
     // load (next login or next service restart). We intentionally do NOT
     // bootout+bootstrap here because that would kill the currently running
-    // process and spawn a duplicate.
+    // process ungracefully (losing in-flight recordings).
 
     Ok(())
 }
@@ -299,10 +299,28 @@ fn is_current_macos_launch_agent_healthy(config: &AutostartConfig) -> Result<boo
     let contents = std::fs::read_to_string(&plist_path)
         .with_context(|| format!("Failed to read LaunchAgent plist at {:?}", plist_path))?;
 
-    // Check label, exe path, and KeepAlive dict (not unconditional true).
+    // Check label, exe path, and KeepAlive/SuccessfulExit (not the old Crashed key).
     Ok(contents.contains(MACOS_AUTOSTART_LABEL)
         && contents.contains(&format!("<string>{}</string>", expected_exe))
-        && (contents.contains("<key>SuccessfulExit</key>") || contents.contains("<key>Crashed</key>")))
+        && contents.contains("<key>SuccessfulExit</key>"))
+}
+
+/// Check if the launchd plist supports restart on non-zero exit.
+/// Returns false if the plist still uses the old `Crashed` key or doesn't exist.
+#[cfg(target_os = "macos")]
+pub fn launchd_supports_exit_restart() -> bool {
+    let Ok(plist_path) = get_launch_agent_path() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(&plist_path) else {
+        return false;
+    };
+    contents.contains("<key>SuccessfulExit</key>")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn launchd_supports_exit_restart() -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
