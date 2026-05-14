@@ -220,8 +220,8 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
     <true/>
     <key>KeepAlive</key>
     <dict>
-        <key>SuccessfulExit</key>
-        <false/>
+        <key>Crashed</key>
+        <true/>
     </dict>
     <key>ProcessType</key>
     <string>Interactive</string>
@@ -299,38 +299,10 @@ fn is_current_macos_launch_agent_healthy(config: &AutostartConfig) -> Result<boo
     let contents = std::fs::read_to_string(&plist_path)
         .with_context(|| format!("Failed to read LaunchAgent plist at {:?}", plist_path))?;
 
-    // Check label, exe path, and KeepAlive/SuccessfulExit (not the old Crashed key).
+    // Check label, exe path, and KeepAlive/Crashed dict (not unconditional true).
     Ok(contents.contains(MACOS_AUTOSTART_LABEL)
         && contents.contains(&format!("<string>{}</string>", expected_exe))
-        && contents.contains("<key>SuccessfulExit</key>"))
-}
-
-/// Set to true when `reconcile_autostart` rewrites the plist this session.
-/// When true, launchd still has the old config in memory, so exit-restart
-/// would fail (launchd wouldn't respawn us).
-static PLIST_REPAIRED_THIS_SESSION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Check if the launchd plist supports restart on non-zero exit AND
-/// launchd has actually loaded it (i.e., the plist wasn't just repaired
-/// this session).
-#[cfg(target_os = "macos")]
-pub fn launchd_supports_exit_restart() -> bool {
-    if PLIST_REPAIRED_THIS_SESSION.load(std::sync::atomic::Ordering::SeqCst) {
-        return false;
-    }
-    let Ok(plist_path) = get_launch_agent_path() else {
-        return false;
-    };
-    let Ok(contents) = std::fs::read_to_string(&plist_path) else {
-        return false;
-    };
-    contents.contains("<key>SuccessfulExit</key>")
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn launchd_supports_exit_restart() -> bool {
-    false
+        && contents.contains("<key>Crashed</key>"))
 }
 
 #[cfg(target_os = "macos")]
@@ -474,7 +446,6 @@ pub fn reconcile_autostart(config: &AutostartConfig, should_enable: bool) -> Res
                     healthy, disabled
                 );
                 enable_autostart(config)?;
-                PLIST_REPAIRED_THIS_SESSION.store(true, std::sync::atomic::Ordering::SeqCst);
             }
 
             return Ok(());

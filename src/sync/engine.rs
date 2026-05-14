@@ -1785,6 +1785,12 @@ unintended app video."
                             info!("User requested switch to display {}", display_id);
                             self.switch_to_display(display_id);
                         }
+                        EngineCommand::RestartProcess => {
+                            info!("Restart requested — exec()ing for fresh capture sources");
+                            self.input_backend.stop();
+                            self.stop_recording().await.ok();
+                            restart_process();
+                        }
                         EngineCommand::Shutdown => {
                             info!("Shutdown command received");
                             self.input_backend.stop();
