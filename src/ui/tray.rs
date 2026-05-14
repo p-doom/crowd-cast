@@ -428,13 +428,18 @@ impl TrayApp {
                 break;
             }
 
-            // Check if screen was unlocked — restart for fresh capture sources
+            // Check if screen was unlocked — restart for fresh capture sources.
+            // Only do this if launchd is configured to restart on non-zero exit
+            // (SuccessfulExit). With the old Crashed plist, exiting would just
+            // kill the app with no restart — worse than staying alive.
             if unsafe { tray_ffi::tray_screen_was_unlocked() } {
-                info!("Screen unlocked — restarting for fresh capture sources");
-                let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
-                // Don't set QUIT_REQUESTED — we want a non-intentional exit
-                // so launchd restarts us via KeepAlive/Crashed.
-                break;
+                if crate::installer::launchd_supports_exit_restart() {
+                    info!("Screen unlocked — restarting for fresh capture sources");
+                    let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
+                    break;
+                } else {
+                    info!("Screen unlocked — skipping restart (plist not migrated yet)");
+                }
             }
 
             if SIGN_IN_REQUESTED.swap(false, Ordering::SeqCst) {
