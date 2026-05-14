@@ -305,10 +305,20 @@ fn is_current_macos_launch_agent_healthy(config: &AutostartConfig) -> Result<boo
         && contents.contains("<key>SuccessfulExit</key>"))
 }
 
-/// Check if the launchd plist supports restart on non-zero exit.
-/// Returns false if the plist still uses the old `Crashed` key or doesn't exist.
+/// Set to true when `reconcile_autostart` rewrites the plist this session.
+/// When true, launchd still has the old config in memory, so exit-restart
+/// would fail (launchd wouldn't respawn us).
+static PLIST_REPAIRED_THIS_SESSION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Check if the launchd plist supports restart on non-zero exit AND
+/// launchd has actually loaded it (i.e., the plist wasn't just repaired
+/// this session).
 #[cfg(target_os = "macos")]
 pub fn launchd_supports_exit_restart() -> bool {
+    if PLIST_REPAIRED_THIS_SESSION.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
     let Ok(plist_path) = get_launch_agent_path() else {
         return false;
     };
@@ -464,6 +474,7 @@ pub fn reconcile_autostart(config: &AutostartConfig, should_enable: bool) -> Res
                     healthy, disabled
                 );
                 enable_autostart(config)?;
+                PLIST_REPAIRED_THIS_SESSION.store(true, std::sync::atomic::Ordering::SeqCst);
             }
 
             return Ok(());
