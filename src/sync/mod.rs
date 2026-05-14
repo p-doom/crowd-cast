@@ -32,6 +32,8 @@ pub enum EngineCommand {
     Panic,
     /// User requested switch to a specific display (from notification action)
     SwitchToDisplay { display_id: u32 },
+    /// Restart the process (exec) for fresh capture sources after unlock
+    RestartProcess,
     /// Shutdown the engine
     Shutdown,
 }
