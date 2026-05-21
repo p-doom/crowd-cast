@@ -1472,6 +1472,11 @@ unintended app video."
 
                     // Branch 3: Retry timer fires
                     _ = async {
+                        if uploads_paused.load(AtomicOrdering::SeqCst) {
+                            // Poll periodically so we notice when uploads resume
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            return;
+                        }
                         match next_retry_at {
                             Some(deadline) => tokio::time::sleep_until(deadline).await,
                             None => std::future::pending().await,
