@@ -205,7 +205,7 @@ void tray_update(struct tray *tray) {
                     NSImage *image = [[NSImage alloc] initWithContentsOfFile:path];
                     if (image != nil) {
                         [image setSize:NSMakeSize(18, 18)];
-                        [image setTemplate:NO];
+                        [image setTemplate:YES];
                         statusItem.button.image = image;
                     }
                 }

@@ -944,10 +944,19 @@ fn get_icon_paths() -> Result<TrayIconPaths> {
         blocked: icon_dir.join(format!("tray_blocked.{}", ext)),
     };
 
-    let needs_create = !paths.idle.exists() || !paths.recording.exists() || !paths.blocked.exists();
+    // Regenerate icons if any are missing or if the app version changed
+    // (ensures updated icon assets are picked up after an update).
+    let version_file = icon_dir.join("tray_version");
+    let current_version = env!("CARGO_PKG_VERSION");
+    let cached_version = std::fs::read_to_string(&version_file).unwrap_or_default();
+    let needs_create = cached_version.trim() != current_version
+        || !paths.idle.exists()
+        || !paths.recording.exists()
+        || !paths.blocked.exists();
 
     if needs_create {
         create_tray_icons(&paths)?;
+        let _ = std::fs::write(&version_file, current_version);
         info!("Created tray icons in {:?}", icon_dir);
     }
 
@@ -957,21 +966,31 @@ fn get_icon_paths() -> Result<TrayIconPaths> {
 fn create_tray_icons(paths: &TrayIconPaths) -> Result<()> {
     let size = 32u32;
     let base = load_base_icon(size);
-    let variants = [
-        (TrayIconState::Idle, [158, 158, 158, 255], &paths.idle),
-        (
-            TrayIconState::Recording,
-            [76, 175, 80, 255],
-            &paths.recording,
-        ),
-        (TrayIconState::Blocked, [255, 152, 0, 255], &paths.blocked),
-    ];
 
-    for (state, color, path) in variants {
+    // Template icons: black on transparent. macOS renders them in the
+    // correct menu bar foreground color automatically.
+    // Idle: no dot. Recording: filled dot. Blocked: hollow ring.
+    let black = [0u8, 0, 0, 255];
+
+    // Idle — just the logo, no dot
+    {
+        let img = base.clone();
+        img.save(&paths.idle)?;
+        debug!("Tray icon generated for Idle: {:?}", paths.idle);
+    }
+    // Recording — filled dot
+    {
         let mut img = base.clone();
-        apply_status_dot(&mut img, color);
-        img.save(path)?;
-        debug!("Tray icon generated for {:?}: {:?}", state, path);
+        apply_status_dot(&mut img, black);
+        img.save(&paths.recording)?;
+        debug!("Tray icon generated for Recording: {:?}", paths.recording);
+    }
+    // Blocked — hollow ring
+    {
+        let mut img = base.clone();
+        apply_status_ring(&mut img, black);
+        img.save(&paths.blocked)?;
+        debug!("Tray icon generated for Blocked: {:?}", paths.blocked);
     }
 
     Ok(())
@@ -999,9 +1018,9 @@ fn create_fallback_icon(size: u32) -> RgbaImage {
             let radius = size as f32 / 2.0 - 2.0;
 
             if dist < radius {
-                rgba.push(68);
-                rgba.push(68);
-                rgba.push(68);
+                rgba.push(0);
+                rgba.push(0);
+                rgba.push(0);
                 rgba.push(255);
             } else {
                 rgba.push(0);
@@ -1031,6 +1050,29 @@ fn apply_status_dot(img: &mut RgbaImage, color: [u8; 4]) {
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
             if (dx * dx + dy * dy).sqrt() <= radius {
+                img.put_pixel(x, y, image::Rgba(color));
+            }
+        }
+    }
+}
+
+fn apply_status_ring(img: &mut RgbaImage, color: [u8; 4]) {
+    let size = img.width().min(img.height());
+    if size == 0 {
+        return;
+    }
+
+    let radius = size as f32 * 0.18;
+    let cx = size as f32 - radius - 2.0;
+    let cy = size as f32 - radius - 2.0;
+    let inner_radius = radius * 0.55;
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= radius && dist >= inner_radius {
                 img.put_pixel(x, y, image::Rgba(color));
             }
         }
