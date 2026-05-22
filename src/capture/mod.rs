@@ -20,7 +20,8 @@ pub use apps::{list_capturable_apps, list_running_apps};
 pub use context::{CaptureContext, RecordingSession};
 pub use frontmost::{get_frontmost_app, AppInfo};
 pub use recording::{
-    RecordingConfig, RecordingOutput, RecordingOutputBuilder, RecordingState, VideoCodecPreference,
+    calculate_output_dimensions, RecordingConfig, RecordingOutput, RecordingOutputBuilder,
+    RecordingState, VideoCodecPreference,
 };
 pub use recovery::{get_display_name, get_display_uuid, DisplayChangeEvent, DisplayMonitor};
 pub use sources::{get_main_display_resolution, get_main_display_uuid, ScreenCaptureSource};

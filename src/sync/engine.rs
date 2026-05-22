@@ -1267,12 +1267,17 @@ unintended app video."
     /// Emit a metadata event with the current display resolution.
     /// Called once at the start of each segment (before the first context event).
     fn emit_metadata_event(&mut self, timestamp_us: u64) {
-        let (w, h) = self.display_resolution;
+        let (dw, dh) = self.display_resolution;
+        let (ow, oh) = crate::capture::calculate_output_dimensions(dw, dh, 1080);
+        let utc_now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.event_buffer.push(InputEvent {
             timestamp_us,
             event: EventType::Metadata(MetadataEvent {
-                display_width: w,
-                display_height: h,
+                display_width: dw,
+                display_height: dh,
+                output_width: ow,
+                output_height: oh,
+                timestamp_utc: utc_now,
             }),
         });
     }

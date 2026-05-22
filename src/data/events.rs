@@ -111,7 +111,7 @@ pub struct MouseScrollEvent {
     pub y: f64,
 }
 
-/// Segment metadata (display resolution, agent version, etc.)
+/// Segment metadata (display resolution, timing, video output dimensions)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataEvent {
     /// Native display width in logical points
@@ -119,6 +119,15 @@ pub struct MetadataEvent {
 
     /// Native display height in logical points
     pub display_height: u32,
+
+    /// Video output width in pixels (after downscale)
+    pub output_width: u32,
+
+    /// Video output height in pixels (after downscale)
+    pub output_height: u32,
+
+    /// UTC timestamp when this segment started (ISO 8601)
+    pub timestamp_utc: String,
 }
 
 impl From<rdev::Key> for KeyEvent {
