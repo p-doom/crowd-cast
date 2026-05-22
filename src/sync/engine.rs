@@ -106,7 +106,6 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PersistedRecordingState {
     Recording,
-    Paused,
     Stopped,
 }
 
@@ -119,8 +118,7 @@ fn read_recording_state() -> Option<PersistedRecordingState> {
     let path = recording_state_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
     match content.trim() {
-        "recording" => Some(PersistedRecordingState::Recording),
-        "paused" => Some(PersistedRecordingState::Paused),
+        "recording" | "paused" => Some(PersistedRecordingState::Recording),
         "stopped" => Some(PersistedRecordingState::Stopped),
         _ => None,
     }
@@ -135,7 +133,6 @@ fn write_recording_state(state: PersistedRecordingState) {
     }
     let s = match state {
         PersistedRecordingState::Recording => "recording",
-        PersistedRecordingState::Paused => "paused",
         PersistedRecordingState::Stopped => "stopped",
     };
     if let Err(e) = std::fs::write(&path, s) {
@@ -224,7 +221,6 @@ fn remove_pending_upload(chunk_id: &str) {
 enum StatusKind {
     Idle,
     Capturing,
-    Paused,
     RecordingBlocked,
     WaitingForOBS,
     Uploading,
@@ -236,7 +232,7 @@ impl StatusKind {
         match status {
             EngineStatus::Idle => Self::Idle,
             EngineStatus::Capturing { .. } => Self::Capturing,
-            EngineStatus::Paused => Self::Paused,
+            EngineStatus::Paused => Self::Idle,
             EngineStatus::RecordingBlocked => Self::RecordingBlocked,
             EngineStatus::WaitingForOBS => Self::WaitingForOBS,
             EngineStatus::Uploading { .. } => Self::Uploading,
@@ -1561,7 +1557,7 @@ unintended app video."
         });
 
         match desired_state {
-            PersistedRecordingState::Recording | PersistedRecordingState::Paused => {
+            PersistedRecordingState::Recording => {
                 info!("Restoring recording state: {:?}", desired_state);
                 if let Err(e) = self.start_recording().await {
                     error!("Failed to start recording: {}", e);
@@ -1571,9 +1567,6 @@ unintended app video."
                     )));
                 } else {
                     self.reset_segment_timer();
-                    if desired_state == PersistedRecordingState::Paused {
-                        self.pause_recording();
-                    }
                 }
             }
             PersistedRecordingState::Stopped => {
@@ -1693,22 +1686,6 @@ unintended app video."
                             self.stop_recording().await?;
                             write_recording_state(PersistedRecordingState::Stopped);
                             self.reset_segment_timer();
-                        }
-                        EngineCommand::PauseRecording => {
-                            let was_paused = self.is_paused;
-                            self.pause_recording();
-                            if !was_paused && self.is_paused {
-                                write_recording_state(PersistedRecordingState::Paused);
-                                self.reset_segment_timer();
-                            }
-                        }
-                        EngineCommand::ResumeRecording => {
-                            let was_paused = self.is_paused;
-                            self.resume_recording();
-                            if was_paused && !self.is_paused {
-                                write_recording_state(PersistedRecordingState::Recording);
-                                self.reset_segment_timer();
-                            }
                         }
                         EngineCommand::PrepareForUpdate => {
                             info!("Preparing for update install");

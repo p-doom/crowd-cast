@@ -43,7 +43,6 @@ fn status_blocks_immediate_update(status: &EngineStatus) -> bool {
     matches!(
         status,
         EngineStatus::Capturing { .. }
-            | EngineStatus::Paused
             | EngineStatus::RecordingBlocked
             | EngineStatus::Uploading { .. }
     )
@@ -77,7 +76,6 @@ fn next_prepare_for_update_action(
 enum TrayIconState {
     Idle,
     Recording,
-    Paused,
     Blocked,
 }
 
@@ -106,7 +104,6 @@ impl TrayIconSet {
         match state {
             TrayIconState::Idle => self.idle.as_ptr(),
             TrayIconState::Recording => self.recording.as_ptr(),
-            TrayIconState::Paused => self.idle.as_ptr(), // Use idle (grey) icon when paused
             TrayIconState::Blocked => self.blocked.as_ptr(),
         }
     }
@@ -161,8 +158,6 @@ impl TrayApp {
         let status_text = CString::new("Status: Idle")?;
         let separator = CString::new("-")?;
         let start_text = CString::new("Start Recording")?;
-        let pause_text = CString::new("Pause Recording")?;
-        let resume_text = CString::new("Resume Recording")?;
         let stop_text = CString::new("Stop Recording")?;
         let panic_text = CString::new("Delete last 10 minutes")?;
         let pause_uploads_text = CString::new("Pause Uploads")?;
@@ -201,22 +196,20 @@ impl TrayApp {
             account_text,         // 1  — "Signed in as X" (disabled display)
             separator.clone(),    // 2
             start_text,           // 3
-            pause_text,           // 4
-            resume_text,          // 5
-            stop_text,            // 6
-            panic_text,           // 7
-            separator.clone(),    // 8
-            pause_uploads_text,   // 9
-            sign_action_text,     // 10 — "Sign in with Google" / "Sign out"
-            settings_text,        // 11
-            updates_text,         // 12
-            separator.clone(),    // 13
-            quit_text,            // 14
+            stop_text,            // 4
+            panic_text,           // 5
+            separator.clone(),    // 6
+            pause_uploads_text,   // 7
+            sign_action_text,     // 8 — "Sign in with Google" / "Sign out"
+            settings_text,        // 9
+            updates_text,         // 10
+            separator.clone(),    // 11
+            quit_text,            // 12
         ];
 
         // Build menu items array (NULL-terminated)
-        // Menu indices: 0=status, 1=account, 2=sep, 3=start, 4=pause, 5=resume, 6=stop,
-        //   7=panic, 8=sep, 9=pause_uploads, 10=sign_action, 11=settings, 12=updates, 13=sep, 14=quit
+        // Menu indices: 0=status, 1=account, 2=sep, 3=start, 4=stop,
+        //   5=panic, 6=sep, 7=pause_uploads, 8=sign_action, 9=settings, 10=updates, 11=sep, 12=quit
         let mut menu_items = vec![
             TrayMenuItem {
                 text: menu_strings[0].as_ptr(), // Status
@@ -247,77 +240,63 @@ impl TrayApp {
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[4].as_ptr(), // Pause Recording
-                disabled: 1,
-                checked: 0,
-                cb: Some(on_pause_recording),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[5].as_ptr(), // Resume Recording
-                disabled: 1,
-                checked: 0,
-                cb: Some(on_resume_recording),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[6].as_ptr(), // Stop Recording
+                text: menu_strings[4].as_ptr(), // Stop Recording
                 disabled: 1,
                 checked: 0,
                 cb: Some(on_stop_capture),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[7].as_ptr(), // Panic
+                text: menu_strings[5].as_ptr(), // Panic
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_panic),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[8].as_ptr(), // separator
+                text: menu_strings[6].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[9].as_ptr(), // Pause Uploads
+                text: menu_strings[7].as_ptr(), // Pause Uploads
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_toggle_uploads),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[10].as_ptr(), // Sign in / Sign out
+                text: menu_strings[8].as_ptr(), // Sign in / Sign out
                 disabled: if auth.is_none() { 1 } else { 0 },
                 checked: 0,
                 cb: Some(on_sign_in),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[11].as_ptr(), // Settings
+                text: menu_strings[9].as_ptr(), // Settings
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_settings),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[12].as_ptr(), // Check for Updates
+                text: menu_strings[10].as_ptr(), // Check for Updates
                 disabled: 1,
                 checked: 0,
                 cb: Some(on_check_for_updates),
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[13].as_ptr(), // separator
+                text: menu_strings[11].as_ptr(), // separator
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
             TrayMenuItem {
-                text: menu_strings[14].as_ptr(), // Quit
+                text: menu_strings[12].as_ptr(), // Quit
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_quit),
@@ -383,8 +362,8 @@ impl TrayApp {
         if self.uploads_paused {
             info!("Uploads paused (restored from previous session)");
             let new_text = CString::new("Resume Uploads").unwrap_or_default();
-            self._menu_strings[9] = new_text;
-            self._menu_items[9].text = self._menu_strings[9].as_ptr();
+            self._menu_strings[7] = new_text;
+            self._menu_items[7].text = self._menu_strings[7].as_ptr();
             self.tray.menu = self._menu_items.as_mut_ptr();
             unsafe { tray_ffi::tray_update(&mut self.tray); }
         }
@@ -458,14 +437,13 @@ impl TrayApp {
                     info!("Uploads resumed by user");
                     let _ = self.cmd_tx.try_send(EngineCommand::ResumeUploads);
                 }
-                // Update menu text: index 7 is the uploads toggle
                 let new_text = if self.uploads_paused {
                     CString::new("Resume Uploads").unwrap_or_default()
                 } else {
                     CString::new("Pause Uploads").unwrap_or_default()
                 };
-                self._menu_strings[9] = new_text;
-                self._menu_items[9].text = self._menu_strings[9].as_ptr();
+                self._menu_strings[7] = new_text;
+                self._menu_items[7].text = self._menu_strings[7].as_ptr();
                 self.tray.menu = self._menu_items.as_mut_ptr();
                 unsafe { tray_ffi::tray_update(&mut self.tray); }
             }
@@ -531,8 +509,7 @@ impl TrayApp {
         #[derive(Clone, Copy, PartialEq)]
         enum MenuState {
             Idle,      // Show: Start
-            Recording, // Show: Pause, Stop
-            Paused,    // Show: Resume, Stop
+            Recording, // Show: Stop
         }
 
         let (status_text, icon_state, menu_state) = match status {
@@ -547,9 +524,9 @@ impl TrayApp {
                 MenuState::Recording,
             ),
             EngineStatus::Paused => (
-                "Status: Paused".to_string(),
-                TrayIconState::Paused,
-                MenuState::Paused,
+                "Status: Idle (paused)".to_string(),
+                TrayIconState::Idle,
+                MenuState::Recording,
             ),
             EngineStatus::RecordingBlocked => (
                 "Status: Recording (no capture sources)".to_string(),
@@ -581,28 +558,15 @@ impl TrayApp {
                 self._menu_items[0].text = self._menu_strings[0].as_ptr();
 
                 // Update menu item visibility based on state
-                // Menu indices: 3=start, 4=pause, 5=resume, 6=stop
+                // Menu indices: 3=start, 4=stop
                 match menu_state {
                     MenuState::Idle => {
-                        // Show: Start, Hide: Pause, Resume, Stop
                         self._menu_items[3].disabled = 0; // Start - enabled
-                        self._menu_items[4].disabled = 1; // Pause - disabled
-                        self._menu_items[5].disabled = 1; // Resume - disabled
-                        self._menu_items[6].disabled = 1; // Stop - disabled
+                        self._menu_items[4].disabled = 1; // Stop - disabled
                     }
                     MenuState::Recording => {
-                        // Show: Pause, Stop, Hide: Start, Resume
                         self._menu_items[3].disabled = 1; // Start - disabled
-                        self._menu_items[4].disabled = 0; // Pause - enabled
-                        self._menu_items[5].disabled = 1; // Resume - disabled
-                        self._menu_items[6].disabled = 0; // Stop - enabled
-                    }
-                    MenuState::Paused => {
-                        // Show: Resume, Stop, Hide: Start, Pause
-                        self._menu_items[3].disabled = 1; // Start - disabled
-                        self._menu_items[4].disabled = 1; // Pause - disabled
-                        self._menu_items[5].disabled = 0; // Resume - enabled
-                        self._menu_items[6].disabled = 0; // Stop - enabled
+                        self._menu_items[4].disabled = 0; // Stop - enabled
                     }
                 }
 
@@ -632,7 +596,7 @@ impl TrayApp {
         }
 
         self.last_updater_can_check = Some(can_check);
-        self._menu_items[12].disabled = if can_check { 0 } else { 1 };
+        self._menu_items[10].disabled = if can_check { 0 } else { 1 };
 
         self.tray.menu = self._menu_items.as_mut_ptr();
         unsafe {
@@ -692,16 +656,16 @@ impl TrayApp {
                     self._menu_strings[1] = account;
                     self._menu_items[1].text = self._menu_strings[1].as_ptr();
                     let sign_out = CString::new("Sign out").unwrap_or_default();
-                    self._menu_strings[10] = sign_out;
-                    self._menu_items[10].text = self._menu_strings[10].as_ptr();
+                    self._menu_strings[8] = sign_out;
+                    self._menu_items[8].text = self._menu_strings[8].as_ptr();
                 } else {
                     // Signed out: clear account display + "Sign in with Google" action
                     let empty = CString::new("").unwrap_or_default();
                     self._menu_strings[1] = empty;
                     self._menu_items[1].text = self._menu_strings[1].as_ptr();
                     let sign_in = CString::new("Sign in with Google").unwrap_or_default();
-                    self._menu_strings[10] = sign_in;
-                    self._menu_items[10].text = self._menu_strings[10].as_ptr();
+                    self._menu_strings[8] = sign_in;
+                    self._menu_items[8].text = self._menu_strings[8].as_ptr();
                 }
             }
         }
@@ -765,7 +729,6 @@ mod tests {
         assert!(status_blocks_immediate_update(&EngineStatus::Capturing {
             event_count: 1
         }));
-        assert!(status_blocks_immediate_update(&EngineStatus::Paused));
         assert!(status_blocks_immediate_update(
             &EngineStatus::RecordingBlocked
         ));
@@ -808,6 +771,10 @@ mod tests {
             PrepareForUpdateAction::SendCommand
         );
         assert_eq!(
+            next_prepare_for_update_action(true, Some(&EngineStatus::Paused)),
+            PrepareForUpdateAction::SendCommand
+        );
+        assert_eq!(
             next_prepare_for_update_action(true, Some(&EngineStatus::Idle)),
             PrepareForUpdateAction::ClearRequest
         );
@@ -825,7 +792,7 @@ mod tests {
             PrepareForUpdateAction::Wait
         );
         assert_eq!(
-            next_prepare_for_update_action(false, Some(&EngineStatus::Paused)),
+            next_prepare_for_update_action(false, Some(&EngineStatus::Idle)),
             PrepareForUpdateAction::Wait
         );
     }
@@ -857,24 +824,6 @@ unsafe extern "C" fn on_stop_capture(_item: *mut TrayMenuItem) {
         // Use try_send to avoid blocking (can't use blocking_send inside tokio runtime)
         if let Err(e) = sender.try_send(EngineCommand::StopRecording) {
             error!("Failed to send stop recording command: {}", e);
-        }
-    }
-}
-
-unsafe extern "C" fn on_pause_recording(_item: *mut TrayMenuItem) {
-    info!("Pause recording requested via tray");
-    if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
-        if let Err(e) = sender.try_send(EngineCommand::PauseRecording) {
-            error!("Failed to send pause recording command: {}", e);
-        }
-    }
-}
-
-unsafe extern "C" fn on_resume_recording(_item: *mut TrayMenuItem) {
-    info!("Resume recording requested via tray");
-    if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
-        if let Err(e) = sender.try_send(EngineCommand::ResumeRecording) {
-            error!("Failed to send resume recording command: {}", e);
         }
     }
 }

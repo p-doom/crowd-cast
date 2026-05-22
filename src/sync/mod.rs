@@ -11,10 +11,6 @@ pub enum EngineCommand {
     StartRecording,
     /// Manually stop recording
     StopRecording,
-    /// Pause recording (both video and keylog)
-    PauseRecording,
-    /// Resume recording (both video and keylog)
-    ResumeRecording,
     /// Stop recording cleanly so a pending auto-update can install
     PrepareForUpdate,
     /// Recreate the active capture source
