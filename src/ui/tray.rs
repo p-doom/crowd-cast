@@ -51,7 +51,7 @@ fn status_blocks_immediate_update(status: &EngineStatus) -> bool {
 fn status_needs_prepare_for_update(status: &EngineStatus) -> bool {
     matches!(
         status,
-        EngineStatus::Capturing { .. } | EngineStatus::RecordingBlocked
+        EngineStatus::Capturing { .. } | EngineStatus::Paused | EngineStatus::RecordingBlocked
     )
 }
 
@@ -750,6 +750,7 @@ mod tests {
         assert!(status_needs_prepare_for_update(&EngineStatus::Capturing {
             event_count: 1
         }));
+        assert!(status_needs_prepare_for_update(&EngineStatus::Paused));
         assert!(status_needs_prepare_for_update(
             &EngineStatus::RecordingBlocked
         ));
@@ -767,6 +768,10 @@ mod tests {
     fn prepare_for_update_action_is_one_shot_and_status_driven() {
         assert_eq!(
             next_prepare_for_update_action(true, Some(&EngineStatus::Capturing { event_count: 1 })),
+            PrepareForUpdateAction::SendCommand
+        );
+        assert_eq!(
+            next_prepare_for_update_action(true, Some(&EngineStatus::Paused)),
             PrepareForUpdateAction::SendCommand
         );
         assert_eq!(
