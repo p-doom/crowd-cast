@@ -1468,7 +1468,10 @@ void show_restart_mac_alert(void) {
         alert.informativeText =
             @"CrowdCast cannot capture your screen. This usually happens "
              "after a display configuration change.\n\n"
-             "Please restart your Mac to fix this.";
+             "Try one of these fixes:\n"
+             "1. Disconnect and reconnect your monitor\n"
+             "2. Log out and back in\n"
+             "3. Restart your Mac";
         alert.alertStyle = NSAlertStyleCritical;
         [alert addButtonWithTitle:@"OK"];
 
