@@ -194,11 +194,22 @@ void tray_update(struct tray *tray) {
         @autoreleasepool {
             @try {
                 currentTray = tray;
-                
-                if (statusItem == nil) {
-                    return;
+
+                // Recover from macOS dropping the status item (known SystemUIServer bug).
+                // If the button or its image vanishes, recreate the entire status item.
+                if (statusItem == nil || statusItem.button == nil) {
+                    NSLog(@"Status item lost — recreating");
+                    statusItem = [[NSStatusBar systemStatusBar]
+                        statusItemWithLength:NSVariableStatusItemLength];
+                    if (statusItem == nil) {
+                        NSLog(@"Failed to recreate status item");
+                        return;
+                    }
                 }
-                
+
+                // Always ensure visible (macOS can hide items after display changes)
+                statusItem.visible = YES;
+
                 // Update icon
                 if (tray->icon_filepath != NULL) {
                     NSString *path = [NSString stringWithUTF8String:tray->icon_filepath];
@@ -209,12 +220,12 @@ void tray_update(struct tray *tray) {
                         statusItem.button.image = image;
                     }
                 }
-                
+
                 // Update tooltip
                 if (tray->tooltip != NULL) {
                     statusItem.button.toolTip = [NSString stringWithUTF8String:tray->tooltip];
                 }
-                
+
                 // Update menu
                 if (tray->menu != NULL) {
                     menu = _tray_menu(tray->menu);
