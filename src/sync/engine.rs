@@ -22,12 +22,12 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::capture::{
-    get_display_uuid, get_frontmost_app, CaptureContext, DisplayChangeEvent, DisplayMonitor,
-    RecordingSession,
+    get_display_uuid, get_frontmost_app, get_main_display_resolution, CaptureContext,
+    DisplayChangeEvent, DisplayMonitor, RecordingSession,
 };
 use crate::config::Config;
 use crate::data::{
-    CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer, UNCAPTURED_APP_ID,
+    CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer, MetadataEvent, UNCAPTURED_APP_ID,
     UNKNOWN_APP_ID,
 };
 use crate::input::{create_input_backend, InputBackend};
@@ -412,6 +412,8 @@ pub struct SyncEngine {
     any_source_ever_ready: bool,
     /// Whether we've already shown the "restart your Mac" alert this session
     restart_alert_shown: bool,
+    /// Native display resolution (logical points) — updated on display change
+    display_resolution: (u32, u32),
 }
 
 impl SyncEngine {
@@ -498,6 +500,7 @@ unintended app video."
             buffered_non_context_event_count: 0,
             any_source_ever_ready: false,
             restart_alert_shown: false,
+            display_resolution: get_main_display_resolution().unwrap_or((1920, 1080)),
         }
     }
 
@@ -1257,6 +1260,24 @@ unintended app video."
         self.last_emitted_context = Some(app_id);
     }
 
+    /// Emit a metadata event with the current display resolution.
+    /// Called once at the start of each segment (before the first context event).
+    fn emit_metadata_event(&mut self, timestamp_us: u64) {
+        let (dw, dh) = self.display_resolution;
+        let (ow, oh) = crate::capture::calculate_output_dimensions(dw, dh, 1080);
+        let utc_now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.event_buffer.push(InputEvent {
+            timestamp_us,
+            event: EventType::Metadata(MetadataEvent {
+                display_width: dw,
+                display_height: dh,
+                output_width: ow,
+                output_height: oh,
+                timestamp_utc: utc_now,
+            }),
+        });
+    }
+
     fn emit_context_snapshot(&mut self, should_capture: bool, timestamp_us: u64) {
         let app_id = self.current_context_app_id(should_capture).to_string();
         self.push_context_event(app_id, timestamp_us);
@@ -1985,6 +2006,7 @@ unintended app video."
         self.recording_start_ns = Some(session.start_time_ns);
         self.current_session = Some(session);
 
+        self.emit_metadata_event(0);
         self.emit_context_snapshot(should_capture, 0);
         if let Some(app) = desired_target.as_deref() {
             self.schedule_capture_watchdog(app, 0);
@@ -2158,6 +2180,7 @@ unintended app video."
         self.idle_paused = false; // Ensure not idle-paused when starting
         self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
 
+        self.emit_metadata_event(0);
         self.emit_context_snapshot(should_capture, 0);
         if let Some(app) = desired_target.as_deref() {
             self.schedule_capture_watchdog(app, 0);
@@ -2482,6 +2505,9 @@ unintended app video."
                 match self.capture_ctx.fully_recreate_sources() {
                     Ok(count) => {
                         info!("Recreated {} source(s) for display '{}'", count, display_name);
+                        if let Ok(res) = get_main_display_resolution() {
+                            self.display_resolution = res;
+                        }
                     }
                     Err(e) => {
                         error!("Failed to recreate sources for display '{}': {}", display_name, e);
@@ -2515,6 +2541,9 @@ unintended app video."
                 match self.capture_ctx.reset_video_and_recreate_sources() {
                     Ok(()) => {
                         info!("Reset video and recreated sources for display '{}'", to_name);
+                        if let Ok(res) = get_main_display_resolution() {
+                            self.display_resolution = res;
+                        }
                     }
                     Err(e) => {
                         error!("Failed to reset video for display '{}': {}", to_name, e);

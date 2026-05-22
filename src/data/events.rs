@@ -41,6 +41,9 @@ pub enum EventType {
 
     /// Mouse scroll
     MouseScroll(MouseScrollEvent),
+
+    /// Segment metadata (emitted once at the start of each segment)
+    Metadata(MetadataEvent),
 }
 
 /// Frontmost application context at a point in time
@@ -106,6 +109,25 @@ pub struct MouseScrollEvent {
 
     /// Y coordinate at time of scroll
     pub y: f64,
+}
+
+/// Segment metadata (display resolution, timing, video output dimensions)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataEvent {
+    /// Native display width in logical points
+    pub display_width: u32,
+
+    /// Native display height in logical points
+    pub display_height: u32,
+
+    /// Video output width in pixels (after downscale)
+    pub output_width: u32,
+
+    /// Video output height in pixels (after downscale)
+    pub output_height: u32,
+
+    /// UTC timestamp when this segment started (ISO 8601)
+    pub timestamp_utc: String,
 }
 
 impl From<rdev::Key> for KeyEvent {
