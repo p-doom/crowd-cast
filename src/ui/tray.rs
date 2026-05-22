@@ -944,10 +944,18 @@ fn get_icon_paths() -> Result<TrayIconPaths> {
         blocked: icon_dir.join(format!("tray_blocked.{}", ext)),
     };
 
-    let needs_create = !paths.idle.exists() || !paths.recording.exists() || !paths.blocked.exists();
+    // Regenerate icons if any are missing or if the app version changed
+    let version_file = icon_dir.join("tray_version");
+    let current_version = env!("CARGO_PKG_VERSION");
+    let cached_version = std::fs::read_to_string(&version_file).unwrap_or_default();
+    let needs_create = cached_version.trim() != current_version
+        || !paths.idle.exists()
+        || !paths.recording.exists()
+        || !paths.blocked.exists();
 
     if needs_create {
         create_tray_icons(&paths)?;
+        let _ = std::fs::write(&version_file, current_version);
         info!("Created tray icons in {:?}", icon_dir);
     }
 
