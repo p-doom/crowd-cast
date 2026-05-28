@@ -16,6 +16,9 @@ static BOOL screenUnlocked = NO;
 static CFAbsoluteTime trayInitTime = 0;
 static id unlockObserver = nil;
 static atomic_bool restartPrepared = false;
+static atomic_bool trayRestartRequested = false;
+static CFAbsoluteTime statusItemDetachedSince = 0;
+static BOOL statusItemWasAttached = NO;
 
 @interface TrayDelegate : NSObject <NSMenuDelegate, NSApplicationDelegate>
 @end
@@ -81,6 +84,55 @@ static NSMenu *_tray_menu(struct tray_menu *m) {
     return menu;
 }
 
+static NSStatusItem *create_status_item(void) {
+    NSStatusItem *item = [[NSStatusBar systemStatusBar]
+        statusItemWithLength:NSVariableStatusItemLength];
+    if (item != nil) {
+        statusItemDetachedSince = 0;
+        statusItemWasAttached = NO;
+    }
+    return item;
+}
+
+static void request_tray_restart(NSString *reason) {
+    bool alreadyRequested = atomic_exchange(&trayRestartRequested, true);
+    if (!alreadyRequested) {
+        NSLog(@"%@ - requesting process restart", reason);
+    }
+}
+
+static void check_status_item_health(void) {
+    if (atomic_load(&restartPrepared) || atomic_load(&trayRestartRequested)) {
+        return;
+    }
+
+    if (statusItem == nil || statusItem.button == nil) {
+        request_tray_restart(@"Status item lost");
+        return;
+    }
+
+    NSWindow *window = statusItem.button.window;
+    if (window != nil) {
+        statusItemWasAttached = YES;
+        statusItemDetachedSince = 0;
+        return;
+    }
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (statusItemDetachedSince == 0) {
+        statusItemDetachedSince = now;
+    }
+
+    // A freshly-created status item may not have an attached window for a
+    // moment while ControlCenter builds the backing scene. If an item that
+    // was previously attached stays detached, the status-item host is wedged;
+    // in-process recreation has proven unreliable on Tahoe, so ask Rust to
+    // restart with a fresh process identity.
+    if (statusItemWasAttached && now - statusItemDetachedSince > 5.0) {
+        request_tray_restart(@"Status item is not attached to the menu bar");
+    }
+}
+
 int tray_init(struct tray *tray) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
@@ -133,12 +185,10 @@ int tray_init(struct tray *tray) {
 
         // Must be called on main thread - dispatch if needed
         if ([NSThread isMainThread]) {
-            statusItem = [[NSStatusBar systemStatusBar]
-                statusItemWithLength:NSVariableStatusItemLength];
+            statusItem = create_status_item();
         } else {
             dispatch_sync(dispatch_get_main_queue(), ^{
-                statusItem = [[NSStatusBar systemStatusBar]
-                    statusItemWithLength:NSVariableStatusItemLength];
+                statusItem = create_status_item();
             });
         }
         
@@ -182,6 +232,7 @@ int tray_loop(int blocking) {
             // main queue — nextEventMatchingMask: alone won't process it.
             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
                                      beforeDate:[NSDate distantPast]];
+            check_status_item_health();
             
             return shouldExit ? -1 : 0;
         } @catch (NSException *exception) {
@@ -202,16 +253,12 @@ void tray_update(struct tray *tray) {
 
                 currentTray = tray;
 
-                // Recover from macOS dropping the status item (known SystemUIServer bug).
-                // If the button or its image vanishes, recreate the entire status item.
+                // Recover from macOS dropping the status item. On Tahoe, trying
+                // to recreate it repeatedly in-process can wedge ControlCenter;
+                // ask the Rust side for a fresh process instead.
                 if (statusItem == nil || statusItem.button == nil) {
-                    NSLog(@"Status item lost — recreating");
-                    statusItem = [[NSStatusBar systemStatusBar]
-                        statusItemWithLength:NSVariableStatusItemLength];
-                    if (statusItem == nil) {
-                        NSLog(@"Failed to recreate status item");
-                        return;
-                    }
+                    request_tray_restart(@"Status item lost during update");
+                    return;
                 }
 
                 // Always ensure visible (macOS can hide items after display changes)
@@ -238,6 +285,7 @@ void tray_update(struct tray *tray) {
                     menu = _tray_menu(tray->menu);
                     statusItem.menu = menu;
                 }
+                check_status_item_health();
             } @catch (NSException *exception) {
                 NSLog(@"Tray update exception: %@", exception);
             }
@@ -265,11 +313,13 @@ static void tray_teardown_on_main(void) {
 
     menu = nil;
     currentTray = nil;
+    statusItemDetachedSince = 0;
+    statusItemWasAttached = NO;
 
-    // Tahoe's ControlCenter/status-item host can reject a newly exec'd
+    // Tahoe's ControlCenter/status-item host can reject a newly-created
     // NSStatusItem if the old item has not fully disconnected yet. Let the
     // removal notification and scene invalidation drain before replacing the
-    // process image.
+    // process.
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.25];
     while ([deadline timeIntervalSinceNow] > 0) {
         @autoreleasepool {
@@ -311,6 +361,13 @@ void tray_exit(void) {
 bool tray_screen_was_unlocked(void) {
     if (screenUnlocked) {
         screenUnlocked = NO;
+        return true;
+    }
+    return false;
+}
+
+bool tray_needs_restart(void) {
+    if (atomic_exchange(&trayRestartRequested, false)) {
         return true;
     }
     return false;

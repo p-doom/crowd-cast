@@ -407,11 +407,18 @@ impl TrayApp {
                 break;
             }
 
-            // Check if screen was unlocked — restart (exec) for fresh capture sources.
-            // Uses exec() to replace the process in-place, preserving the PID and
-            // launchd ownership. No dependency on KeepAlive plist config.
+            // Check if screen was unlocked and restart for fresh capture sources.
+            // On macOS the engine uses launchd or a fresh child process so AppKit
+            // and ControlCenter get a fresh status-item identity too.
             if unsafe { tray_ffi::tray_screen_was_unlocked() } {
                 info!("Screen unlocked — restarting for fresh capture sources");
+                unsafe { tray_ffi::tray_prepare_for_restart(); }
+                let _ = self.cmd_tx.try_send(EngineCommand::RestartProcess);
+                break;
+            }
+
+            if unsafe { tray_ffi::tray_needs_restart() } {
+                info!("Native tray requested process restart");
                 unsafe { tray_ffi::tray_prepare_for_restart(); }
                 let _ = self.cmd_tx.try_send(EngineCommand::RestartProcess);
                 break;

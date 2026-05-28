@@ -43,14 +43,14 @@ use crate::upload::Uploader;
 use super::{EngineCommand, EngineStatus};
 
 /// Restart the current process with a clean OBS context.
-/// Uses Unix exec to replace this process with a fresh one.
+/// Uses a fresh process on macOS so AppKit/ControlCenter also get a fresh
+/// status-item identity. Falls back to Unix exec on other platforms.
 fn restart_process() -> ! {
     info!("Restarting process for fresh OBS context...");
 
     #[cfg(all(target_os = "macos", not(no_tray)))]
-    unsafe {
-        crate::ui::tray_ffi::tray_prepare_for_restart();
-        std::thread::sleep(Duration::from_millis(250));
+    {
+        restart_macos_process();
     }
 
     let exe = std::env::current_exe().expect("Failed to get current executable path");
@@ -72,6 +72,51 @@ fn restart_process() -> ! {
             .spawn()
             .expect("Failed to restart process");
         std::process::exit(0);
+    }
+}
+
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn restart_macos_process() -> ! {
+    unsafe {
+        crate::ui::tray_ffi::tray_prepare_for_restart();
+    }
+    std::thread::sleep(Duration::from_millis(250));
+
+    let uid = unsafe { libc::getuid() };
+    let service = format!("gui/{}/dev.crowd-cast.agent", uid);
+    match std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &service])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            info!("Requested LaunchAgent restart via launchctl kickstart");
+            std::process::exit(0);
+        }
+        Ok(status) => {
+            warn!(
+                "launchctl kickstart failed with status {}; falling back to spawning a fresh process",
+                status
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Failed to run launchctl kickstart: {}; falling back to spawning a fresh process",
+                e
+            );
+        }
+    }
+
+    let exe = std::env::current_exe().expect("Failed to get current executable path");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match std::process::Command::new(&exe).args(&args).spawn() {
+        Ok(_) => {
+            info!("Spawned fresh process for restart");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            error!("Failed to spawn fresh process for restart: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
