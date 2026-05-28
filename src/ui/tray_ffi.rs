@@ -47,6 +47,9 @@ extern "C" {
     /// Update the tray icon, tooltip, and menu
     pub fn tray_update(tray: *mut Tray);
 
+    /// Remove the AppKit status item before replacing the process
+    pub fn tray_prepare_for_restart();
+
     /// Signal the event loop to exit
     pub fn tray_exit();
 
@@ -68,6 +71,9 @@ pub unsafe fn tray_loop(_blocking: c_int) -> c_int {
 
 #[cfg(no_tray)]
 pub unsafe fn tray_update(_tray: *mut Tray) {}
+
+#[cfg(no_tray)]
+pub unsafe fn tray_prepare_for_restart() {}
 
 #[cfg(no_tray)]
 pub unsafe fn tray_exit() {}

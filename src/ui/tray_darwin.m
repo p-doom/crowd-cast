@@ -5,6 +5,7 @@
  */
 
 #import <Cocoa/Cocoa.h>
+#include <stdatomic.h>
 #include "tray.h"
 
 static NSStatusItem *statusItem = nil;
@@ -13,6 +14,8 @@ static struct tray *currentTray = nil;
 static BOOL shouldExit = NO;
 static BOOL screenUnlocked = NO;
 static CFAbsoluteTime trayInitTime = 0;
+static id unlockObserver = nil;
+static atomic_bool restartPrepared = false;
 
 @interface TrayDelegate : NSObject <NSMenuDelegate, NSApplicationDelegate>
 @end
@@ -114,7 +117,7 @@ int tray_init(struct tray *tray) {
         // restart loop (the freshly restarted process would see the same
         // unlock notification and exit again).
         trayInitTime = CFAbsoluteTimeGetCurrent();
-        [[NSDistributedNotificationCenter defaultCenter]
+        unlockObserver = [[NSDistributedNotificationCenter defaultCenter]
             addObserverForName:@"com.apple.screenIsUnlocked"
                         object:nil
                          queue:[NSOperationQueue mainQueue]
@@ -193,6 +196,10 @@ void tray_update(struct tray *tray) {
     void (^updateBlock)(void) = ^{
         @autoreleasepool {
             @try {
+                if (atomic_load(&restartPrepared)) {
+                    return;
+                }
+
                 currentTray = tray;
 
                 // Recover from macOS dropping the status item (known SystemUIServer bug).
@@ -242,6 +249,58 @@ void tray_update(struct tray *tray) {
         updateBlock();
     } else {
         dispatch_async(dispatch_get_main_queue(), updateBlock);
+    }
+}
+
+static void tray_teardown_on_main(void) {
+    if (unlockObserver != nil) {
+        [[NSDistributedNotificationCenter defaultCenter] removeObserver:unlockObserver];
+        unlockObserver = nil;
+    }
+
+    if (statusItem != nil) {
+        [[NSStatusBar systemStatusBar] removeStatusItem:statusItem];
+        statusItem = nil;
+    }
+
+    menu = nil;
+    currentTray = nil;
+
+    // Tahoe's ControlCenter/status-item host can reject a newly exec'd
+    // NSStatusItem if the old item has not fully disconnected yet. Let the
+    // removal notification and scene invalidation drain before replacing the
+    // process image.
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.25];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        @autoreleasepool {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:deadline];
+        }
+    }
+}
+
+void tray_prepare_for_restart(void) {
+    bool alreadyPrepared = atomic_exchange(&restartPrepared, true);
+    if (alreadyPrepared) {
+        return;
+    }
+
+    if ([NSThread isMainThread]) {
+        tray_teardown_on_main();
+    } else {
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            tray_teardown_on_main();
+            dispatch_semaphore_signal(done);
+        });
+
+        intptr_t result = dispatch_semaphore_wait(
+            done,
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC))
+        );
+        if (result != 0) {
+            NSLog(@"Timed out waiting for tray teardown before restart");
+        }
     }
 }
 

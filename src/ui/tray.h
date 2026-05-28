@@ -7,6 +7,8 @@
 #ifndef TRAY_H
 #define TRAY_H
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,8 +41,14 @@ int tray_loop(int blocking);
 /* Update the tray icon, tooltip, and menu */
 void tray_update(struct tray *tray);
 
+/* Tear down AppKit tray state before replacing the process */
+void tray_prepare_for_restart(void);
+
 /* Signal the event loop to exit */
 void tray_exit(void);
+
+/* Returns true once if the screen was unlocked since last check */
+bool tray_screen_was_unlocked(void);
 
 #ifdef __cplusplus
 }

@@ -412,6 +412,7 @@ impl TrayApp {
             // launchd ownership. No dependency on KeepAlive plist config.
             if unsafe { tray_ffi::tray_screen_was_unlocked() } {
                 info!("Screen unlocked — restarting for fresh capture sources");
+                unsafe { tray_ffi::tray_prepare_for_restart(); }
                 let _ = self.cmd_tx.try_send(EngineCommand::RestartProcess);
                 break;
             }
@@ -993,4 +994,3 @@ fn apply_status_dot(img: &mut RgbaImage, color: [u8; 4]) {
         }
     }
 }
-

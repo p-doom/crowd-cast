@@ -46,6 +46,13 @@ use super::{EngineCommand, EngineStatus};
 /// Uses Unix exec to replace this process with a fresh one.
 fn restart_process() -> ! {
     info!("Restarting process for fresh OBS context...");
+
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    unsafe {
+        crate::ui::tray_ffi::tray_prepare_for_restart();
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
     let exe = std::env::current_exe().expect("Failed to get current executable path");
     let args: Vec<String> = std::env::args().skip(1).collect();
 
