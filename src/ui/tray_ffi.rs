@@ -55,6 +55,9 @@ extern "C" {
 
     /// Returns true (once) if the screen was unlocked since last check
     pub fn tray_screen_was_unlocked() -> bool;
+
+    /// Returns true (once) if the native tray needs a process restart
+    pub fn tray_needs_restart() -> bool;
 }
 
 // Stub implementations when tray is not available
@@ -80,6 +83,11 @@ pub unsafe fn tray_exit() {}
 
 #[cfg(no_tray)]
 pub unsafe fn tray_screen_was_unlocked() -> bool {
+    false
+}
+
+#[cfg(no_tray)]
+pub unsafe fn tray_needs_restart() -> bool {
     false
 }
 

@@ -50,6 +50,9 @@ void tray_exit(void);
 /* Returns true once if the screen was unlocked since last check */
 bool tray_screen_was_unlocked(void);
 
+/* Returns true once if the native tray needs a process restart */
+bool tray_needs_restart(void);
+
 #ifdef __cplusplus
 }
 #endif
