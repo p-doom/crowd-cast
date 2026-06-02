@@ -2,8 +2,11 @@
 
 pub mod app_selector;
 pub mod notifications;
+mod platform_tray;
 mod tray;
 pub mod tray_ffi;
+#[cfg(target_os = "macos")]
+mod tray_macos;
 mod updater;
 
 pub use notifications::{

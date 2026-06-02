@@ -1,36 +1,43 @@
-//! System tray application using dmikushin/tray FFI
+//! System tray application
 //!
-//! Provides a system tray UI for controlling the crowd-cast agent.
+//! Business logic for the tray UI: engine command dispatch, updater scheduling,
+//! auth flow, settings panel. Platform-specific rendering is handled by
+//! implementations of `PlatformTray`.
 
 use anyhow::Result;
 use image::imageops::FilterType;
 use image::RgbaImage;
-use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use super::{
-    tray_ffi::{self, Tray, TrayMenuItem},
-    UpdaterController,
+use super::platform_tray::{
+    PlatformTray, PlatformTrayPoll, TrayAction, TrayDisplayState, TrayIconPaths, TrayIconState,
 };
+use super::UpdaterController;
 use crate::sync::{EngineCommand, EngineStatus};
 
-// Global state for callbacks (required because C callbacks can't capture Rust state)
-static CHECK_FOR_UPDATES_REQUESTED: AtomicBool = AtomicBool::new(false);
-static SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
-static TOGGLE_UPLOADS_REQUESTED: AtomicBool = AtomicBool::new(false);
-static SIGN_IN_REQUESTED: AtomicBool = AtomicBool::new(false);
-static SIGN_IN_COMPLETED: AtomicBool = AtomicBool::new(false);
+// ---------------------------------------------------------------------------
+// Globals shared with main.rs
+// ---------------------------------------------------------------------------
+
+/// Set when the user explicitly quits via the tray menu.
+/// Read by `main.rs` after the tray loop exits to decide the process exit code.
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-static CMD_SENDER: Mutex<Option<mpsc::Sender<EngineCommand>>> = Mutex::new(None);
+
+/// Set by the background sign-in thread when OAuth completes.
+/// Read by the tray loop to refresh the auth display.
+static SIGN_IN_COMPLETED: AtomicBool = AtomicBool::new(false);
 
 /// Check if the user explicitly quit via the tray menu.
 pub fn was_quit_requested() -> bool {
     QUIT_REQUESTED.load(Ordering::SeqCst)
 }
+
+// ---------------------------------------------------------------------------
+// Prepare-for-update logic (pure business logic, no platform dependency)
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrepareForUpdateAction {
@@ -72,53 +79,44 @@ fn next_prepare_for_update_action(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TrayIconState {
-    Idle,
-    Recording,
-    Blocked,
-}
+// ---------------------------------------------------------------------------
+// Auth display helper
+// ---------------------------------------------------------------------------
 
-struct TrayIconPaths {
-    idle: PathBuf,
-    recording: PathBuf,
-    blocked: PathBuf,
-}
-
-struct TrayIconSet {
-    idle: CString,
-    recording: CString,
-    blocked: CString,
-}
-
-impl TrayIconSet {
-    fn new(paths: &TrayIconPaths) -> Result<Self> {
-        Ok(Self {
-            idle: CString::new(paths.idle.to_string_lossy().as_bytes())?,
-            recording: CString::new(paths.recording.to_string_lossy().as_bytes())?,
-            blocked: CString::new(paths.blocked.to_string_lossy().as_bytes())?,
-        })
-    }
-
-    fn path_for(&self, state: TrayIconState) -> *const std::os::raw::c_char {
-        match state {
-            TrayIconState::Idle => self.idle.as_ptr(),
-            TrayIconState::Recording => self.recording.as_ptr(),
-            TrayIconState::Blocked => self.blocked.as_ptr(),
+/// Compute the display strings for the auth section of the tray menu.
+/// Returns (account_text, sign_action_text, auth_configured).
+fn compute_auth_display(
+    auth: &Option<std::sync::Arc<tokio::sync::Mutex<crate::auth::AuthManager>>>,
+) -> (String, String, bool) {
+    if let Some(ref auth) = auth {
+        if let Ok(mgr) = auth.try_lock() {
+            if let Some(email) = mgr.email() {
+                return (
+                    format!("Signed in as {}", email),
+                    "Sign out".to_string(),
+                    true,
+                );
+            }
+            return (String::new(), "Sign in with Google".to_string(), true);
         }
+        return (String::new(), "Sign in with Google".to_string(), true);
     }
+    (
+        String::new(),
+        "Sign in (not configured)".to_string(),
+        false,
+    )
 }
 
-/// System tray application
+// ---------------------------------------------------------------------------
+// TrayApp
+// ---------------------------------------------------------------------------
+
+/// System tray application — owns a platform tray and drives the event loop.
 pub struct TrayApp {
     cmd_tx: mpsc::Sender<EngineCommand>,
     status_rx: broadcast::Receiver<EngineStatus>,
-    // Owned data that must live as long as the tray
-    _icons: TrayIconSet,
-    _tooltip: CString,
-    _menu_items: Vec<TrayMenuItem>,
-    _menu_strings: Vec<CString>,
-    tray: Tray,
+    platform_tray: Box<dyn PlatformTray>,
     updater: UpdaterController,
     last_updater_can_check: Option<bool>,
     last_status: Option<EngineStatus>,
@@ -127,6 +125,10 @@ pub struct TrayApp {
     uploads_paused: bool,
     auth: Option<std::sync::Arc<tokio::sync::Mutex<crate::auth::AuthManager>>>,
     auth_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+    // Cached display state for auth
+    account_display_text: String,
+    sign_action_display_text: String,
+    auth_configured: bool,
 }
 
 impl TrayApp {
@@ -139,243 +141,134 @@ impl TrayApp {
     ) -> Result<Self> {
         info!("Initializing system tray UI");
 
-        // Store sender in global for callbacks
-        {
-            let mut sender = CMD_SENDER.lock().unwrap();
-            *sender = Some(cmd_tx.clone());
-        }
-
-        // Get tray icon paths
         let icon_paths = get_icon_paths()?;
-        let icons = TrayIconSet::new(&icon_paths)?;
+        let platform_tray = create_platform_tray(&icon_paths)?;
         let updater = UpdaterController::new();
 
-        let tooltip = CString::new("crowd-cast Agent")?;
+        // Compute initial auth display state
+        let (account_display_text, sign_action_display_text, auth_configured) =
+            compute_auth_display(&auth);
 
-        // Create menu items
-        // Menu strings must be kept alive
-        // Note: We use indices to update text dynamically based on state
-        let status_text = CString::new("Status: Idle")?;
-        let separator = CString::new("-")?;
-        let start_text = CString::new("Start Recording")?;
-        let stop_text = CString::new("Stop Recording")?;
-        let panic_text = CString::new("Delete last 10 minutes")?;
-        let pause_uploads_text = CString::new("Pause Uploads")?;
-        let settings_text = CString::new("Settings")?;
-        let updates_text = CString::new("Check for Updates")?;
-        let quit_text = CString::new("Quit")?;
-
-        // Determine auth display and action text based on auth state
-        let is_authenticated = auth.as_ref()
-            .and_then(|a| a.try_lock().ok())
-            .map(|m| m.is_authenticated())
+        let uploads_paused = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+            .and_then(|p| std::fs::read_to_string(p.data_dir().join("uploads_paused")).ok())
+            .map(|s| s.trim() == "true")
             .unwrap_or(false);
-        let account_text = if let Some(ref auth) = auth {
-            if let Ok(mgr) = auth.try_lock() {
-                if let Some(email) = mgr.email() {
-                    CString::new(format!("Signed in as {}", email))?
-                } else {
-                    CString::new("")?
-                }
-            } else {
-                CString::new("")?
-            }
-        } else {
-            CString::new("")?
-        };
-        let sign_action_text = if auth.is_none() {
-            CString::new("Sign in (not configured)")?
-        } else if is_authenticated {
-            CString::new("Sign out")?
-        } else {
-            CString::new("Sign in with Google")?
-        };
-
-        let menu_strings = vec![
-            status_text,          // 0
-            account_text,         // 1  — "Signed in as X" (disabled display)
-            separator.clone(),    // 2
-            start_text,           // 3
-            stop_text,            // 4
-            panic_text,           // 5
-            separator.clone(),    // 6
-            pause_uploads_text,   // 7
-            sign_action_text,     // 8 — "Sign in with Google" / "Sign out"
-            settings_text,        // 9
-            updates_text,         // 10
-            separator.clone(),    // 11
-            quit_text,            // 12
-        ];
-
-        // Build menu items array (NULL-terminated)
-        // Menu indices: 0=status, 1=account, 2=sep, 3=start, 4=stop,
-        //   5=panic, 6=sep, 7=pause_uploads, 8=sign_action, 9=settings, 10=updates, 11=sep, 12=quit
-        let mut menu_items = vec![
-            TrayMenuItem {
-                text: menu_strings[0].as_ptr(), // Status
-                disabled: 1,
-                checked: 0,
-                cb: None,
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[1].as_ptr(), // Signed in as X (display only)
-                disabled: 1,
-                checked: 0,
-                cb: None,
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[2].as_ptr(), // separator
-                disabled: 0,
-                checked: 0,
-                cb: None,
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[3].as_ptr(), // Start Recording
-                disabled: 0,
-                checked: 0,
-                cb: Some(on_start_capture),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[4].as_ptr(), // Stop Recording
-                disabled: 1,
-                checked: 0,
-                cb: Some(on_stop_capture),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[5].as_ptr(), // Panic
-                disabled: 0,
-                checked: 0,
-                cb: Some(on_panic),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[6].as_ptr(), // separator
-                disabled: 0,
-                checked: 0,
-                cb: None,
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[7].as_ptr(), // Pause Uploads
-                disabled: 0,
-                checked: 0,
-                cb: Some(on_toggle_uploads),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[8].as_ptr(), // Sign in / Sign out
-                disabled: if auth.is_none() { 1 } else { 0 },
-                checked: 0,
-                cb: Some(on_sign_in),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[9].as_ptr(), // Settings
-                disabled: 0,
-                checked: 0,
-                cb: Some(on_settings),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[10].as_ptr(), // Check for Updates
-                disabled: 1,
-                checked: 0,
-                cb: Some(on_check_for_updates),
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[11].as_ptr(), // separator
-                disabled: 0,
-                checked: 0,
-                cb: None,
-                submenu: std::ptr::null_mut(),
-            },
-            TrayMenuItem {
-                text: menu_strings[12].as_ptr(), // Quit
-                disabled: 0,
-                checked: 0,
-                cb: Some(on_quit),
-                submenu: std::ptr::null_mut(),
-            },
-            // NULL terminator
-            TrayMenuItem {
-                text: std::ptr::null(),
-                disabled: 0,
-                checked: 0,
-                cb: None,
-                submenu: std::ptr::null_mut(),
-            },
-        ];
-
-        let tray = Tray {
-            icon_filepath: icons.path_for(TrayIconState::Idle),
-            tooltip: tooltip.as_ptr(),
-            cb: None, // No left-click callback, just show menu
-            menu: menu_items.as_mut_ptr(),
-        };
 
         info!("System tray created");
 
         Ok(Self {
             cmd_tx,
             status_rx,
-            _icons: icons,
-            _tooltip: tooltip,
-            _menu_items: menu_items,
-            _menu_strings: menu_strings,
-            tray,
+            platform_tray,
             updater,
             last_updater_can_check: None,
             last_status: None,
             pending_prepare_for_update: false,
             last_update_check: std::time::Instant::now(),
-            uploads_paused: directories::ProjectDirs::from("dev", "crowd-cast", "agent")
-                .and_then(|p| std::fs::read_to_string(p.data_dir().join("uploads_paused")).ok())
-                .map(|s| s.trim() == "true")
-                .unwrap_or(false),
+            uploads_paused,
             auth,
             auth_runtime,
+            account_display_text,
+            sign_action_display_text,
+            auth_configured,
         })
+    }
+
+    /// Compute the full display state from current TrayApp state.
+    fn compute_display_state(&self) -> TrayDisplayState {
+        let (status_text, icon_state, can_start, can_stop) = match &self.last_status {
+            Some(EngineStatus::Idle) => (
+                "Status: Idle".to_string(),
+                TrayIconState::Idle,
+                true,
+                false,
+            ),
+            Some(EngineStatus::Capturing { event_count }) => (
+                format!("Status: Capturing ({} events)", event_count),
+                TrayIconState::Recording,
+                false,
+                true,
+            ),
+            Some(EngineStatus::Paused) => (
+                "Status: Idle (paused)".to_string(),
+                TrayIconState::Idle,
+                false,
+                true,
+            ),
+            Some(EngineStatus::RecordingBlocked) => (
+                "Status: Recording (no capture sources)".to_string(),
+                TrayIconState::Blocked,
+                false,
+                true,
+            ),
+            Some(EngineStatus::WaitingForOBS) => (
+                "Status: Waiting for OBS...".to_string(),
+                TrayIconState::Blocked,
+                true,
+                false,
+            ),
+            Some(EngineStatus::Uploading { chunk_id }) => (
+                format!("Status: Uploading {}", chunk_id),
+                TrayIconState::Idle,
+                true,
+                false,
+            ),
+            Some(EngineStatus::Error(msg)) => (
+                format!("Status: Error - {}", truncate_str(msg, 30)),
+                TrayIconState::Idle,
+                true,
+                false,
+            ),
+            None => (
+                "Status: Idle".to_string(),
+                TrayIconState::Idle,
+                true,
+                false,
+            ),
+        };
+
+        TrayDisplayState {
+            icon_state,
+            status_text,
+            account_text: self.account_display_text.clone(),
+            sign_action_text: self.sign_action_display_text.clone(),
+            auth_action_enabled: self.auth_configured,
+            can_start,
+            can_stop,
+            uploads_text: if self.uploads_paused {
+                "Resume Uploads".to_string()
+            } else {
+                "Pause Uploads".to_string()
+            },
+            can_check_updates: self.updater.can_check_for_updates(),
+        }
+    }
+
+    /// Push current display state to the platform tray.
+    fn refresh_display(&mut self) {
+        let state = self.compute_display_state();
+        self.platform_tray.update(&state);
     }
 
     /// Initialize and run the tray application event loop (blocks until quit)
     pub fn run(mut self) -> Result<()> {
         info!("Starting system tray event loop");
 
-        // Initialize the tray
-        let init_result = unsafe { tray_ffi::tray_init(&mut self.tray) };
-        if init_result != 0 {
-            return Err(anyhow::anyhow!("Failed to initialize system tray"));
-        }
+        self.platform_tray.init()?;
 
         QUIT_REQUESTED.store(false, Ordering::SeqCst);
-        CHECK_FOR_UPDATES_REQUESTED.store(false, Ordering::SeqCst);
-        SETTINGS_REQUESTED.store(false, Ordering::SeqCst);
-        TOGGLE_UPLOADS_REQUESTED.store(false, Ordering::SeqCst);
-
-        // Restore upload pause state from previous session
-        if self.uploads_paused {
-            info!("Uploads paused (restored from previous session)");
-            let new_text = CString::new("Resume Uploads").unwrap_or_default();
-            self._menu_strings[7] = new_text;
-            self._menu_items[7].text = self._menu_strings[7].as_ptr();
-            self.tray.menu = self._menu_items.as_mut_ptr();
-            unsafe { tray_ffi::tray_update(&mut self.tray); }
-        }
+        SIGN_IN_COMPLETED.store(false, Ordering::SeqCst);
 
         self.updater.start();
         if let Some(reason) = self.updater.reason() {
             info!("Updater unavailable: {}", reason);
         }
-        self.refresh_updater_menu_item();
+
+        // Push initial display state (includes uploads_paused, auth, updater)
+        self.refresh_display();
 
         loop {
-            // Check for status updates (non-blocking)
+            // Check for engine status updates (non-blocking)
             match self.status_rx.try_recv() {
                 Ok(status) => {
                     self.update_status(&status);
@@ -392,81 +285,82 @@ impl TrayApp {
                 }
             }
 
-            // Run one iteration of the native event loop (non-blocking)
-            let loop_result = unsafe { tray_ffi::tray_loop(0) };
+            // Run one iteration of the platform event loop
+            match self.platform_tray.poll() {
+                PlatformTrayPoll::None => {}
 
-            if loop_result < 0 {
-                info!("Tray loop signaled exit");
-                break;
+                PlatformTrayPoll::Exit => {
+                    info!("Tray loop signaled exit");
+                    break;
+                }
+
+                PlatformTrayPoll::RequestRestart => {
+                    self.platform_tray.prepare_for_restart();
+                    let _ = self.cmd_tx.try_send(EngineCommand::RestartProcess);
+                    break;
+                }
+
+                PlatformTrayPoll::Action(action) => match action {
+                    TrayAction::Quit => {
+                        info!("Quit requested via tray menu");
+                        QUIT_REQUESTED.store(true, Ordering::SeqCst);
+                        let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
+                        break;
+                    }
+                    TrayAction::StartRecording => {
+                        info!("Start recording requested via tray");
+                        if let Err(e) = self.cmd_tx.try_send(EngineCommand::StartRecording) {
+                            error!("Failed to send start recording command: {}", e);
+                        }
+                    }
+                    TrayAction::StopRecording => {
+                        info!("Stop recording requested via tray");
+                        if let Err(e) = self.cmd_tx.try_send(EngineCommand::StopRecording) {
+                            error!("Failed to send stop recording command: {}", e);
+                        }
+                    }
+                    TrayAction::Panic => {
+                        warn!("Panic button pressed via tray");
+                        if let Err(e) = self.cmd_tx.try_send(EngineCommand::Panic) {
+                            error!("Failed to send panic command: {}", e);
+                        }
+                    }
+                    TrayAction::ToggleUploads => {
+                        self.uploads_paused = !self.uploads_paused;
+                        if self.uploads_paused {
+                            info!("Uploads paused by user");
+                            let _ = self.cmd_tx.try_send(EngineCommand::PauseUploads);
+                        } else {
+                            info!("Uploads resumed by user");
+                            let _ = self.cmd_tx.try_send(EngineCommand::ResumeUploads);
+                        }
+                        self.refresh_display();
+                    }
+                    TrayAction::SignIn => {
+                        self.handle_sign_in();
+                    }
+                    TrayAction::Settings => {
+                        self.show_settings_panel();
+                    }
+                    TrayAction::CheckForUpdates => {
+                        if let Err(e) = self.updater.check_for_updates() {
+                            warn!("Failed to check for updates: {}", e);
+                        }
+                        self.last_update_check = std::time::Instant::now();
+                    }
+                },
             }
 
-            // Check if quit was requested via callback
-            if QUIT_REQUESTED.load(Ordering::SeqCst) {
-                info!("Quit requested via tray menu");
-                let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
-                break;
-            }
-
-            // Check if screen was unlocked and restart for fresh capture sources.
-            // On macOS the engine uses launchd or a fresh child process so AppKit
-            // and ControlCenter get a fresh status-item identity too.
-            if unsafe { tray_ffi::tray_screen_was_unlocked() } {
-                info!("Screen unlocked — restarting for fresh capture sources");
-                unsafe { tray_ffi::tray_prepare_for_restart(); }
-                let _ = self.cmd_tx.try_send(EngineCommand::RestartProcess);
-                break;
-            }
-
-            if unsafe { tray_ffi::tray_needs_restart() } {
-                info!("Native tray requested process restart");
-                unsafe { tray_ffi::tray_prepare_for_restart(); }
-                let _ = self.cmd_tx.try_send(EngineCommand::RestartProcess);
-                break;
-            }
-
-            if SIGN_IN_REQUESTED.swap(false, Ordering::SeqCst) {
-                self.handle_sign_in();
-            }
-
+            // Check if sign-in completed on the background thread
             if SIGN_IN_COMPLETED.swap(false, Ordering::SeqCst) {
-                self.update_auth_menu();
-            }
-
-            if SETTINGS_REQUESTED.swap(false, Ordering::SeqCst) {
-                self.show_settings_panel();
-            }
-
-            if TOGGLE_UPLOADS_REQUESTED.swap(false, Ordering::SeqCst) {
-                self.uploads_paused = !self.uploads_paused;
-                if self.uploads_paused {
-                    info!("Uploads paused by user");
-                    let _ = self.cmd_tx.try_send(EngineCommand::PauseUploads);
-                } else {
-                    info!("Uploads resumed by user");
-                    let _ = self.cmd_tx.try_send(EngineCommand::ResumeUploads);
-                }
-                let new_text = if self.uploads_paused {
-                    CString::new("Resume Uploads").unwrap_or_default()
-                } else {
-                    CString::new("Pause Uploads").unwrap_or_default()
-                };
-                self._menu_strings[7] = new_text;
-                self._menu_items[7].text = self._menu_strings[7].as_ptr();
-                self.tray.menu = self._menu_items.as_mut_ptr();
-                unsafe { tray_ffi::tray_update(&mut self.tray); }
-            }
-
-            if CHECK_FOR_UPDATES_REQUESTED.swap(false, Ordering::SeqCst) {
-                if let Err(e) = self.updater.check_for_updates() {
-                    warn!("Failed to check for updates: {}", e);
-                }
-                self.last_update_check = std::time::Instant::now();
+                self.update_auth_display();
+                self.refresh_display();
             }
 
             // Periodic background update check (bypasses Sparkle's scheduler
             // which relies on NSUserDefaults that may not persist).
-            // Interval matches SUScheduledCheckInterval in Info.plist (default 60s for testing, 86400 for production).
-            const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+            const UPDATE_CHECK_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(600);
             if self.last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
                 if self.updater.can_check_for_updates() {
                     info!("Scheduled background update check");
@@ -475,6 +369,7 @@ impl TrayApp {
                 self.last_update_check = std::time::Instant::now();
             }
 
+            // Handle deferred Sparkle install requests
             self.pending_prepare_for_update |= self.updater.take_prepare_for_update_request();
             match next_prepare_for_update_action(
                 self.pending_prepare_for_update,
@@ -499,7 +394,12 @@ impl TrayApp {
                 PrepareForUpdateAction::Wait => {}
             }
 
-            self.refresh_updater_menu_item();
+            // Refresh display if updater availability changed
+            let can_check = self.updater.can_check_for_updates();
+            if self.last_updater_can_check != Some(can_check) {
+                self.last_updater_can_check = Some(can_check);
+                self.refresh_display();
+            }
 
             // Small sleep to prevent busy loop when no events
             std::thread::sleep(std::time::Duration::from_millis(16));
@@ -509,107 +409,36 @@ impl TrayApp {
         Ok(())
     }
 
-    /// Update the status display based on engine status
+    /// Process a new engine status: update internal state and refresh the display.
     fn update_status(&mut self, status: &EngineStatus) {
         self.last_status = Some(status.clone());
 
-        // Determine status text, icon state, and menu state
-        #[derive(Clone, Copy, PartialEq)]
-        enum MenuState {
-            Idle,      // Show: Start
-            Recording, // Show: Stop
-        }
-
-        let (status_text, icon_state, menu_state) = match status {
-            EngineStatus::Idle => (
-                "Status: Idle".to_string(),
-                TrayIconState::Idle,
-                MenuState::Idle,
-            ),
-            EngineStatus::Capturing { event_count } => (
-                format!("Status: Capturing ({} events)", event_count),
-                TrayIconState::Recording,
-                MenuState::Recording,
-            ),
-            EngineStatus::Paused => (
-                "Status: Idle (paused)".to_string(),
-                TrayIconState::Idle,
-                MenuState::Recording,
-            ),
-            EngineStatus::RecordingBlocked => (
-                "Status: Recording (no capture sources)".to_string(),
-                TrayIconState::Blocked,
-                MenuState::Recording,
-            ),
-            EngineStatus::WaitingForOBS => (
-                "Status: Waiting for OBS...".to_string(),
-                TrayIconState::Blocked,
-                MenuState::Idle,
-            ),
-            EngineStatus::Uploading { chunk_id } => (
-                format!("Status: Uploading {}", chunk_id),
-                TrayIconState::Idle,
-                MenuState::Idle,
-            ),
-            EngineStatus::Error(msg) => (
-                format!("Status: Error - {}", truncate_str(msg, 30)),
-                TrayIconState::Idle,
-                MenuState::Idle,
-            ),
-        };
-
-        // Update the status menu item text and menu item visibility
-        if let Ok(new_text) = CString::new(status_text.as_bytes()) {
-            if !self._menu_strings.is_empty() {
-                // Update status text
-                self._menu_strings[0] = new_text;
-                self._menu_items[0].text = self._menu_strings[0].as_ptr();
-
-                // Update menu item visibility based on state
-                // Menu indices: 3=start, 4=stop
-                match menu_state {
-                    MenuState::Idle => {
-                        self._menu_items[3].disabled = 0; // Start - enabled
-                        self._menu_items[4].disabled = 1; // Stop - disabled
-                    }
-                    MenuState::Recording => {
-                        self._menu_items[3].disabled = 1; // Start - disabled
-                        self._menu_items[4].disabled = 0; // Stop - enabled
-                    }
-                }
-
-                self.tray.menu = self._menu_items.as_mut_ptr();
-                self.tray.icon_filepath = self._icons.path_for(icon_state);
-                unsafe {
-                    tray_ffi::tray_update(&mut self.tray);
-                }
-            }
-        }
-
         self.updater
             .set_busy(status_blocks_immediate_update(status));
-        self.refresh_updater_menu_item();
 
-        debug!("Tray status updated: {}", status_text);
+        self.refresh_display();
+
+        debug!(
+            "Tray status updated: {}",
+            match status {
+                EngineStatus::Idle => "Idle".to_string(),
+                EngineStatus::Capturing { event_count } =>
+                    format!("Capturing ({} events)", event_count),
+                EngineStatus::Paused => "Paused".to_string(),
+                EngineStatus::RecordingBlocked => "RecordingBlocked".to_string(),
+                EngineStatus::WaitingForOBS => "WaitingForOBS".to_string(),
+                EngineStatus::Uploading { chunk_id } => format!("Uploading {}", chunk_id),
+                EngineStatus::Error(msg) => format!("Error: {}", msg),
+            }
+        );
     }
 
-    fn refresh_updater_menu_item(&mut self) {
-        if self._menu_items.len() <= 8 {
-            return;
-        }
-
-        let can_check = self.updater.can_check_for_updates();
-        if self.last_updater_can_check == Some(can_check) {
-            return;
-        }
-
-        self.last_updater_can_check = Some(can_check);
-        self._menu_items[10].disabled = if can_check { 0 } else { 1 };
-
-        self.tray.menu = self._menu_items.as_mut_ptr();
-        unsafe {
-            tray_ffi::tray_update(&mut self.tray);
-        }
+    /// Refresh cached auth display strings from the auth manager.
+    fn update_auth_display(&mut self) {
+        let (account, sign_action, configured) = compute_auth_display(&self.auth);
+        self.account_display_text = account;
+        self.sign_action_display_text = sign_action;
+        self.auth_configured = configured;
     }
 
     fn handle_sign_in(&mut self) {
@@ -630,7 +459,8 @@ impl TrayApp {
                 let mut mgr = auth.lock().await;
                 mgr.logout();
             });
-            self.update_auth_menu();
+            self.update_auth_display();
+            self.refresh_display();
             return;
         }
 
@@ -653,32 +483,6 @@ impl TrayApp {
                 }
             }
         });
-    }
-
-    fn update_auth_menu(&mut self) {
-        if let Some(ref auth) = self.auth {
-            if let Ok(mgr) = auth.try_lock() {
-                if let Some(email) = mgr.email() {
-                    // Signed in: show account display + "Sign out" action
-                    let account = CString::new(format!("Signed in as {}", email)).unwrap_or_default();
-                    self._menu_strings[1] = account;
-                    self._menu_items[1].text = self._menu_strings[1].as_ptr();
-                    let sign_out = CString::new("Sign out").unwrap_or_default();
-                    self._menu_strings[8] = sign_out;
-                    self._menu_items[8].text = self._menu_strings[8].as_ptr();
-                } else {
-                    // Signed out: clear account display + "Sign in with Google" action
-                    let empty = CString::new("").unwrap_or_default();
-                    self._menu_strings[1] = empty;
-                    self._menu_items[1].text = self._menu_strings[1].as_ptr();
-                    let sign_in = CString::new("Sign in with Google").unwrap_or_default();
-                    self._menu_strings[8] = sign_in;
-                    self._menu_items[8].text = self._menu_strings[8].as_ptr();
-                }
-            }
-        }
-        self.tray.menu = self._menu_items.as_mut_ptr();
-        unsafe { tray_ffi::tray_update(&mut self.tray); }
     }
 
     fn show_settings_panel(&self) {
@@ -723,6 +527,26 @@ impl TrayApp {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Platform tray factory
+// ---------------------------------------------------------------------------
+
+fn create_platform_tray(icon_paths: &TrayIconPaths) -> Result<Box<dyn PlatformTray>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(super::tray_macos::MacOSTray::new(icon_paths)?))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = icon_paths;
+        Ok(Box::new(super::platform_tray::StubTray))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -806,72 +630,9 @@ mod tests {
     }
 }
 
-impl Drop for TrayApp {
-    fn drop(&mut self) {
-        // Clean up global state
-        let mut sender = CMD_SENDER.lock().unwrap();
-        *sender = None;
-    }
-}
-
-// C callbacks - these must be extern "C" functions
-
-unsafe extern "C" fn on_start_capture(_item: *mut TrayMenuItem) {
-    info!("Start recording requested via tray");
-    if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
-        // Use try_send to avoid blocking (can't use blocking_send inside tokio runtime)
-        if let Err(e) = sender.try_send(EngineCommand::StartRecording) {
-            error!("Failed to send start recording command: {}", e);
-        }
-    }
-}
-
-unsafe extern "C" fn on_stop_capture(_item: *mut TrayMenuItem) {
-    info!("Stop recording requested via tray");
-    if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
-        // Use try_send to avoid blocking (can't use blocking_send inside tokio runtime)
-        if let Err(e) = sender.try_send(EngineCommand::StopRecording) {
-            error!("Failed to send stop recording command: {}", e);
-        }
-    }
-}
-
-unsafe extern "C" fn on_check_for_updates(_item: *mut TrayMenuItem) {
-    info!("Check for updates requested via tray");
-    CHECK_FOR_UPDATES_REQUESTED.store(true, Ordering::SeqCst);
-}
-
-unsafe extern "C" fn on_panic(_item: *mut TrayMenuItem) {
-    warn!("Panic button pressed via tray");
-    if let Some(sender) = CMD_SENDER.lock().unwrap().as_ref() {
-        if let Err(e) = sender.try_send(EngineCommand::Panic) {
-            error!("Failed to send panic command: {}", e);
-        }
-    }
-}
-
-unsafe extern "C" fn on_toggle_uploads(_item: *mut TrayMenuItem) {
-    info!("Toggle uploads requested via tray");
-    TOGGLE_UPLOADS_REQUESTED.store(true, Ordering::SeqCst);
-}
-
-unsafe extern "C" fn on_sign_in(_item: *mut TrayMenuItem) {
-    info!("Sign in requested via tray");
-    SIGN_IN_REQUESTED.store(true, Ordering::SeqCst);
-}
-
-unsafe extern "C" fn on_settings(_item: *mut TrayMenuItem) {
-    info!("Settings requested via tray");
-    SETTINGS_REQUESTED.store(true, Ordering::SeqCst);
-}
-
-unsafe extern "C" fn on_quit(_item: *mut TrayMenuItem) {
-    info!("Quit requested via tray");
-    QUIT_REQUESTED.store(true, Ordering::SeqCst);
-    unsafe {
-        tray_ffi::tray_exit();
-    }
-}
+// ---------------------------------------------------------------------------
+// Icon generation (cross-platform)
+// ---------------------------------------------------------------------------
 
 /// Truncate a string to a maximum length, adding ellipsis if needed
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -922,7 +683,7 @@ fn get_icon_paths() -> Result<TrayIconPaths> {
 fn create_tray_icons(paths: &TrayIconPaths) -> Result<()> {
     let size = 32u32;
     let base = load_base_icon(size);
-    let variants = [
+    let variants: [(TrayIconState, [u8; 4], &PathBuf); 3] = [
         (TrayIconState::Idle, [158, 158, 158, 255], &paths.idle),
         (
             TrayIconState::Recording,
@@ -932,11 +693,11 @@ fn create_tray_icons(paths: &TrayIconPaths) -> Result<()> {
         (TrayIconState::Blocked, [255, 152, 0, 255], &paths.blocked),
     ];
 
-    for (state, color, path) in variants {
+    for (_state, color, path) in variants {
         let mut img = base.clone();
         apply_status_dot(&mut img, color);
         img.save(path)?;
-        debug!("Tray icon generated for {:?}: {:?}", state, path);
+        debug!("Tray icon generated: {:?}", path);
     }
 
     Ok(())
