@@ -85,9 +85,25 @@ impl CaptureContext {
                 debug!("OBS binaries already present");
             }
             ObsBootstrapperResult::Restart => {
-                // On Windows this means we need to restart. On macOS, Done is returned instead.
-                warn!("OBS bootstrap requires restart - this shouldn't happen on macOS");
-                anyhow::bail!("OBS bootstrap requires application restart");
+                // On Windows, the bootstrapper downloads OBS and stages an updater
+                // that moves the new binaries into place and relaunches the app.
+                // We must exit cleanly so that updater can run; the relaunched
+                // process will find OBS already present and proceed normally.
+                #[cfg(target_os = "windows")]
+                {
+                    info!(
+                        "OBS binaries installed; exiting so the bootstrap updater can relaunch with OBS available"
+                    );
+                    std::process::exit(0);
+                }
+
+                // On macOS, bootstrap completes in place and returns None, so a
+                // Restart here is unexpected.
+                #[cfg(not(target_os = "windows"))]
+                {
+                    warn!("OBS bootstrap requires restart - this shouldn't happen on this platform");
+                    anyhow::bail!("OBS bootstrap requires application restart");
+                }
             }
         }
 

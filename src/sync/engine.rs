@@ -1479,10 +1479,7 @@ unintended app video."
                                     if retry_queue.len() >= UPLOAD_PAUSE_NOTIFY_THRESHOLD && !upload_pause_notified {
                                         upload_pause_notified = true;
                                         warn!("{} segments waiting to upload. Resume uploads from the tray menu.", UPLOAD_PAUSE_NOTIFY_THRESHOLD);
-                                        extern "C" {
-                                            fn notifications_show_upload_queue_warning();
-                                        }
-                                        unsafe { notifications_show_upload_queue_warning(); }
+                                        crate::ui::notifications::show_upload_queue_warning_notification();
                                     }
                                     continue;
                                 }

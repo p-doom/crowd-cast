@@ -284,7 +284,10 @@ fn main() -> Result<()> {
         let _ = cmd_tx.send(EngineCommand::Shutdown).await;
     });
 
-    // Wait for engine thread to finish
+    // Wait for engine thread to finish.
+    // In the no_tray path above we already joined engine_handle while waiting
+    // for Ctrl+C, so only join here when the tray owned the main loop.
+    #[cfg(not(no_tray))]
     let _ = engine_handle.join();
 
     // Determine exit code: intentional exits (Quit menu, Sparkle update, Ctrl+C)

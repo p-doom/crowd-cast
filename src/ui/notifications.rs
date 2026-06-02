@@ -50,6 +50,7 @@ mod ffi {
             version: *const c_char,
             build: *const c_char,
         );
+        pub fn notifications_show_upload_queue_warning();
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -283,6 +284,22 @@ pub fn show_obs_download_started_notification() {
 /// Show OBS download started notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_obs_download_started_notification() {
+    debug!("Notifications not supported on this platform");
+}
+
+/// Show notification warning that many segments are queued because uploads are paused
+#[cfg(target_os = "macos")]
+pub fn show_upload_queue_warning_notification() {
+    unsafe {
+        ffi::notifications_show_upload_queue_warning();
+    }
+
+    debug!("Showed upload queue warning notification");
+}
+
+/// Show upload queue warning notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_upload_queue_warning_notification() {
     debug!("Notifications not supported on this platform");
 }
 
