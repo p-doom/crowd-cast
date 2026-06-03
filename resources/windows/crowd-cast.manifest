@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+    Required for native-windows-gui: declares a dependency on Common Controls
+    v6 so the loader binds comctl32.dll v6 (which exports SetWindowSubclass and
+    friends). Without this, the process fails to start with
+    STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139).
+
+    Note: DPI awareness is set at runtime via SetProcessDpiAwarenessContext in
+    main(), so it is intentionally not declared here.
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>

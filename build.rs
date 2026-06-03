@@ -73,6 +73,14 @@ fn main() {
     {
         // The Windows tray is implemented in pure Rust via the tray-icon/muda
         // crates (see src/ui/tray_windows.rs), so no C sources or no_tray flag.
+
+        // Embed the application manifest declaring Common Controls v6. Without
+        // it, native-windows-gui's statically-imported comctl32 v6 functions
+        // (SetWindowSubclass et al.) bind to comctl32 v5 and the process fails
+        // to start with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139).
+        embed_resource::compile("resources/windows/crowd-cast.rc", embed_resource::NONE);
+        println!("cargo:rerun-if-changed=resources/windows/crowd-cast.rc");
+        println!("cargo:rerun-if-changed=resources/windows/crowd-cast.manifest");
     }
 
     println!("cargo:rerun-if-changed=src/ui/tray.h");
