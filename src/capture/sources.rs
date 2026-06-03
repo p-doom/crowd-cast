@@ -68,8 +68,59 @@ impl ScreenCaptureSource {
         })
     }
 
-    /// Create a new screen capture source (fallback for non-macOS)
-    #[cfg(not(target_os = "macos"))]
+    /// Create a new full-screen capture source on Windows.
+    ///
+    /// Uses libobs `monitor_capture` via Windows Graphics Capture (WGC),
+    /// targeting the primary monitor. `capture_audio` is ignored — the
+    /// Windows monitor source has no audio track (audio is window-scoped only).
+    #[cfg(target_os = "windows")]
+    pub fn new_display_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        _capture_audio: bool,
+    ) -> Result<Self> {
+        use libobs_simple::sources::windows::{
+            MonitorCaptureSourceBuilder, ObsDisplayCaptureMethod,
+        };
+
+        info!("Creating Windows monitor capture source: {}", name);
+
+        // Pick the primary monitor, falling back to the first enumerated one.
+        let monitors = MonitorCaptureSourceBuilder::get_monitors()
+            .map_err(|e| anyhow::anyhow!("Failed to enumerate monitors: {}", e))?;
+        let primary = monitors
+            .iter()
+            .find(|m| m.0.is_primary)
+            .or_else(|| monitors.first());
+
+        let mut builder = context
+            .source_builder::<MonitorCaptureSourceBuilder, _>(name)?
+            .set_capture_cursor(true)
+            .set_capture_method(ObsDisplayCaptureMethod::MethodWgc);
+
+        if let Some(monitor) = primary {
+            info!("Capturing monitor '{}'", monitor.0.name);
+            builder = builder.set_monitor(monitor);
+        } else {
+            tracing::warn!("No monitors enumerated; using default monitor capture settings");
+        }
+
+        let source = builder
+            .add_to_scene(scene)
+            .context("Failed to add monitor capture source to scene")?;
+
+        debug!("Monitor capture source '{}' created successfully", name);
+
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+        })
+    }
+
+    /// Create a new screen capture source (fallback for unsupported platforms)
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn new_display_capture(
         _context: &mut ObsContext,
         _scene: &mut ObsSceneRef,
@@ -427,8 +478,37 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     }
 }
 
-/// Get the actual resolution of the main display (non-macOS fallback)
-#[cfg(not(target_os = "macos"))]
+/// Get the actual pixel resolution of the primary display on Windows.
+///
+/// Uses `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`, which reports the
+/// current mode's true pixel dimensions independent of the process's
+/// DPI-awareness (unlike `GetSystemMetrics`).
+#[cfg(target_os = "windows")]
+pub fn get_main_display_resolution() -> Result<(u32, u32)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
+
+    unsafe {
+        let mut devmode = DEVMODEW::default();
+        devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+
+        let ok = EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut devmode);
+        if !ok.as_bool() {
+            anyhow::bail!("EnumDisplaySettingsW failed to read the primary display mode");
+        }
+
+        let width = devmode.dmPelsWidth;
+        let height = devmode.dmPelsHeight;
+        if width == 0 || height == 0 {
+            anyhow::bail!("Invalid display dimensions: {}x{}", width, height);
+        }
+
+        Ok((width, height))
+    }
+}
+
+/// Get the actual resolution of the main display (fallback for unsupported platforms)
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     anyhow::bail!("Display resolution detection not available on this platform")
 }

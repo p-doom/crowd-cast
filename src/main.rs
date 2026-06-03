@@ -57,6 +57,40 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
     }
 }
 
+/// Channel for the Windows console control handler to send shutdown commands.
+#[cfg(windows)]
+static WIN_CMD_SENDER: std::sync::Mutex<Option<mpsc::Sender<EngineCommand>>> =
+    std::sync::Mutex::new(None);
+
+/// Windows console control handler (Ctrl+C / Ctrl+Break / console close).
+///
+/// Windows has no SIGINT, so without this Ctrl+C hard-kills the process and the
+/// current segment's buffered input events are never flushed to disk. This marks
+/// the exit intentional and asks the engine to shut down gracefully (which runs
+/// stop_recording → writes the segment's .msgpack). Returning TRUE keeps the
+/// process alive long enough for main() to join the engine thread and flush.
+#[cfg(windows)]
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> windows::Win32::Foundation::BOOL {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+        | CTRL_SHUTDOWN_EVENT => {
+            INTENTIONAL_EXIT.store(true, Ordering::SeqCst);
+            if let Ok(guard) = WIN_CMD_SENDER.lock() {
+                if let Some(tx) = guard.as_ref() {
+                    let _ = tx.try_send(EngineCommand::Shutdown);
+                }
+            }
+            BOOL(1)
+        }
+        _ => BOOL(0),
+    }
+}
+
 use config::Config;
 use installer::{needs_setup, reconcile_autostart, run_wizard_gui, AutostartConfig};
 use sync::{create_engine_channels, EngineCommand, SyncEngine};
@@ -246,6 +280,21 @@ fn main() -> Result<()> {
         }
         // Store the channel for the signal handler to use
         *CMD_SENDER_FOR_SIGNAL.lock().unwrap() = Some((sigint_tx, sigint_runtime));
+    }
+
+    // Windows: install a console control handler so Ctrl+C (and console close)
+    // shut the engine down gracefully and flush the current segment to disk,
+    // instead of hard-killing the process and losing buffered input events.
+    #[cfg(windows)]
+    {
+        *WIN_CMD_SENDER.lock().unwrap() = Some(cmd_tx.clone());
+        unsafe {
+            use windows::Win32::Foundation::BOOL;
+            use windows::Win32::System::Console::SetConsoleCtrlHandler;
+            if let Err(e) = SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(1)) {
+                warn!("Failed to install console Ctrl+C handler: {}", e);
+            }
+        }
     }
 
     // Run tray on main thread
