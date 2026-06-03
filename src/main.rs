@@ -131,6 +131,11 @@ fn main() -> Result<()> {
 
     info!("crowd-cast Agent starting...");
 
+    // On Windows, register our notification identity (AUMID + Start Menu
+    // shortcut) so toasts are branded as crowd-cast rather than PowerShell.
+    #[cfg(target_os = "windows")]
+    ui::register_notification_identity();
+
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 

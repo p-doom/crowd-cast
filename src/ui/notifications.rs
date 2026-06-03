@@ -84,13 +84,13 @@ extern "C" fn notification_action_callback(action_id: *const std::ffi::c_char, d
     }
 }
 
-/// Raise a Windows toast notification. Uses the PowerShell AppUserModelID so it
-/// works without registering an app shortcut (sufficient until the installer
-/// registers our own AUMID).
+/// Raise a Windows toast notification under our own AppUserModelID so it is
+/// branded as crowd-cast. `super::register_notification_identity()` must have
+/// run at startup to register the matching Start Menu shortcut.
 #[cfg(target_os = "windows")]
 fn windows_toast(title: &str, text: &str) {
     use tauri_winrt_notification::Toast;
-    if let Err(e) = Toast::new(Toast::POWERSHELL_APP_ID)
+    if let Err(e) = Toast::new(super::aumid_windows::APP_AUMID)
         .title(title)
         .text1(text)
         .show()
