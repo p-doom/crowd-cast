@@ -537,7 +537,11 @@ fn create_platform_tray(icon_paths: &TrayIconPaths) -> Result<Box<dyn PlatformTr
     {
         Ok(Box::new(super::tray_macos::MacOSTray::new(icon_paths)?))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(super::tray_windows::WindowsTray::new(icon_paths)?))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = icon_paths;
         Ok(Box::new(super::platform_tray::StubTray))
