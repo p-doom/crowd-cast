@@ -864,6 +864,7 @@ dependencies = [
  "tray-icon",
  "urlencoding",
  "uuid",
+ "winapi",
  "windows 0.58.0",
  "zip 2.4.2",
 ]

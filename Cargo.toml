@@ -100,6 +100,8 @@ muda = "0.15"
 tauri-winrt-notification = "0.7"
 # Native Win32 GUI for the Windows setup wizard / app picker
 native-windows-gui = "1"
+# Raw Win32 for ListView checkbox state (LVS_EX_CHECKBOXES) in the wizard
+winapi = { version = "0.3", features = ["winuser", "commctrl", "windef", "minwindef", "basetsd"] }
 
 [build-dependencies]
 cc = "1"

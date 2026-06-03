@@ -3,6 +3,10 @@
 //! Mirrors the macOS wizard contract: list capturable apps, let the user select
 //! targets + toggle capture-all / start-on-login, then (on Save) update and save
 //! the config so the re-exec in `main` sees `setup_completed = true`.
+//!
+//! The app list is a ListView with real checkboxes (LVS_EX_CHECKBOXES). nwg
+//! doesn't expose checkbox state, so it's driven via raw Win32 SendMessage on
+//! the control's HWND (see the `lv` module).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,9 +19,91 @@ use super::autostart::{disable_autostart, enable_autostart, AutostartConfig};
 use super::wizard_gui::WizardResult;
 use crate::config::Config;
 
-/// Enumerate currently-visible application windows as (display label, exe stem)
-/// pairs, de-duplicated by executable. Falls back to the running-process list if
-/// no windows can be enumerated.
+/// Raw Win32 helpers for ListView checkbox state (nwg has no checkbox API).
+mod lv {
+    use winapi::shared::minwindef::{LPARAM, WPARAM};
+    use winapi::shared::windef::HWND;
+    use winapi::um::commctrl::{
+        LVITEMW, LVIS_STATEIMAGEMASK, LVM_GETITEMSTATE, LVM_SETEXTENDEDLISTVIEWSTYLE,
+        LVM_SETITEMSTATE, LVS_EX_CHECKBOXES, LVS_EX_FULLROWSELECT,
+    };
+    use winapi::um::winuser::SendMessageW;
+
+    /// State-image index encodes the checkbox: 1 = unchecked, 2 = checked,
+    /// stored in bits 12-15 of the item state.
+    fn state_image(checked: bool) -> u32 {
+        if checked {
+            2 << 12
+        } else {
+            1 << 12
+        }
+    }
+
+    pub unsafe fn enable_checkboxes(hwnd: HWND) {
+        let style = (LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT) as WPARAM;
+        SendMessageW(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE, style, style as LPARAM);
+    }
+
+    pub unsafe fn set_check(hwnd: HWND, row: usize, checked: bool) {
+        let mut item: LVITEMW = std::mem::zeroed();
+        item.stateMask = LVIS_STATEIMAGEMASK;
+        item.state = state_image(checked);
+        SendMessageW(
+            hwnd,
+            LVM_SETITEMSTATE,
+            row as WPARAM,
+            &item as *const LVITEMW as LPARAM,
+        );
+    }
+
+    pub unsafe fn is_checked(hwnd: HWND, row: usize) -> bool {
+        let st = SendMessageW(
+            hwnd,
+            LVM_GETITEMSTATE,
+            row as WPARAM,
+            LVIS_STATEIMAGEMASK as LPARAM,
+        ) as u32;
+        ((st & LVIS_STATEIMAGEMASK) >> 12) == 2
+    }
+}
+
+/// Windows shell / system UI processes that are never useful capture targets,
+/// so we hide them from the picker to reduce clutter.
+const SYSTEM_EXES: &[&str] = &[
+    "applicationframehost",
+    "searchhost",
+    "searchapp",
+    "shellexperiencehost",
+    "startmenuexperiencehost",
+    "systemsettings",
+    "textinputhost",
+    "lockapp",
+    "sihost",
+    "ctfmon",
+    "dwm",
+    "runtimebroker",
+    "useroobebroker",
+    "widgets",
+    "widgetservice",
+    "explorer",
+    "taskmgr",
+];
+
+/// A clean, human-friendly label for an app: the product name when available
+/// (e.g. "Mozilla Firefox"), with the executable appended only when it adds
+/// information. Avoids the noisy raw window titles.
+fn friendly_label(product_name: &str, exe: &str) -> String {
+    let product = product_name.trim();
+    if product.is_empty() {
+        return exe.to_string();
+    }
+    if product.eq_ignore_ascii_case(exe) {
+        product.to_string()
+    } else {
+        format!("{} ({})", product, exe)
+    }
+}
+
 fn list_windowed_apps() -> Vec<(String, String)> {
     use libobs_simple::sources::windows::{WindowCaptureSourceBuilder, WindowSearchMode};
     use std::collections::BTreeMap;
@@ -35,26 +121,35 @@ fn list_windowed_apps() -> Vec<(String, String)> {
             if exe.is_empty() {
                 continue;
             }
-            let title = w.0.title.clone().unwrap_or_default();
-            let label = if title.trim().is_empty() {
-                exe.clone()
-            } else {
-                format!("{}  —  {}", title.trim(), exe)
-            };
-            by_exe.entry(exe.to_ascii_lowercase()).or_insert(label);
+            let exe_l = exe.to_ascii_lowercase();
+            if SYSTEM_EXES.contains(&exe_l.as_str()) {
+                continue;
+            }
+            let product = w.0.product_name.clone().unwrap_or_default();
+            by_exe
+                .entry(exe_l)
+                .or_insert_with(|| friendly_label(&product, &exe));
         }
     }
 
     if by_exe.is_empty() {
         // Fallback: running processes (noisier, but better than an empty list).
         for app in crate::capture::list_capturable_apps() {
-            by_exe
-                .entry(app.bundle_id.to_ascii_lowercase())
-                .or_insert(app.name);
+            let exe_l = app.bundle_id.to_ascii_lowercase();
+            if SYSTEM_EXES.contains(&exe_l.as_str()) {
+                continue;
+            }
+            by_exe.entry(exe_l).or_insert(app.name);
         }
     }
 
-    by_exe.into_iter().map(|(exe, label)| (label, exe)).collect()
+    let mut apps: Vec<(String, String)> = by_exe
+        .into_iter()
+        .map(|(exe, label)| (label, exe))
+        .collect();
+    // Sort by the human-friendly label, case-insensitively.
+    apps.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    apps
 }
 
 /// Show the native Windows setup wizard. Blocks until the user clicks Save or
@@ -64,7 +159,6 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
     let _ = nwg::Font::set_global_family("Segoe UI");
 
     let apps = list_windowed_apps();
-    let labels: Vec<String> = apps.iter().map(|(label, _)| label.clone()).collect();
     let preselect: Vec<usize> = apps
         .iter()
         .enumerate()
@@ -95,21 +189,42 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
         .map_err(|e| anyhow::anyhow!("window: {:?}", e))?;
 
     nwg::Label::builder()
-        .text("Select the applications to capture (Ctrl/Shift-click for multiple):")
+        .text("Check the applications you want to capture:")
         .parent(&window)
         .build(&mut intro)
         .map_err(|e| anyhow::anyhow!("label: {:?}", e))?;
 
-    nwg::ListBox::builder()
-        .collection(labels)
-        .multi_selection(preselect)
-        .flags(nwg::ListBoxFlags::VISIBLE | nwg::ListBoxFlags::MULTI_SELECT)
+    nwg::ListView::builder()
+        .list_style(nwg::ListViewStyle::Detailed)
         .parent(&window)
         .build(&mut list)
-        .map_err(|e| anyhow::anyhow!("listbox: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("listview: {:?}", e))?;
+
+    // Single, header-less column that holds the app label + its checkbox.
+    list.set_headers_enabled(false);
+    list.insert_column(nwg::InsertListViewColumn {
+        index: Some(0),
+        fmt: None,
+        width: Some(430),
+        text: Some("Application".to_string()),
+    });
+    for (label, _) in &apps {
+        list.insert_item(label.as_str());
+    }
+
+    // nwg has no checkbox API, so enable LVS_EX_CHECKBOXES and pre-check the
+    // already-configured apps via raw Win32 on the control's HWND.
+    if let Some(hwnd) = list.handle.hwnd() {
+        unsafe {
+            lv::enable_checkboxes(hwnd);
+            for &i in &preselect {
+                lv::set_check(hwnd, i, true);
+            }
+        }
+    }
 
     nwg::CheckBox::builder()
-        .text("Capture all applications (ignore the selection above)")
+        .text("Capture all applications (ignore the checks above)")
         .check_state(check_state(config.capture.capture_all))
         .parent(&window)
         .build(&mut capture_all)
@@ -160,11 +275,14 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
                 E::OnWindowClose => nwg::stop_thread_dispatch(),
                 E::OnButtonClick => {
                     if &handle == &save_btn {
-                        let selected: Vec<String> = list
-                            .multi_selection()
-                            .into_iter()
-                            .filter_map(|i| apps.get(i).map(|(_, exe)| exe.clone()))
-                            .collect();
+                        let mut selected: Vec<String> = Vec::new();
+                        if let Some(hwnd) = list.handle.hwnd() {
+                            for (i, (_, exe)) in apps.iter().enumerate() {
+                                if unsafe { lv::is_checked(hwnd, i) } {
+                                    selected.push(exe.clone());
+                                }
+                            }
+                        }
                         let mut r = res.borrow_mut();
                         r.completed = true;
                         r.selected_apps = selected;
