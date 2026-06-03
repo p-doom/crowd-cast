@@ -97,6 +97,21 @@ use sync::{create_engine_channels, EngineCommand, SyncEngine};
 
 /// Main entry point, runs tray on main thread (required for macOS)
 fn main() -> Result<()> {
+    // On Windows, declare Per-Monitor-V2 DPI awareness before any graphics or
+    // window initialization. libobs (and its window/monitor capture sources) read
+    // window rectangles in physical pixels; if the host process is DPI-unaware the
+    // system virtualizes those coordinates on scaled displays (e.g. 150%), so the
+    // captured window texture and the rect libobs uses disagree and the capture is
+    // mis-scaled/cropped. OBS itself runs Per-Monitor-V2 for this reason.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        // Best-effort: fails harmlessly if awareness was already set (e.g. via manifest).
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     // Initialize logging
     let _log_guard = logging::init_logging()?;
 

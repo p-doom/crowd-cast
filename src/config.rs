@@ -143,7 +143,7 @@ fn default_idle_timeout_secs() -> u64 {
 }
 
 fn default_single_active_app_capture() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 fn default_capture_watchdog_timeout_ms() -> u64 {

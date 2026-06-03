@@ -234,7 +234,9 @@ impl CaptureContext {
     }
 
     fn use_single_active_app_capture(&self) -> bool {
-        cfg!(target_os = "macos") && self.single_active_app_capture && !self.target_apps.is_empty()
+        cfg!(any(target_os = "macos", target_os = "windows"))
+            && self.single_active_app_capture
+            && !self.target_apps.is_empty()
     }
 
     fn build_scene_name(prefix: &str) -> String {
@@ -357,8 +359,14 @@ impl CaptureContext {
                 }
                 bundles
             }
+            // On Windows (and other non-macOS platforms) we don't pre-filter by
+            // running process here. We attempt to create a window_capture source
+            // for each target app below; apps without a capturable window simply
+            // fail source creation and are skipped (see the match on the result).
             #[cfg(not(target_os = "macos"))]
-            HashSet::new()
+            {
+                target_apps.iter().cloned().collect()
+            }
         };
 
         for bundle_id in &target_apps {

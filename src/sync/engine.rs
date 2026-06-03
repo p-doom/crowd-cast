@@ -498,7 +498,7 @@ impl SyncEngine {
         };
         let pause_uploads_on_idle = config.capture.pause_uploads_on_idle;
         let single_active_app_capture = config.capture.single_active_app_capture
-            && cfg!(target_os = "macos")
+            && cfg!(any(target_os = "macos", target_os = "windows"))
             && !config.capture.target_apps.is_empty();
         let blank_video_on_untracked_app = config.capture.blank_video_on_untracked_app;
         let capture_watchdog_timeout =
