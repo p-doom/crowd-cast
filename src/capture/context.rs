@@ -250,6 +250,21 @@ impl CaptureContext {
         )
     }
 
+    /// Canonical form of an application identifier for matching and as the
+    /// `app_scenes` key. Windows executable names are case-insensitive, so we
+    /// lower-case them; macOS bundle IDs and Linux process names are
+    /// case-sensitive and pass through unchanged (so macOS behavior is identical).
+    fn canonical_app_id(app: &str) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            app.to_ascii_lowercase()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            app.to_string()
+        }
+    }
+
     fn select_initial_active_app(&self) -> Option<String> {
         if !self.use_single_active_app_capture() {
             return None;
@@ -259,9 +274,9 @@ impl CaptureContext {
         if self
             .target_apps
             .iter()
-            .any(|app| app == &frontmost.bundle_id)
+            .any(|app| Self::canonical_app_id(app) == Self::canonical_app_id(&frontmost.bundle_id))
         {
-            Some(frontmost.bundle_id)
+            Some(Self::canonical_app_id(&frontmost.bundle_id))
         } else {
             None
         }
@@ -390,12 +405,15 @@ impl CaptureContext {
                 capture_audio,
             ) {
                 Ok(source) => {
-                    if initial_active_app == Some(bundle_id.as_str()) {
+                    // Key scenes by the canonical id so frontmost-derived lookups
+                    // (also canonical) match regardless of how target_apps is cased.
+                    let canonical_id = Self::canonical_app_id(bundle_id);
+                    if initial_active_app == Some(canonical_id.as_str()) {
                         Self::activate_scene(&mut scene)?;
-                        self.active_capture_app = Some(bundle_id.clone());
+                        self.active_capture_app = Some(canonical_id.clone());
                     }
                     info!("Created app scene for '{}'", bundle_id);
-                    self.app_scenes.insert(bundle_id.clone(), (scene, source));
+                    self.app_scenes.insert(canonical_id, (scene, source));
                 }
                 Err(e) => {
                     warn!(
@@ -863,9 +881,13 @@ impl CaptureContext {
 
     /// Check if an app needs a scene created (wasn't running at startup).
     pub fn needs_scene_for_app(&self, bundle_id: &str) -> bool {
+        let canonical = Self::canonical_app_id(bundle_id);
         self.use_single_active_app_capture()
-            && self.target_apps.iter().any(|a| a == bundle_id)
-            && !self.app_scenes.contains_key(bundle_id)
+            && self
+                .target_apps
+                .iter()
+                .any(|a| Self::canonical_app_id(a) == canonical)
+            && !self.app_scenes.contains_key(&canonical)
     }
 
     /// Switch to a different app's pre-created scene.

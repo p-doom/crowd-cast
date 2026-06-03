@@ -264,8 +264,12 @@ fn get_frontmost_app_windows() -> Option<AppInfo> {
             .unwrap_or("Unknown")
             .to_string();
 
+        // Use a lowercase executable stem as the bundle_id so app matching is
+        // case-insensitive: Windows reports the on-disk case (e.g. "Notepad")
+        // which users can't reliably predict when configuring target_apps.
+        // `name` keeps the original case for display.
         Some(AppInfo {
-            bundle_id: name.clone(),
+            bundle_id: name.to_ascii_lowercase(),
             name,
             pid,
         })

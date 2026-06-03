@@ -324,7 +324,20 @@ impl Config {
             return false;
         }
 
-        self.capture.target_apps.iter().any(|app| app == bundle_id)
+        // On Windows, app identifiers are executable names whose case the user
+        // can't reliably predict, so match case-insensitively. On macOS/Linux the
+        // identifiers (bundle IDs / process names) are case-sensitive.
+        #[cfg(target_os = "windows")]
+        {
+            self.capture
+                .target_apps
+                .iter()
+                .any(|app| app.eq_ignore_ascii_case(bundle_id))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.capture.target_apps.iter().any(|app| app == bundle_id)
+        }
     }
 
     /// Mark setup as completed and save
