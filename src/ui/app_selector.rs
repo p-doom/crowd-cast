@@ -1,8 +1,11 @@
 //! Standalone app selection panel — shown from the tray "Settings" menu.
 
 use anyhow::Result;
+#[cfg(target_os = "macos")]
 use std::ffi::{CStr, CString};
+#[cfg(target_os = "macos")]
 use std::os::raw::c_char;
+#[cfg(target_os = "macos")]
 use tracing::info;
 
 /// Result of showing the app selection panel.
@@ -96,7 +99,20 @@ pub fn show_panel(
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: reuse the native app-picker (the setup wizard's checklist) as a
+/// standalone Settings panel. Blocks on its event loop until Save/Cancel.
+#[cfg(target_os = "windows")]
+pub fn show_panel(current_apps: &[String], capture_all: bool) -> Result<AppSelectionResult> {
+    let r: crate::installer::AppPickerResult =
+        crate::installer::run_settings_panel(current_apps, capture_all)?;
+    Ok(AppSelectionResult {
+        saved: r.saved,
+        capture_all: r.capture_all,
+        selected_apps: r.selected_apps,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn show_panel(
     current_apps: &[String],
     capture_all: bool,

@@ -190,9 +190,27 @@ fn list_windowed_apps() -> Vec<(String, String)> {
     apps
 }
 
-/// Show the native Windows setup wizard. Blocks until the user clicks Save or
-/// Cancel (or closes the window).
-pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
+/// Raw user selections from the shared app-picker dialog.
+#[derive(Clone)]
+struct PickerOutcome {
+    saved: bool,
+    capture_all: bool,
+    selected_apps: Vec<String>,
+    autostart: bool,
+}
+
+/// Build and run the native app-picker dialog on the calling thread, blocking
+/// until the user clicks Save / Cancel or closes the window. Shared by the
+/// first-run setup wizard and the tray Settings panel. When `show_autostart` is
+/// set, the "start at login" row is shown and its state returned; otherwise the
+/// row is hidden and `autostart` echoes `autostart_initial` unchanged.
+fn run_app_picker(
+    title: &str,
+    current_apps: &[String],
+    capture_all_initial: bool,
+    autostart_initial: bool,
+    show_autostart: bool,
+) -> Result<PickerOutcome> {
     nwg::init().map_err(|e| anyhow::anyhow!("Failed to initialize GUI: {:?}", e))?;
     let _ = nwg::Font::set_global_family("Segoe UI");
 
@@ -200,13 +218,7 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
     let preselect: Vec<usize> = apps
         .iter()
         .enumerate()
-        .filter(|(_, (_, exe))| {
-            config
-                .capture
-                .target_apps
-                .iter()
-                .any(|t| t.eq_ignore_ascii_case(exe))
-        })
+        .filter(|(_, (_, exe))| current_apps.iter().any(|t| t.eq_ignore_ascii_case(exe)))
         .map(|(i, _)| i)
         .collect();
 
@@ -226,7 +238,7 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
         .size((460, 520))
         .center(true)
         .icon(logo.as_ref())
-        .title("crowd-cast setup")
+        .title(title)
         .build(&mut window)
         .map_err(|e| anyhow::anyhow!("window: {:?}", e))?;
 
@@ -267,25 +279,29 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
 
     nwg::CheckBox::builder()
         .text("Capture all applications (ignore the checks above)")
-        .check_state(check_state(config.capture.capture_all))
+        .check_state(check_state(capture_all_initial))
         .parent(&window)
         .build(&mut capture_all)
         .map_err(|e| anyhow::anyhow!("checkbox: {:?}", e))?;
 
     // The per-app checklist is irrelevant when "capture all" is on, so disable
     // and grey it to match the checkbox's initial state (synced in the handler).
-    let initially_all = config.capture.capture_all;
-    list.set_enabled(!initially_all);
+    list.set_enabled(!capture_all_initial);
     if let Some(hwnd) = list.handle.hwnd() {
-        unsafe { lv::set_greyed(hwnd, initially_all) };
+        unsafe { lv::set_greyed(hwnd, capture_all_initial) };
     }
 
+    // Always created so the event handler can reference it; only added to the
+    // layout and read back when `show_autostart` is set. When hidden it would
+    // otherwise render at its default (0,0) position over the intro label, so
+    // explicitly hide it in that case.
     nwg::CheckBox::builder()
         .text("Start crowd-cast automatically at login")
-        .check_state(check_state(config.capture.start_on_login))
+        .check_state(check_state(autostart_initial))
         .parent(&window)
         .build(&mut autostart)
         .map_err(|e| anyhow::anyhow!("checkbox: {:?}", e))?;
+    autostart.set_visible(show_autostart);
 
     nwg::Button::builder()
         .text("Save")
@@ -299,29 +315,39 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
         .build(&mut cancel_btn)
         .map_err(|e| anyhow::anyhow!("button: {:?}", e))?;
 
-    nwg::GridLayout::builder()
+    let mut lb = nwg::GridLayout::builder()
         .parent(&window)
         .spacing(2)
         .child_item(nwg::GridLayoutItem::new(&intro, 0, 0, 2, 1))
         .child_item(nwg::GridLayoutItem::new(&list, 0, 1, 2, 8))
-        .child_item(nwg::GridLayoutItem::new(&capture_all, 0, 9, 2, 1))
-        .child_item(nwg::GridLayoutItem::new(&autostart, 0, 10, 2, 1))
-        .child(0, 11, &save_btn)
-        .child(1, 11, &cancel_btn)
+        .child_item(nwg::GridLayoutItem::new(&capture_all, 0, 9, 2, 1));
+    let button_row = if show_autostart {
+        lb = lb.child_item(nwg::GridLayoutItem::new(&autostart, 0, 10, 2, 1));
+        11
+    } else {
+        10
+    };
+    lb.child(0, button_row, &save_btn)
+        .child(1, button_row, &cancel_btn)
         .build(&layout)
         .map_err(|e| anyhow::anyhow!("layout: {:?}", e))?;
 
-    let result = Rc::new(RefCell::new(WizardResult::default()));
+    let outcome = Rc::new(RefCell::new(PickerOutcome {
+        saved: false,
+        capture_all: capture_all_initial,
+        selected_apps: current_apps.to_vec(),
+        autostart: autostart_initial,
+    }));
     let apps = Rc::new(apps);
     let window = Rc::new(window);
 
     let handler = {
-        let res = result.clone();
+        let out = outcome.clone();
         let apps = apps.clone();
         nwg::full_bind_event_handler(&window.handle, move |evt, _data, handle| {
             use nwg::Event as E;
             match evt {
-                // Closing the (only) window ends the wizard with completed = false.
+                // Closing the (only) window ends the dialog with saved = false.
                 E::OnWindowClose => nwg::stop_thread_dispatch(),
                 E::OnButtonClick => {
                     if &handle == &save_btn {
@@ -333,11 +359,11 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
                                 }
                             }
                         }
-                        let mut r = res.borrow_mut();
-                        r.completed = true;
-                        r.selected_apps = selected;
-                        r.capture_all = is_checked(&capture_all);
-                        r.autostart_enabled = is_checked(&autostart);
+                        let mut o = out.borrow_mut();
+                        o.saved = true;
+                        o.selected_apps = selected;
+                        o.capture_all = is_checked(&capture_all);
+                        o.autostart = is_checked(&autostart);
                         nwg::stop_thread_dispatch();
                     } else if &handle == &cancel_btn {
                         nwg::stop_thread_dispatch();
@@ -358,35 +384,80 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
     nwg::dispatch_thread_events();
     nwg::unbind_event_handler(&handler);
 
-    let result = result.borrow().clone();
+    let outcome = outcome.borrow().clone();
+    Ok(outcome)
+}
 
-    if result.completed {
-        info!(
-            "Windows wizard completed: {} app(s), capture_all={}, autostart={}",
-            result.selected_apps.len(),
-            result.capture_all,
-            result.autostart_enabled
-        );
-        config.capture.capture_all = result.capture_all;
-        config.capture.target_apps = result.selected_apps.clone();
-        config.capture.setup_completed = true;
-        config.capture.start_on_login = result.autostart_enabled;
+/// Show the native Windows setup wizard. Blocks until the user clicks Save or
+/// Cancel (or closes the window).
+pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
+    let outcome = run_app_picker(
+        "crowd-cast setup",
+        &config.capture.target_apps,
+        config.capture.capture_all,
+        config.capture.start_on_login,
+        true,
+    )?;
 
-        if result.autostart_enabled {
-            if let Err(e) = enable_autostart(&AutostartConfig::default()) {
-                info!("Failed to enable autostart: {}", e);
-            }
-        } else if let Err(e) = disable_autostart() {
-            info!("Failed to disable autostart: {}", e);
-        }
-
-        config.save()?;
-        info!("Configuration saved");
-    } else {
+    let mut result = WizardResult::default();
+    if !outcome.saved {
         info!("Windows wizard cancelled");
+        return Ok(result);
     }
 
+    result.completed = true;
+    result.selected_apps = outcome.selected_apps.clone();
+    result.capture_all = outcome.capture_all;
+    result.autostart_enabled = outcome.autostart;
+
+    info!(
+        "Windows wizard completed: {} app(s), capture_all={}, autostart={}",
+        result.selected_apps.len(),
+        result.capture_all,
+        result.autostart_enabled
+    );
+    config.capture.capture_all = result.capture_all;
+    config.capture.target_apps = result.selected_apps.clone();
+    config.capture.setup_completed = true;
+    config.capture.start_on_login = result.autostart_enabled;
+
+    if result.autostart_enabled {
+        if let Err(e) = enable_autostart(&AutostartConfig::default()) {
+            info!("Failed to enable autostart: {}", e);
+        }
+    } else if let Err(e) = disable_autostart() {
+        info!("Failed to disable autostart: {}", e);
+    }
+
+    config.save()?;
+    info!("Configuration saved");
+
     Ok(result)
+}
+
+/// Selection returned by the tray Settings app-picker (no autostart row).
+pub struct AppPickerResult {
+    pub saved: bool,
+    pub capture_all: bool,
+    pub selected_apps: Vec<String>,
+}
+
+/// Show the app-picker as a standalone Settings panel (invoked from the tray).
+/// Reuses the wizard's picker UI without the autostart row or `setup_completed`
+/// side effects; the caller persists and applies the returned selection.
+pub fn run_settings_panel(current_apps: &[String], capture_all: bool) -> Result<AppPickerResult> {
+    let outcome = run_app_picker("crowd-cast settings", current_apps, capture_all, false, false)?;
+    info!(
+        "Windows settings panel closed: saved={}, {} app(s), capture_all={}",
+        outcome.saved,
+        outcome.selected_apps.len(),
+        outcome.capture_all
+    );
+    Ok(AppPickerResult {
+        saved: outcome.saved,
+        capture_all: outcome.capture_all,
+        selected_apps: outcome.selected_apps,
+    })
 }
 
 fn check_state(checked: bool) -> nwg::CheckBoxState {

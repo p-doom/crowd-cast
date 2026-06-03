@@ -12,6 +12,8 @@ pub mod wizard_ffi;
 pub mod wizard_gui;
 #[cfg(target_os = "windows")]
 mod wizard_windows;
+#[cfg(target_os = "windows")]
+pub use wizard_windows::{run_settings_panel, AppPickerResult};
 
 pub use autostart::*;
 pub use permissions::*;
