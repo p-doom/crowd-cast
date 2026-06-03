@@ -25,9 +25,11 @@ mod lv {
     use winapi::shared::windef::HWND;
     use winapi::um::commctrl::{
         LVITEMW, LVIS_STATEIMAGEMASK, LVM_GETITEMSTATE, LVM_SETEXTENDEDLISTVIEWSTYLE,
-        LVM_SETITEMSTATE, LVS_EX_CHECKBOXES, LVS_EX_FULLROWSELECT,
+        LVM_SETITEMSTATE, LVM_SETTEXTCOLOR, LVS_EX_CHECKBOXES, LVS_EX_FULLROWSELECT,
     };
-    use winapi::um::winuser::SendMessageW;
+    use winapi::um::winuser::{
+        GetSysColor, InvalidateRect, SendMessageW, COLOR_GRAYTEXT, COLOR_WINDOWTEXT,
+    };
 
     /// State-image index encodes the checkbox: 1 = unchecked, 2 = checked,
     /// stored in bits 12-15 of the item state.
@@ -54,6 +56,15 @@ mod lv {
             row as WPARAM,
             &item as *const LVITEMW as LPARAM,
         );
+    }
+
+    /// Grey out (or restore) the item text to signal the list is disabled.
+    /// A disabled report-view ListView custom-draws its rows and so does NOT
+    /// grey them on its own, so we drive the text colour explicitly.
+    pub unsafe fn set_greyed(hwnd: HWND, greyed: bool) {
+        let color = GetSysColor(if greyed { COLOR_GRAYTEXT } else { COLOR_WINDOWTEXT });
+        SendMessageW(hwnd, LVM_SETTEXTCOLOR, 0, color as LPARAM);
+        InvalidateRect(hwnd, std::ptr::null(), 1);
     }
 
     pub unsafe fn is_checked(hwnd: HWND, row: usize) -> bool {
@@ -94,14 +105,41 @@ const SYSTEM_EXES: &[&str] = &[
 /// information. Avoids the noisy raw window titles.
 fn friendly_label(product_name: &str, exe: &str) -> String {
     let product = product_name.trim();
-    if product.is_empty() {
-        return exe.to_string();
-    }
-    if product.eq_ignore_ascii_case(exe) {
+    let base = if product.is_empty() {
+        exe.to_string()
+    } else if product.eq_ignore_ascii_case(exe) {
         product.to_string()
     } else {
         format!("{} ({})", product, exe)
+    };
+    capitalize_first(&base)
+}
+
+/// Upper-cases the first character (e.g. "firefox" -> "Firefox").
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
+}
+
+/// Load the crowd-cast logo (embedded PNG) as an nwg Icon for the window's
+/// title-bar / taskbar icon. Returns None if decoding fails (icon is optional).
+fn load_logo_icon() -> Option<nwg::Icon> {
+    let png: &[u8] = include_bytes!("../../assets/logo.png");
+    let img = image::load_from_memory(png).ok()?;
+    let small = img.resize_exact(32, 32, image::imageops::FilterType::Lanczos3);
+    let mut ico: Vec<u8> = Vec::new();
+    small
+        .write_to(&mut std::io::Cursor::new(&mut ico), image::ImageFormat::Ico)
+        .ok()?;
+    let mut icon = nwg::Icon::default();
+    nwg::Icon::builder()
+        .source_bin(Some(&ico))
+        .build(&mut icon)
+        .ok()?;
+    Some(icon)
 }
 
 fn list_windowed_apps() -> Vec<(String, String)> {
@@ -172,6 +210,9 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
         .map(|(i, _)| i)
         .collect();
 
+    // Held for the lifetime of the window (Windows keeps using the HICON).
+    let logo = load_logo_icon();
+
     let mut window = Default::default();
     let mut intro = Default::default();
     let mut list = Default::default();
@@ -184,6 +225,7 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
     nwg::Window::builder()
         .size((460, 520))
         .center(true)
+        .icon(logo.as_ref())
         .title("crowd-cast setup")
         .build(&mut window)
         .map_err(|e| anyhow::anyhow!("window: {:?}", e))?;
@@ -229,6 +271,14 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
         .parent(&window)
         .build(&mut capture_all)
         .map_err(|e| anyhow::anyhow!("checkbox: {:?}", e))?;
+
+    // The per-app checklist is irrelevant when "capture all" is on, so disable
+    // and grey it to match the checkbox's initial state (synced in the handler).
+    let initially_all = config.capture.capture_all;
+    list.set_enabled(!initially_all);
+    if let Some(hwnd) = list.handle.hwnd() {
+        unsafe { lv::set_greyed(hwnd, initially_all) };
+    }
 
     nwg::CheckBox::builder()
         .text("Start crowd-cast automatically at login")
@@ -291,6 +341,13 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
                         nwg::stop_thread_dispatch();
                     } else if &handle == &cancel_btn {
                         nwg::stop_thread_dispatch();
+                    } else if &handle == &capture_all {
+                        // Disable + grey the per-app checklist while "capture all" is on.
+                        let all = is_checked(&capture_all);
+                        list.set_enabled(!all);
+                        if let Some(hwnd) = list.handle.hwnd() {
+                            unsafe { lv::set_greyed(hwnd, all) };
+                        }
                     }
                 }
                 _ => {}
