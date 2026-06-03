@@ -96,6 +96,8 @@ windows = { version = "0.58", features = [
 # Pure-Rust system tray + menu (Tauri ecosystem) for the Windows PlatformTray
 tray-icon = "0.19"
 muda = "0.15"
+# Windows toast notifications (Tauri ecosystem)
+tauri-winrt-notification = "0.7"
 
 [build-dependencies]
 cc = "1"
