@@ -13,9 +13,9 @@ tokio-stream = "0.1"
 futures = "0.3"
 
 # Embedded libobs
-libobs = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
-libobs-wrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
-libobs-simple = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+libobs = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
+libobs-wrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
+libobs-simple = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
 # NOTE: libobs-bootstrapper is NOT a general dependency. It downloads prebuilt OBS binaries
 # at runtime (macOS/Windows) and hard-`compile_error!`s on Linux. On Linux, libobs is
 # provided by a system install or a relocatable bundle located via CROWD_CAST_OBS_* env
@@ -78,7 +78,7 @@ libc = "0.2"
 # there, and Linux provisions libobs via a system install or relocatable bundle instead
 # (see src/capture/context.rs + docs/LINUX_LIBOBS_PROVISIONING.md).
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux evdev fallback for Wayland
@@ -102,7 +102,7 @@ windows = { version = "0.58", features = ["Win32_Foundation"] }
 cc = "1"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
-cargo-obs-build = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+cargo-obs-build = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
 pkg-config = "0.3"

@@ -11,26 +11,20 @@ macOS code is unaffected.
 
 ---
 
-## ⚠️ CRITICAL #1 — the GPU/VAAPI fix lives in the libobs-rs fork and must be pushed first
+## CRITICAL #1 — GPU/VAAPI fix (DONE — already wired in)
 
-GPU **encoding** on Intel/AMD Linux requires a change to `libobs-simple` that adds the VAAPI
-encoders to the hardware candidate list (without it, Intel/AMD GPUs silently fall back to software
-x264). That change is committed to the **fork**, not this repo:
+GPU **encoding** on Intel/AMD Linux requires VAAPI encoders in libobs-simple's hardware candidate
+list (without them, Intel/AMD GPUs silently fall back to software x264). This is already done and
+wired in — **no action needed**:
 
-- Repo: `p-doom/libobs-rs`, branch `macos-support`
-- File: `libobs-simple/src/output/simple.rs`, fn `hardware_candidates` (added `FFMPEG_VAAPI[_TEX]`,
-  `HEVC_FFMPEG_VAAPI[_TEX]`, `AV1_FFMPEG_VAAPI[_TEX]`)
+- Fork branch **`p-doom/libobs-rs` `linux-support`** (forked from `macos-support`) contains the fix
+  in `libobs-simple/src/output/simple.rs::hardware_candidates` (`FFMPEG_VAAPI[_TEX]`,
+  `HEVC_FFMPEG_VAAPI[_TEX]`, `AV1_FFMPEG_VAAPI[_TEX]`). It is **pushed**.
+- crowd-cast's `Cargo.toml` points all `libobs-*` deps at `linux-support`, and `Cargo.lock` pins the
+  rev containing the fix (`81f8498`). Verified to compile on macOS.
+- `macos-support` was intentionally left untouched and unpushed.
 
-crowd-cast builds libobs-* from git and Cargo.lock pins a specific rev, so this fix has **no effect
-until**:
-```bash
-# 1) push the fork commit
-git -C <libobs-rs clone> push origin macos-support
-# 2) in crowd-cast, pull the new rev
-cargo update -p libobs-simple
-```
-Until then, NVIDIA still gets NVENC, but Intel/AMD will encode in software. Verify the chosen
-encoder at runtime (see "Validate GPU" below).
+Just confirm at runtime that a hardware encoder is selected (see "Validate GPU" below).
 
 ## ⚠️ CRITICAL #2 — host infrastructure cannot be bundled
 
@@ -68,7 +62,6 @@ The `libobs` crate links libobs at **build time** via pkg-config (or `LIBOBS_PAT
 Also required at build time (unchanged from macOS): `CROWD_CAST_API_GATEWAY_URL`.
 
 ```bash
-# after pushing the fork + cargo update (CRITICAL #1):
 CROWD_CAST_API_GATEWAY_URL="https://.../prod/presign" cargo build --release
 ```
 
@@ -128,8 +121,8 @@ Required OBS plugins present (system or bundle): `linux-pipewire`, `linux-captur
 ---
 
 ## Suggested validation order
-1. Push fork + `cargo update -p libobs-simple` (CRITICAL #1).
-2. Install `obs-studio` (mode 1). `cargo build --release`.
-3. Run with `RUST_LOG=debug`, empty `target_apps` → confirm display capture records a file.
-4. Confirm hardware encoder chosen + EGL render (Validate GPU section).
-5. Then iterate on per-app capture and the bundle/download provisioning.
+1. Install `obs-studio` (mode 1) + `libobs-dev`. `cargo build --release` (the VAAPI fix is already
+   pinned via the `linux-support` branch — CRITICAL #1 is done).
+2. Run with `RUST_LOG=debug`, empty `target_apps` → confirm display capture records a file.
+3. Confirm hardware encoder chosen + EGL render (Validate GPU section).
+4. Then iterate on per-app capture and the bundle/download provisioning.
