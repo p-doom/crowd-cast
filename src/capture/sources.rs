@@ -19,6 +19,22 @@ use libobs_simple::sources::macos::{
 #[cfg(target_os = "macos")]
 use libobs_wrapper::data::ObsObjectUpdater;
 
+#[cfg(target_os = "linux")]
+use libobs_simple::sources::linux::{
+    PipeWireDesktopCaptureSourceBuilder, PipeWireWindowCaptureSourceBuilder,
+    X11CaptureSourceBuilder, XCompositeInputSourceBuilder,
+};
+
+/// Returns true when running under a Wayland session (vs X11), used to choose the right
+/// Linux capture backend (PipeWire/portal on Wayland, XSHM/XComposite on X11).
+#[cfg(target_os = "linux")]
+fn is_wayland_session() -> bool {
+    std::env::var("XDG_SESSION_TYPE")
+        .map(|s| s.eq_ignore_ascii_case("wayland"))
+        .unwrap_or(false)
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
 /// Wrapper around a screen capture source
 pub struct ScreenCaptureSource {
     source: ObsSourceRef,
@@ -68,15 +84,75 @@ impl ScreenCaptureSource {
         })
     }
 
-    /// Create a new screen capture source (fallback for non-macOS)
-    #[cfg(not(target_os = "macos"))]
+    /// Create a new display (full-screen) capture source on Linux.
+    ///
+    /// - **Wayland**: captures via xdg-desktop-portal ScreenCast + PipeWire (the GPU /
+    ///   zero-copy path). The first run shows the portal picker; a restore token can be
+    ///   persisted later to avoid re-prompting (see docs/LINUX_LIBOBS_PROVISIONING.md).
+    /// - **X11**: captures the whole primary screen via XSHM (`xshm_input`).
+    ///
+    /// Audio is configured at the output level, so `_capture_audio` is unused here.
+    #[cfg(target_os = "linux")]
+    pub fn new_display_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        _capture_audio: bool,
+    ) -> Result<Self> {
+        let source = if is_wayland_session() {
+            info!(
+                "Creating Linux PipeWire (Wayland) display capture source: {}",
+                name
+            );
+            context
+                .source_builder::<PipeWireDesktopCaptureSourceBuilder, _>(name)?
+                .set_show_cursor(true)
+                .add_to_scene(scene)
+                .context("Failed to add PipeWire desktop capture source to scene")?
+        } else {
+            info!("Creating Linux X11 (xshm) display capture source: {}", name);
+            context
+                .source_builder::<X11CaptureSourceBuilder, _>(name)?
+                .set_screen(0)
+                .set_show_cursor(true)
+                .add_to_scene(scene)
+                .context("Failed to add X11 screen capture source to scene")?
+        };
+
+        debug!("Linux display capture source '{}' created", name);
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+        })
+    }
+
+    /// Create a new display capture source on Windows.
+    ///
+    /// WINDOWS (for whoever adds Windows support): mirror the Linux/macOS implementations
+    /// using `libobs_simple::sources::windows::MonitorCaptureSourceBuilder` (the
+    /// `monitor_capture` source), selecting the WGC capture method. The structure is
+    /// identical: `context.source_builder::<MonitorCaptureSourceBuilder, _>(name)? ...
+    /// .add_to_scene(scene)`.
+    #[cfg(target_os = "windows")]
     pub fn new_display_capture(
         _context: &mut ObsContext,
         _scene: &mut ObsSceneRef,
         _name: &str,
         _capture_audio: bool,
     ) -> Result<Self> {
-        anyhow::bail!("Screen capture not yet implemented for this platform");
+        anyhow::bail!("Display capture not yet implemented for Windows (use monitor_capture)")
+    }
+
+    /// Fallback for unsupported platforms.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    pub fn new_display_capture(
+        _context: &mut ObsContext,
+        _scene: &mut ObsSceneRef,
+        _name: &str,
+        _capture_audio: bool,
+    ) -> Result<Self> {
+        anyhow::bail!("Screen capture not supported on this platform");
     }
 
     /// Create a new application capture source for a specific application
@@ -128,17 +204,92 @@ impl ScreenCaptureSource {
         })
     }
 
-    /// Create a new application capture source (fallback for non-macOS)
-    #[cfg(not(target_os = "macos"))]
+    /// Create a per-application / per-window capture source on Linux.
+    ///
+    /// Privacy-preserving: only the target window's own buffer is captured, so an
+    /// overlapping non-selected window cannot leak (no monitor cropping involved).
+    /// - **Wayland**: per-window capture via the xdg-desktop-portal ScreenCast WINDOW
+    ///   source (PipeWire). Selection is user-driven through the system picker — Wayland
+    ///   does not permit selecting a window by app id programmatically — so `bundle_id` is
+    ///   used only for logging; persist the restore token to avoid re-prompting.
+    /// - **X11**: per-window capture via XComposite. `bundle_id` MUST be the X11 window id
+    ///   (decimal string); mapping an application to its window id is the caller's job (see
+    ///   the frontmost/app-enumeration code) and is intentionally not done here.
+    ///
+    /// `_display_uuid` is unused on Linux (kept for signature parity with macOS).
+    ///
+    /// NOTE: the end-to-end per-app / follow-focus flow on Linux (portal session lifecycle,
+    /// restore-token persistence, window-id resolution) requires validation on a Linux
+    /// machine. See docs/LINUX_PORTING_PLAN.md.
+    #[cfg(target_os = "linux")]
+    pub fn new_application_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        bundle_id: &str,
+        _display_uuid: &str,
+        _capture_audio: bool,
+    ) -> Result<Self> {
+        let source = if is_wayland_session() {
+            info!(
+                "Creating Linux PipeWire (Wayland) window capture source: {} (app hint: {})",
+                name, bundle_id
+            );
+            context
+                .source_builder::<PipeWireWindowCaptureSourceBuilder, _>(name)?
+                .set_show_cursor(true)
+                .add_to_scene(scene)
+                .context("Failed to add PipeWire window capture source to scene")?
+        } else {
+            info!(
+                "Creating Linux X11 (xcomposite) window capture source: {} (window id: {})",
+                name, bundle_id
+            );
+            context
+                .source_builder::<XCompositeInputSourceBuilder, _>(name)?
+                .set_capture_window(bundle_id)
+                .set_show_cursor(true)
+                .add_to_scene(scene)
+                .context("Failed to add XComposite window capture source to scene")?
+        };
+
+        debug!("Linux application capture source '{}' created", name);
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+        })
+    }
+
+    /// Create a per-application/window capture source on Windows.
+    ///
+    /// WINDOWS (for whoever adds Windows support): implement using
+    /// `libobs_simple::sources::windows::WindowCaptureSourceBuilder` (the `window_capture`
+    /// source, WGC method) to capture a single HWND. Map the target app to its foreground
+    /// HWND in the caller. Same builder -> `add_to_scene` structure as Linux/macOS.
+    #[cfg(target_os = "windows")]
     pub fn new_application_capture(
         _context: &mut ObsContext,
         _scene: &mut ObsSceneRef,
-        name: &str,
+        _name: &str,
         _bundle_id: &str,
         _display_uuid: &str,
         _capture_audio: bool,
     ) -> Result<Self> {
-        anyhow::bail!("Application capture not yet implemented for this platform");
+        anyhow::bail!("Application capture not yet implemented for Windows (use window_capture)")
+    }
+
+    /// Fallback for unsupported platforms.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    pub fn new_application_capture(
+        _context: &mut ObsContext,
+        _scene: &mut ObsSceneRef,
+        _name: &str,
+        _bundle_id: &str,
+        _display_uuid: &str,
+        _capture_audio: bool,
+    ) -> Result<Self> {
+        anyhow::bail!("Application capture not supported on this platform");
     }
 
     /// Get the source name
@@ -377,8 +528,27 @@ pub fn get_main_display_uuid() -> Result<String> {
     }
 }
 
-/// Get the UUID string for the main display (non-macOS fallback)
-#[cfg(not(target_os = "macos"))]
+/// Get the UUID string for the main display.
+///
+/// On Linux the capture sources do not need a display UUID (unlike macOS ScreenCaptureKit
+/// application capture), so this returns an empty string to keep the cross-platform call
+/// sites (e.g. `setup_display_or_multi_capture`) working without special-casing.
+#[cfg(target_os = "linux")]
+pub fn get_main_display_uuid() -> Result<String> {
+    Ok(String::new())
+}
+
+/// Get the UUID string for the main display (Windows).
+///
+/// WINDOWS: not needed for `monitor_capture`/`window_capture`; return empty unless a
+/// monitor identifier is later required.
+#[cfg(target_os = "windows")]
+pub fn get_main_display_uuid() -> Result<String> {
+    Ok(String::new())
+}
+
+/// Get the UUID string for the main display (unsupported-platform fallback)
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn get_main_display_uuid() -> Result<String> {
     anyhow::bail!("Display UUID not available on this platform")
 }
@@ -427,8 +597,28 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     }
 }
 
-/// Get the actual resolution of the main display (non-macOS fallback)
-#[cfg(not(target_os = "macos"))]
+/// Get the actual resolution of the main display (Linux).
+///
+/// Not yet implemented: callers (`CaptureContext::initialize`) fall back to OBS's default
+/// canvas size on `Err`, and libobs scales the captured source to the canvas, so capture
+/// still works — just not at the native display resolution. A proper implementation can
+/// query the X11 (`RANDR`) or Wayland (`wl_output`) mode later.
+#[cfg(target_os = "linux")]
+pub fn get_main_display_resolution() -> Result<(u32, u32)> {
+    anyhow::bail!("Display resolution detection not yet implemented on Linux (using OBS defaults)")
+}
+
+/// Get the actual resolution of the main display (Windows).
+///
+/// WINDOWS: implement via `GetSystemMetrics`/`EnumDisplayMonitors`; until then callers fall
+/// back to OBS defaults.
+#[cfg(target_os = "windows")]
+pub fn get_main_display_resolution() -> Result<(u32, u32)> {
+    anyhow::bail!("Display resolution detection not yet implemented on Windows (using OBS defaults)")
+}
+
+/// Get the actual resolution of the main display (unsupported-platform fallback)
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     anyhow::bail!("Display resolution detection not available on this platform")
 }

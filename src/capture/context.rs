@@ -8,6 +8,11 @@
 //! (specific applications by bundle ID).
 
 use anyhow::{Context as _, Result};
+// The OBS bootstrapper downloads prebuilt OBS binaries at runtime. It is only used on
+// macOS/Windows; on Linux libobs is provided by a system install or a relocatable bundle
+// (located via CROWD_CAST_OBS_* env vars), so the crate (which hard-`compile_error!`s on
+// Linux) is gated out entirely here and in Cargo.toml.
+#[cfg(not(target_os = "linux"))]
 use libobs_bootstrapper::{
     status_handler::ObsBootstrapStatusHandler, ObsBootstrapper, ObsBootstrapperOptions,
     ObsBootstrapperResult,
@@ -15,8 +20,12 @@ use libobs_bootstrapper::{
 use libobs_wrapper::context::ObsContext;
 use libobs_wrapper::data::video::ObsVideoInfoBuilder;
 use libobs_wrapper::scenes::ObsSceneRef;
-use libobs_wrapper::utils::{ObsPath, StartupInfo, StartupPaths};
+use libobs_wrapper::utils::StartupInfo;
+// ObsPath/StartupPaths are only used to redirect OBS runtime paths on macOS/Linux.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use libobs_wrapper::utils::{ObsPath, StartupPaths};
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_os = "linux"))]
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -28,6 +37,8 @@ use super::frontmost::get_frontmost_app;
 use super::recording::{calculate_output_dimensions, RecordingConfig, RecordingOutput};
 use super::sources::{get_main_display_resolution, get_main_display_uuid, ScreenCaptureSource};
 use super::CaptureState;
+// Only used by the macOS/Windows bootstrap path below.
+#[cfg(not(target_os = "linux"))]
 use crate::ui::{is_running_in_app_bundle, show_obs_download_started_notification};
 
 /// Session information for a recording
@@ -77,18 +88,29 @@ impl CaptureContext {
     pub async fn new(output_directory: PathBuf) -> Result<Self> {
         info!("Initializing embedded libobs capture context...");
 
-        // Bootstrap OBS binaries (download if not present)
-        let bootstrap_result = Self::bootstrap_obs().await?;
+        // Bootstrap OBS binaries (download if not present).
+        // Linux does NOT use the bootstrapper: libobs is provided by a system OBS install
+        // or a relocatable bundle located via CROWD_CAST_OBS_* env vars (see
+        // `obs_startup_paths_from_env` and docs/LINUX_LIBOBS_PROVISIONING.md).
+        #[cfg(not(target_os = "linux"))]
+        {
+            let bootstrap_result = Self::bootstrap_obs().await?;
 
-        match bootstrap_result {
-            ObsBootstrapperResult::None => {
-                debug!("OBS binaries already present");
+            match bootstrap_result {
+                ObsBootstrapperResult::None => {
+                    debug!("OBS binaries already present");
+                }
+                ObsBootstrapperResult::Restart => {
+                    // On Windows this means we need to restart. On macOS, Done is returned instead.
+                    warn!("OBS bootstrap requires restart - this shouldn't happen on macOS");
+                    anyhow::bail!("OBS bootstrap requires application restart");
+                }
             }
-            ObsBootstrapperResult::Restart => {
-                // On Windows this means we need to restart. On macOS, Done is returned instead.
-                warn!("OBS bootstrap requires restart - this shouldn't happen on macOS");
-                anyhow::bail!("OBS bootstrap requires application restart");
-            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            debug!("Linux: skipping OBS bootstrapper (libobs provided by system install or bundle via StartupPaths)");
         }
 
         Ok(Self {
@@ -108,7 +130,8 @@ impl CaptureContext {
         })
     }
 
-    /// Bootstrap OBS binaries
+    /// Bootstrap OBS binaries (macOS/Windows only; Linux uses system or bundled libobs).
+    #[cfg(not(target_os = "linux"))]
     async fn bootstrap_obs() -> Result<ObsBootstrapperResult> {
         let notify_download = is_running_in_app_bundle();
         #[cfg(target_os = "macos")]
@@ -198,7 +221,11 @@ impl CaptureContext {
             .build();
 
         let mut startup_info = StartupInfo::default().set_video_info(video_info);
-        #[cfg(target_os = "macos")]
+        // On macOS the runtime OBS lives in the app bundle; on Linux it lives in a
+        // downloaded/extracted bundle (or system install). Both can be redirected via
+        // CROWD_CAST_OBS_* env vars. When none are set on Linux, `StartupInfo::default()`
+        // already points libobs-wrapper at the system OBS paths.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(paths) = obs_startup_paths_from_env() {
             startup_info = startup_info.set_startup_paths(paths);
         }
@@ -1021,12 +1048,14 @@ impl CaptureContext {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
 struct ObsBootstrapNotificationHandler {
     notify_download: bool,
     download_notified: bool,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl ObsBootstrapNotificationHandler {
     fn new(notify_download: bool) -> Self {
         Self {
@@ -1071,6 +1100,36 @@ fn obs_startup_paths_from_env() -> Option<StartupPaths> {
     Some(paths)
 }
 
+/// Build OBS runtime paths for Linux from environment overrides.
+///
+/// Lets the Linux build point libobs at either a downloaded relocatable bundle or a
+/// system OBS install WITHOUT recompiling. All three granular overrides must be set:
+///   - `CROWD_CAST_OBS_DATA_PATH`        -> libobs data dir (the `data/libobs` effects dir)
+///   - `CROWD_CAST_OBS_PLUGIN_BIN_PATH`  -> plugin binary dir (may contain the `%module%` token)
+///   - `CROWD_CAST_OBS_PLUGIN_DATA_PATH` -> plugin data dir (typically `.../%module%`)
+///
+/// When they are not all set, returns `None` so that `StartupInfo::default()` is used —
+/// which on Linux already points libobs-wrapper at the system OBS install (e.g.
+/// `/usr/share/obs/libobs` + `/usr/lib/<arch>/obs-plugins`). The relocatable-bundle layout
+/// these vars are expected to point at is defined in docs/LINUX_LIBOBS_PROVISIONING.md.
+#[cfg(target_os = "linux")]
+fn obs_startup_paths_from_env() -> Option<StartupPaths> {
+    let data = std::env::var("CROWD_CAST_OBS_DATA_PATH").ok()?;
+    let plugin_bin = std::env::var("CROWD_CAST_OBS_PLUGIN_BIN_PATH").ok()?;
+    let plugin_data = std::env::var("CROWD_CAST_OBS_PLUGIN_DATA_PATH").ok()?;
+
+    info!(
+        "Using OBS runtime paths from env overrides (data={}, plugin_bin={}, plugin_data={})",
+        data, plugin_bin, plugin_data
+    );
+    Some(StartupPaths::new(
+        ObsPath::new(data.as_str()),
+        ObsPath::new(plugin_bin.as_str()),
+        ObsPath::new(plugin_data.as_str()),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
 impl ObsBootstrapStatusHandler for ObsBootstrapNotificationHandler {
     type Error = Infallible;
 
