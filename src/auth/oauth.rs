@@ -137,8 +137,12 @@ impl AuthManager {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", &auth_url])
+            // NOTE: do NOT use `cmd /C start <url>` — cmd treats `&` as a command
+            // separator and truncates the OAuth URL at the first query param, so
+            // Google sees a request missing `response_type` etc. rundll32 takes
+            // the full URL as a single argument with no shell parsing.
+            let _ = std::process::Command::new("rundll32")
+                .args(["url.dll,FileProtocolHandler", &auth_url])
                 .spawn();
         }
 
