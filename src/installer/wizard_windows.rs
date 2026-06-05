@@ -212,7 +212,28 @@ fn run_app_picker(
     show_autostart: bool,
 ) -> Result<PickerOutcome> {
     nwg::init().map_err(|e| anyhow::anyhow!("Failed to initialize GUI: {:?}", e))?;
-    let _ = nwg::Font::set_global_family("Segoe UI");
+
+    // The process is Per-Monitor-V2 DPI-aware (set in main, for libobs), but nwg
+    // does not scale its controls for DPI. Without help that yields a tiny
+    // physical-pixel window rendered with an oversized default font (text looks
+    // huge and long labels clip). So scale the window/columns by the system DPI
+    // and set an explicit Segoe UI font sized for that DPI.
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96);
+    let scale = dpi as f64 / 96.0;
+    let px = |design: f64| (design * scale).round() as i32;
+
+    // Native Windows UI is Segoe UI ~9pt; lfHeight in device px = pt * dpi / 72.
+    let mut font = nwg::Font::default();
+    if nwg::Font::builder()
+        .family("Segoe UI")
+        .size_absolute((9.0 * dpi as f64 / 72.0).round() as u32)
+        .build(&mut font)
+        .is_ok()
+    {
+        nwg::Font::set_global_default(Some(font));
+    } else {
+        let _ = nwg::Font::set_global_family("Segoe UI");
+    }
 
     let apps = list_windowed_apps();
     let preselect: Vec<usize> = apps
@@ -235,7 +256,7 @@ fn run_app_picker(
     let layout = Default::default();
 
     nwg::Window::builder()
-        .size((460, 520))
+        .size((px(460.0), px(520.0)))
         .center(true)
         .icon(logo.as_ref())
         .title(title)
@@ -259,7 +280,7 @@ fn run_app_picker(
     list.insert_column(nwg::InsertListViewColumn {
         index: Some(0),
         fmt: None,
-        width: Some(430),
+        width: Some(px(430.0)),
         text: Some("Application".to_string()),
     });
     for (label, _) in &apps {
@@ -395,7 +416,13 @@ pub fn run_wizard_windows(config: &mut Config) -> Result<WizardResult> {
         "crowd-cast setup",
         &config.capture.target_apps,
         config.capture.capture_all,
-        config.capture.start_on_login,
+        // Default "start at login" to on for first-time setup; respect the saved
+        // value when the user re-runs the wizard later.
+        if config.capture.setup_completed {
+            config.capture.start_on_login
+        } else {
+            true
+        },
         true,
     )?;
 
