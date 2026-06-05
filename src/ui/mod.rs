@@ -7,6 +7,8 @@ mod tray;
 pub mod tray_ffi;
 #[cfg(target_os = "macos")]
 mod tray_macos;
+#[cfg(target_os = "windows")]
+mod tray_windows;
 mod updater;
 
 pub use notifications::{

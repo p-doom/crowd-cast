@@ -71,9 +71,8 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
-        // On Windows, we need shell32 for the tray
-        // For now, disable tray on Windows until we add the C sources
-        println!("cargo:rustc-cfg=no_tray");
+        // The Windows tray is implemented in pure Rust via the tray-icon/muda
+        // crates (see src/ui/tray_windows.rs), so no C sources or no_tray flag.
     }
 
     println!("cargo:rerun-if-changed=src/ui/tray.h");
