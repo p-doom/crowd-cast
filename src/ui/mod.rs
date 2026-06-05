@@ -1,6 +1,8 @@
 //! System tray UI and notifications
 
 pub mod app_selector;
+#[cfg(target_os = "windows")]
+mod aumid_windows;
 pub mod notifications;
 mod platform_tray;
 mod tray;
@@ -21,6 +23,13 @@ pub use notifications::{
 };
 pub use tray::*;
 pub use updater::UpdaterController;
+
+/// Register the Windows notification identity (AUMID + Start Menu shortcut) so
+/// toasts are branded as crowd-cast. No-op error handling inside.
+#[cfg(target_os = "windows")]
+pub fn register_notification_identity() {
+    aumid_windows::register();
+}
 
 #[cfg(target_os = "macos")]
 pub fn current_app_bundle_path() -> Option<std::path::PathBuf> {
