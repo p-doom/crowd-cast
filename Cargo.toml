@@ -98,6 +98,10 @@ tray-icon = "0.19"
 muda = "0.15"
 # Windows toast notifications (Tauri ecosystem)
 tauri-winrt-notification = "0.7"
+# Native Win32 GUI for the Windows setup wizard / app picker
+native-windows-gui = "1"
+# Raw Win32 for ListView checkbox state (LVS_EX_CHECKBOXES) in the wizard
+winapi = { version = "0.3", features = ["winuser", "commctrl", "windef", "minwindef", "basetsd"] }
 
 [build-dependencies]
 cc = "1"
@@ -107,6 +111,10 @@ cargo-obs-build = { git = "https://github.com/p-doom/libobs-rs", branch = "macos
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
 pkg-config = "0.3"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+# Embeds the app manifest (Common Controls v6) required by native-windows-gui
+embed-resource = "2"
 
 [profile.release]
 lto = true

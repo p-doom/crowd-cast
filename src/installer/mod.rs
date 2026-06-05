@@ -10,6 +10,8 @@ pub mod permissions;
 pub mod wizard;
 pub mod wizard_ffi;
 pub mod wizard_gui;
+#[cfg(target_os = "windows")]
+mod wizard_windows;
 
 pub use autostart::*;
 pub use permissions::*;
