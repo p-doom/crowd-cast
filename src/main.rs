@@ -3,6 +3,12 @@
 //! Captures paired screencast and input data for dataset collection.
 //! Uses embedded libobs for single-binary distribution.
 
+// Release builds run as a background tray agent, so use the Windows GUI
+// subsystem to avoid popping a console window (which would show libobs/log
+// output) when launched from the installer/Start Menu. Debug builds keep the
+// console for development. No-op on non-Windows targets.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod auth;
 mod capture;
 mod config;

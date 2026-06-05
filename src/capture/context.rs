@@ -126,7 +126,10 @@ impl CaptureContext {
 
     /// Bootstrap OBS binaries
     async fn bootstrap_obs() -> Result<ObsBootstrapperResult> {
-        let notify_download = is_running_in_app_bundle();
+        // On Windows the release agent runs windowless (no console), so the
+        // one-time first-launch OBS download is otherwise invisible — toast a
+        // "downloading" notification so the user knows why startup is delayed.
+        let notify_download = is_running_in_app_bundle() || cfg!(target_os = "windows");
         #[cfg(target_os = "macos")]
         let options = {
             let mut options = ObsBootstrapperOptions::default().set_update(false);
