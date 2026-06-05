@@ -1,4 +1,5 @@
 obs-build/
 target/
 build/
+dist/
 .venv/
