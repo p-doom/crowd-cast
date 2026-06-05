@@ -132,7 +132,37 @@ scripts/build-and-publish-macos.sh \
 
 Auto-updates are delivered via Sparkle using an appcast hosted on S3.
 
-### Linux/Windows
+### Windows
+
+The agent runs from a single executable; OBS is fetched automatically on first
+launch and no special permissions are required.
+
+#### Windows Distribution
+
+Build the per-user installer (no admin / UAC required) with [Inno Setup](https://jrsoftware.org/isinfo.php):
+
+```powershell
+# One-time: install the Inno Setup compiler
+winget install JRSoftware.InnoSetup
+
+# Build the release binary + installer
+$env:CROWD_CAST_API_GATEWAY_URL = "https://.../prod/presign"
+pwsh scripts/build-windows-installer.ps1
+# -> dist/crowd-cast-setup-<version>.exe
+```
+
+The installer (`installer/windows/crowd-cast.iss`) installs the agent and its
+`obs.dll` loader under `%LOCALAPPDATA%\Programs\crowd-cast`, creates a Start Menu
+shortcut tagged with the app's AppUserModelID (so toast notifications are branded
+"crowd-cast"), and registers an uninstaller that stops the agent and removes the
+autostart entry and install directory. Autostart itself is managed in-app via the
+setup wizard's "start at login" option.
+
+On first launch the agent downloads the rest of the OBS runtime (codecs,
+plugins) into the install folder and relaunches itself automatically — a
+one-time step that needs network access.
+
+### Linux
 
 Support coming soon...
 

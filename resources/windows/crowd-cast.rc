@@ -1,3 +1,8 @@
 // Embeds the application manifest as an RT_MANIFEST (24) resource with the
 // process manifest id (1). Compiled by embed-resource in build.rs on Windows.
 1 24 "crowd-cast.manifest"
+
+// Application icon (lowest-ID icon group becomes the exe's Explorer/taskbar
+// icon and the default for Start Menu shortcuts). Multi-size .ico generated
+// from assets/logo.png.
+1 ICON "crowd-cast.ico"
