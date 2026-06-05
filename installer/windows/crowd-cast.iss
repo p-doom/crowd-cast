@@ -14,8 +14,8 @@
 #ifndef AppVersionInfo
 #define AppVersionInfo "0.0.0.0"
 #endif
-#ifndef SourceExe
-#define SourceExe "..\..\target\release\crowd-cast-agent.exe"
+#ifndef SourceDir
+#define SourceDir "..\..\target\release"
 #endif
 
 #define AppName "crowd-cast"
@@ -58,7 +58,11 @@ SolidCompression=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; obs.dll is the loader the agent links against and must be present for the
+; process to start; the rest of the OBS runtime (data\, obs-plugins\, codec
+; DLLs) is downloaded into {app} on first launch by the bootstrapper.
+Source: "{#SourceDir}\obs.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; Start Menu shortcut placed directly under Programs at the SAME path the agent
@@ -82,3 +86,8 @@ Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; \
 ; Stop a running agent so its files can be removed.
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExe}"; \
     Flags: runhidden; RunOnceId: "StopAgent"
+
+[UninstallDelete]
+; The OBS runtime is downloaded into {app} on first launch (not tracked by the
+; installer), so remove the whole install directory on uninstall.
+Type: filesandordirs; Name: "{app}"

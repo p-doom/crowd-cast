@@ -24,9 +24,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$iss      = Join-Path $repoRoot 'installer\windows\crowd-cast.iss'
-$exePath  = Join-Path $repoRoot 'target\release\crowd-cast-agent.exe'
+$repoRoot   = Split-Path -Parent $PSScriptRoot
+$iss        = Join-Path $repoRoot 'installer\windows\crowd-cast.iss'
+$releaseDir = Join-Path $repoRoot 'target\release'
+$exePath    = Join-Path $releaseDir 'crowd-cast-agent.exe'
+$obsDll     = Join-Path $releaseDir 'obs.dll'
 
 if ([string]::IsNullOrWhiteSpace($ApiGatewayUrl)) {
     throw "CROWD_CAST_API_GATEWAY_URL is required (set the env var or pass -ApiGatewayUrl)."
@@ -63,9 +65,12 @@ $env:CROWD_CAST_API_GATEWAY_URL = $ApiGatewayUrl
 & cargo build --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed." }
 if (-not (Test-Path $exePath)) { throw "Expected binary not found at $exePath." }
+# obs.dll is the loader the agent links against; it must ship so the process can
+# start (the rest of the OBS runtime is downloaded on first launch).
+if (-not (Test-Path $obsDll)) { throw "obs.dll not found at $obsDll (expected from the libobs-rs build)." }
 
 Write-Host "==> Compiling installer (ISCC)..." -ForegroundColor Cyan
-& $Iscc "/DAppVersion=$Version" "/DAppVersionInfo=$versionInfo" "/DSourceExe=$exePath" $iss
+& $Iscc "/DAppVersion=$Version" "/DAppVersionInfo=$versionInfo" "/DSourceDir=$releaseDir" $iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed." }
 
 $out = Join-Path $repoRoot "dist\crowd-cast-setup-$Version.exe"

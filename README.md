@@ -151,12 +151,16 @@ pwsh scripts/build-windows-installer.ps1
 # -> dist/crowd-cast-setup-<version>.exe
 ```
 
-The installer (`installer/windows/crowd-cast.iss`) installs the agent under
-`%LOCALAPPDATA%\Programs\crowd-cast`, creates a Start Menu shortcut tagged with
-the app's AppUserModelID (so toast notifications are branded "crowd-cast"), and
-registers an uninstaller that stops the agent and removes the autostart entry.
-Autostart itself is managed in-app via the setup wizard's "start at login"
-option.
+The installer (`installer/windows/crowd-cast.iss`) installs the agent and its
+`obs.dll` loader under `%LOCALAPPDATA%\Programs\crowd-cast`, creates a Start Menu
+shortcut tagged with the app's AppUserModelID (so toast notifications are branded
+"crowd-cast"), and registers an uninstaller that stops the agent and removes the
+autostart entry and install directory. Autostart itself is managed in-app via the
+setup wizard's "start at login" option.
+
+On first launch the agent downloads the rest of the OBS runtime (codecs,
+plugins) into the install folder and relaunches itself automatically — a
+one-time step that needs network access.
 
 ### Linux
 
