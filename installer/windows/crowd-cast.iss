@@ -59,10 +59,13 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "{#SourceDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
-; obs.dll is the loader the agent links against and must be present for the
-; process to start; the rest of the OBS runtime (data\, obs-plugins\, codec
-; DLLs) is downloaded into {app} on first launch by the bootstrapper.
-Source: "{#SourceDir}\obs.dll"; DestDir: "{app}"; Flags: ignoreversion
+; obs.dll is a small loader the agent links against; it must be present for the
+; process to start. On first launch the bootstrapper downloads the full OBS
+; runtime (data\, obs-plugins\, codec DLLs) into {app} AND replaces this loader
+; with the real ~1 MB obs.dll. Use onlyifdoesntexist so a reinstall does not
+; clobber that real DLL back to the stub — bootstrap is skipped once the runtime
+; exists, so the stub would then fail to load OBS.
+Source: "{#SourceDir}\obs.dll"; DestDir: "{app}"; Flags: onlyifdoesntexist
 
 [Icons]
 ; Start Menu shortcut placed directly under Programs at the SAME path the agent
