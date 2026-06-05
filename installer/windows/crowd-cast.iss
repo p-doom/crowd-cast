@@ -66,6 +66,9 @@ Source: "{#SourceDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; clobber that real DLL back to the stub — bootstrap is skipped once the runtime
 ; exists, so the stub would then fail to load OBS.
 Source: "{#SourceDir}\obs.dll"; DestDir: "{app}"; Flags: onlyifdoesntexist
+; WinSparkle auto-updater runtime, loaded dynamically at startup. Static (not
+; replaced at runtime), so refresh it on every install/update.
+Source: "{#SourceDir}\WinSparkle.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; Start Menu shortcut placed directly under Programs at the SAME path the agent
