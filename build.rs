@@ -64,8 +64,21 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     {
-        // On Linux, we need GTK for the tray
-        // For now, disable tray on Linux until we add the C sources
+        // Native GTK3 setup wizard (mirrors the macOS Cocoa wizard). The system tray
+        // is still disabled on Linux for now (no_tray); only the wizard is wired up.
+        let gtk = pkg_config::Config::new()
+            .atleast_version("3.0.0")
+            .probe("gtk+-3.0")
+            .expect("gtk+-3.0 development files are required to build the Linux setup wizard");
+        let mut wizard = cc::Build::new();
+        wizard.file("src/ui/wizard_linux.c");
+        for inc in &gtk.include_paths {
+            wizard.include(inc);
+        }
+        wizard.compile("wizard_linux");
+        println!("cargo:rerun-if-changed=src/ui/wizard_linux.c");
+
+        // Tray not yet implemented on Linux.
         println!("cargo:rustc-cfg=no_tray");
     }
 

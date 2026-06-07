@@ -10,7 +10,7 @@ use crate::capture::list_capturable_apps;
 use crate::config::Config;
 use crate::installer::autostart::{disable_autostart, enable_autostart, AutostartConfig};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::wizard_ffi::{self, AppInfoWrapper};
 
 /// Result of running the GUI wizard
@@ -44,20 +44,19 @@ impl Default for WizardResult {
 pub fn run_wizard_gui(config: &mut Config) -> Result<WizardResult> {
     info!("Starting native setup wizard");
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        run_wizard_macos(config)
+        run_wizard_native(config)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        // For non-macOS, we could fall back to CLI wizard or return error
-        anyhow::bail!("Native GUI wizard is only available on macOS. Use --setup for CLI wizard.");
+        anyhow::bail!("Native GUI wizard is not available on this platform.");
     }
 }
 
-#[cfg(target_os = "macos")]
-fn run_wizard_macos(config: &mut Config) -> Result<WizardResult> {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_wizard_native(config: &mut Config) -> Result<WizardResult> {
     // Get list of available apps
     info!("Loading available applications...");
     let apps = list_capturable_apps();

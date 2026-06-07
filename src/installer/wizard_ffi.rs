@@ -37,7 +37,9 @@ impl Default for WizardConfig {
     }
 }
 
-#[cfg(target_os = "macos")]
+// Shared C ABI implemented by the native wizard on each platform
+// (src/ui/wizard_darwin.m on macOS, src/ui/wizard_linux.c on Linux).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 extern "C" {
     /// Set the list of available apps for selection
     fn wizard_set_apps(apps: *const WizardAppInfo, count: usize);
@@ -47,7 +49,11 @@ extern "C" {
 
     /// Free memory allocated by the wizard for selected_apps
     fn wizard_free_result(config: *mut WizardConfig);
+}
 
+// macOS-only permission helpers (TCC). No Linux equivalent in the wizard ABI.
+#[cfg(target_os = "macos")]
+extern "C" {
     /// Check accessibility permission status (1 = granted, 0 = denied)
     fn wizard_check_accessibility() -> i32;
 
@@ -112,7 +118,7 @@ pub struct NativeWizardResult {
 }
 
 /// Set the available apps for the wizard to display
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn set_available_apps(apps: &[AppInfoWrapper]) {
     let ffi_apps: Vec<WizardAppInfo> = apps.iter().map(|a| a.as_ffi()).collect();
     unsafe {
@@ -121,7 +127,7 @@ pub fn set_available_apps(apps: &[AppInfoWrapper]) {
 }
 
 /// Run the native wizard and return the result
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn run_native_wizard() -> NativeWizardResult {
     let mut config = WizardConfig::default();
 
@@ -207,11 +213,11 @@ pub fn open_notifications_settings() {
     unsafe { wizard_open_notifications_settings() }
 }
 
-// Non-macOS stubs
-#[cfg(not(target_os = "macos"))]
+// Stubs for platforms without a native wizard (e.g. Windows)
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn set_available_apps(_apps: &[AppInfoWrapper]) {}
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn run_native_wizard() -> NativeWizardResult {
     NativeWizardResult {
         completed: false,
