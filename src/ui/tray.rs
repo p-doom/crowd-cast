@@ -369,12 +369,35 @@ impl TrayApp {
                 self.last_update_check = std::time::Instant::now();
             }
 
-            // Handle deferred Sparkle install requests
+            // Handle deferred auto-update install requests.
             self.pending_prepare_for_update |= self.updater.take_prepare_for_update_request();
-            match next_prepare_for_update_action(
+            let prepare_action = next_prepare_for_update_action(
                 self.pending_prepare_for_update,
                 self.last_status.as_ref(),
-            ) {
+            );
+
+            // On Windows, WinSparkle launches the installer *first* and only then
+            // asks the app to quit — and, unlike macOS Sparkle, it never terminates
+            // the process itself. The installer is already running and waiting to
+            // replace this exe, so we must clean-stop and exit promptly or its
+            // Restart Manager step can't close us ("Setup was unable to close all
+            // applications"). Any actionable state takes the same path as a tray
+            // Quit: send Shutdown (flush segment + stop OBS), then break and exit.
+            #[cfg(target_os = "windows")]
+            match prepare_action {
+                PrepareForUpdateAction::SendCommand | PrepareForUpdateAction::ClearRequest => {
+                    info!("Auto-update staged an installer; shutting down to apply it");
+                    crate::INTENTIONAL_EXIT.store(true, Ordering::SeqCst);
+                    let _ = self.cmd_tx.try_send(EngineCommand::Shutdown);
+                    break;
+                }
+                PrepareForUpdateAction::Wait => {}
+            }
+
+            // On macOS, Sparkle terminates (and relaunches) the app for us, so we
+            // only need a clean stop while recording; otherwise just clear it.
+            #[cfg(not(target_os = "windows"))]
+            match prepare_action {
                 PrepareForUpdateAction::SendCommand => {
                     info!("Auto-update requested a clean stop before install");
                     // Mark as intentional so main exits with 0 (no KeepAlive restart)

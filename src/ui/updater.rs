@@ -107,7 +107,12 @@ impl UpdaterController {
         {
             let url = option_env!("CROWD_CAST_APPCAST_URL").unwrap_or_default();
             let key = option_env!("CROWD_CAST_ED_PUBLIC_KEY").unwrap_or_default();
-            match super::updater_windows::init(url, key, env!("CARGO_PKG_VERSION")) {
+            // Compare against {base}.{build_number} so each new build looks newer
+            // without bumping the Cargo version (matches macOS). Falls back to the
+            // Cargo version for dev builds with no build number stamped in.
+            let version =
+                option_env!("CROWD_CAST_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+            match super::updater_windows::init(url, key, version) {
                 Ok(()) => {
                     self.started = true;
                     info!("WinSparkle updater initialized");

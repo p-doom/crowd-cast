@@ -85,8 +85,13 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     ValueType: none; ValueName: "{#AppName}"; Flags: dontcreatekey uninsdeletevalue
 
 [Run]
+; Interactive install: offer a "Launch crowd-cast" checkbox on the Finish page.
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; \
     Flags: nowait postinstall skipifsilent
+; Silent auto-update: WinSparkle runs this installer with /VERYSILENT, so the
+; checkbox above is skipped. Relaunch the agent automatically (only when silent)
+; so it keeps running across updates, mirroring macOS Sparkle's relaunch.
+Filename: "{app}\{#AppExe}"; Flags: nowait runhidden; Check: WizardSilent
 
 [UninstallRun]
 ; Stop a running agent so its files can be removed.

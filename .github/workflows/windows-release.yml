@@ -1,0 +1,92 @@
+name: Windows Release
+
+# Manual trigger (Actions tab → "Run workflow", or `gh workflow run windows-release.yml`).
+# No version bump needed: the marketing version comes from Cargo.toml, and the
+# AUTO build number (the workflow run number) makes every release look newer to
+# WinSparkle — so clients auto-update on each release, exactly like macOS.
+on:
+  workflow_dispatch:
+    inputs:
+      version_base:
+        description: "Marketing version (blank = Cargo.toml version)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # create the GitHub Release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Resolve versions
+        id: ver
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $base  = "${{ github.event.inputs.version_base }}"
+          if ([string]::IsNullOrWhiteSpace($base)) { $base = $cargo }
+          $build = "${{ github.run_number }}"
+          "marketing=$base"           >> $env:GITHUB_OUTPUT
+          "build=$build"              >> $env:GITHUB_OUTPUT
+          "buildVersion=$base.$build" >> $env:GITHUB_OUTPUT
+          "tag=win-v$base+$build"     >> $env:GITHUB_OUTPUT
+
+      - name: Build release binary + installer
+        shell: pwsh
+        env:
+          CROWD_CAST_API_GATEWAY_URL: ${{ secrets.CROWD_CAST_API_GATEWAY_URL }}
+          CROWD_CAST_GOOGLE_CLIENT_ID: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_ID }}
+          CROWD_CAST_GOOGLE_CLIENT_SECRET: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_SECRET }}
+          CROWD_CAST_APPCAST_URL: https://crowd-cast-bucket.s3.amazonaws.com/appcast-win.xml
+          CROWD_CAST_ED_PUBLIC_KEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
+          # Auto build number → comparable version = {marketing}.{run_number}
+          CROWD_CAST_VERSION_BASE: ${{ steps.ver.outputs.marketing }}
+          CROWD_CAST_BUILD_NUMBER: ${{ steps.ver.outputs.build }}
+        run: pwsh scripts/build-windows-installer.ps1 -Version "${{ steps.ver.outputs.marketing }}"
+
+      - name: Sign installer + generate appcast
+        shell: pwsh
+        env:
+          ED_PRIVATE_KEY: ${{ secrets.CROWD_CAST_ED_PRIVATE_KEY }}
+        run: |
+          $v   = "${{ steps.ver.outputs.marketing }}"
+          $bv  = "${{ steps.ver.outputs.buildVersion }}"
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $installer = "dist/crowd-cast-setup-$v.exe"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/crowd-cast-setup-$v.exe"
+          $keyFile = Join-Path $env:RUNNER_TEMP 'ed25519.key'
+          [System.IO.File]::WriteAllText($keyFile, $env:ED_PRIVATE_KEY, (New-Object System.Text.UTF8Encoding($false)))
+          try {
+            pwsh scripts/generate-appcast-win.ps1 -InstallerPath $installer -Version $v -BuildVersion $bv -DownloadUrl $url -PrivateKeyFile $keyFile -OutFile dist/appcast-win.xml
+          } finally {
+            Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "crowd-cast (Windows) ${{ steps.ver.outputs.marketing }} build ${{ steps.ver.outputs.build }}"
+          files: dist/crowd-cast-setup-${{ steps.ver.outputs.marketing }}.exe
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # Publish the appcast LAST — once it's live, clients start updating, so the
+      # release asset (previous step) must already exist for the download URL.
+      - name: Publish appcast to S3
+        run: aws s3 cp dist/appcast-win.xml s3://crowd-cast-bucket/appcast-win.xml

@@ -6,6 +6,7 @@
 fn main() {
     configure_upload_endpoint();
     configure_google_oauth();
+    configure_build_version();
 
     // Tell Cargo about the no_tray cfg
     println!("cargo::rustc-check-cfg=cfg(no_tray)");
@@ -111,6 +112,29 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ui/updater_darwin.m");
     println!("cargo:rerun-if-changed=src/ui/wizard_darwin.h");
     println!("cargo:rerun-if-changed=src/ui/wizard_darwin.m");
+}
+
+// The version the Windows auto-updater compares (and that the appcast carries)
+// is `{base}.{build_number}`, mirroring macOS's CFBundleShortVersionString +
+// CFBundleVersion. The base defaults to the Cargo version; the build number is
+// an auto-incrementing value supplied at release time (run number / timestamp).
+// This is only emitted when a build number is set, so dev builds stay stable
+// (and the updater falls back to CARGO_PKG_VERSION).
+fn configure_build_version() {
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_BUILD_NUMBER");
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_VERSION_BASE");
+    if let Ok(num) = std::env::var("CROWD_CAST_BUILD_NUMBER") {
+        let num = num.trim();
+        if !num.is_empty() {
+            let base = std::env::var("CROWD_CAST_VERSION_BASE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("CARGO_PKG_VERSION").ok())
+                .unwrap_or_default();
+            println!("cargo:rustc-env=CROWD_CAST_BUILD_VERSION={base}.{num}");
+        }
+    }
 }
 
 fn configure_google_oauth() {
