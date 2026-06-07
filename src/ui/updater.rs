@@ -53,9 +53,24 @@ impl UpdaterController {
             }
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         {
-            Self::unavailable("Auto-update is only implemented on macOS.")
+            match (
+                option_env!("CROWD_CAST_APPCAST_URL"),
+                option_env!("CROWD_CAST_ED_PUBLIC_KEY"),
+            ) {
+                (Some(url), Some(key)) if !url.is_empty() && !key.is_empty() => Self {
+                    available: true,
+                    started: false,
+                    reason: None,
+                },
+                _ => Self::unavailable("Auto-update feed is not configured in this build."),
+            }
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Self::unavailable("Auto-update is only implemented on macOS and Windows.")
         }
     }
 
@@ -85,6 +100,23 @@ impl UpdaterController {
                 self.available = false;
                 self.reason = Some(reason.clone());
                 warn!("Sparkle updater unavailable: {reason}");
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let url = option_env!("CROWD_CAST_APPCAST_URL").unwrap_or_default();
+            let key = option_env!("CROWD_CAST_ED_PUBLIC_KEY").unwrap_or_default();
+            match super::updater_windows::init(url, key, env!("CARGO_PKG_VERSION")) {
+                Ok(()) => {
+                    self.started = true;
+                    info!("WinSparkle updater initialized");
+                }
+                Err(e) => {
+                    self.available = false;
+                    self.reason = Some(e.clone());
+                    warn!("WinSparkle updater unavailable: {e}");
+                }
             }
         }
     }
@@ -160,6 +192,11 @@ impl UpdaterController {
             return ffi::updater_can_check_for_updates() != 0;
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            return true;
+        }
+
         #[allow(unreachable_code)]
         false
     }
@@ -183,6 +220,12 @@ impl UpdaterController {
             return Err(anyhow!(reason));
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            super::updater_windows::check_with_ui();
+            return Ok(());
+        }
+
         #[allow(unreachable_code)]
         Err(anyhow!("Auto-update is not available on this platform."))
     }
@@ -196,6 +239,11 @@ impl UpdaterController {
         unsafe {
             ffi::updater_check_for_updates_in_background();
         }
+
+        #[cfg(target_os = "windows")]
+        {
+            super::updater_windows::check_without_ui();
+        }
     }
 
     pub fn take_prepare_for_update_request(&self) -> bool {
@@ -206,6 +254,11 @@ impl UpdaterController {
         #[cfg(all(target_os = "macos", has_sparkle))]
         unsafe {
             return ffi::updater_take_prepare_for_update_request() != 0;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            return super::updater_windows::take_shutdown_request();
         }
 
         #[allow(unreachable_code)]

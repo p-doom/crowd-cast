@@ -12,6 +12,8 @@ mod tray_macos;
 #[cfg(target_os = "windows")]
 mod tray_windows;
 mod updater;
+#[cfg(target_os = "windows")]
+mod updater_windows;
 
 pub use notifications::{
     init_notifications, is_authorized as notifications_authorized,

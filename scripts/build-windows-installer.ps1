@@ -29,6 +29,7 @@ $iss        = Join-Path $repoRoot 'installer\windows\crowd-cast.iss'
 $releaseDir = Join-Path $repoRoot 'target\release'
 $exePath    = Join-Path $releaseDir 'crowd-cast-agent.exe'
 $obsDll     = Join-Path $releaseDir 'obs.dll'
+$winSparkle = Join-Path $releaseDir 'WinSparkle.dll'
 
 if ([string]::IsNullOrWhiteSpace($ApiGatewayUrl)) {
     throw "CROWD_CAST_API_GATEWAY_URL is required (set the env var or pass -ApiGatewayUrl)."
@@ -60,6 +61,13 @@ if (-not $Iscc -or -not (Test-Path $Iscc)) {
     throw "ISCC.exe (Inno Setup 6) not found. Install it: winget install JRSoftware.InnoSetup"
 }
 
+# Fetch the WinSparkle auto-update runtime; build.rs copies it next to the exe
+# (target\release) so the installer can ship it.
+Write-Host "==> Fetching WinSparkle..." -ForegroundColor Cyan
+# Invoked as a PowerShell script (not an exe), so it throws on failure under
+# $ErrorActionPreference='Stop'; don't gate on $LASTEXITCODE (only set by exes).
+& (Join-Path $PSScriptRoot 'fetch-winsparkle.ps1')
+
 Write-Host "==> Building release binary (v$Version)..." -ForegroundColor Cyan
 $env:CROWD_CAST_API_GATEWAY_URL = $ApiGatewayUrl
 & cargo build --release
@@ -68,6 +76,8 @@ if (-not (Test-Path $exePath)) { throw "Expected binary not found at $exePath." 
 # obs.dll is the loader the agent links against; it must ship so the process can
 # start (the rest of the OBS runtime is downloaded on first launch).
 if (-not (Test-Path $obsDll)) { throw "obs.dll not found at $obsDll (expected from the libobs-rs build)." }
+# WinSparkle.dll is copied next to the exe by build.rs after fetch-winsparkle.
+if (-not (Test-Path $winSparkle)) { throw "WinSparkle.dll not found at $winSparkle (run scripts/fetch-winsparkle.ps1)." }
 
 Write-Host "==> Compiling installer (ISCC)..." -ForegroundColor Cyan
 & $Iscc "/DAppVersion=$Version" "/DAppVersionInfo=$versionInfo" "/DSourceDir=$releaseDir" $iss

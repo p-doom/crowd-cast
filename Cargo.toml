@@ -105,6 +105,8 @@ tauri-winrt-notification = "0.7"
 native-windows-gui = "1"
 # Raw Win32 for ListView checkbox state (LVS_EX_CHECKBOXES) in the wizard
 winapi = { version = "0.3", features = ["winuser", "commctrl", "windef", "minwindef", "basetsd"] }
+# Dynamically load WinSparkle.dll for auto-updates (optional at runtime)
+libloading = "0.8"
 
 [build-dependencies]
 cc = "1"

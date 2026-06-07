@@ -81,6 +81,27 @@ fn main() {
         embed_resource::compile("resources/windows/crowd-cast.rc", embed_resource::NONE);
         println!("cargo:rerun-if-changed=resources/windows/crowd-cast.rc");
         println!("cargo:rerun-if-changed=resources/windows/crowd-cast.manifest");
+        println!("cargo:rerun-if-changed=resources/windows/crowd-cast.ico");
+
+        // Bake in the auto-update feed + signing key (empty -> updater is
+        // unavailable at runtime, which is fine for dev/placeholder builds).
+        configure_windows_updater();
+
+        // Copy WinSparkle.dll next to the built exe so dev runs (and the
+        // installer's source dir) find it beside the executable. Best-effort:
+        // run scripts/fetch-winsparkle.ps1 to populate it; auto-update is
+        // optional, so a missing DLL just disables it.
+        const WINSPARKLE_DLL: &str = "build/winsparkle/0.9.3/WinSparkle.dll";
+        println!("cargo:rerun-if-changed={WINSPARKLE_DLL}");
+        if let Ok(out_dir) = std::env::var("OUT_DIR") {
+            let dll = std::path::Path::new(WINSPARKLE_DLL);
+            if dll.exists() {
+                // OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out
+                if let Some(target_dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
+                    let _ = std::fs::copy(dll, target_dir.join("WinSparkle.dll"));
+                }
+            }
+        }
     }
 
     println!("cargo:rerun-if-changed=src/ui/tray.h");
@@ -106,6 +127,24 @@ fn configure_google_oauth() {
         let client_secret = client_secret.trim();
         if !client_secret.is_empty() {
             println!("cargo:rustc-env=CROWD_CAST_GOOGLE_CLIENT_SECRET={client_secret}");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_updater() {
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_APPCAST_URL");
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_ED_PUBLIC_KEY");
+    if let Ok(url) = std::env::var("CROWD_CAST_APPCAST_URL") {
+        let url = url.trim();
+        if !url.is_empty() {
+            println!("cargo:rustc-env=CROWD_CAST_APPCAST_URL={url}");
+        }
+    }
+    if let Ok(key) = std::env::var("CROWD_CAST_ED_PUBLIC_KEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            println!("cargo:rustc-env=CROWD_CAST_ED_PUBLIC_KEY={key}");
         }
     }
 }
