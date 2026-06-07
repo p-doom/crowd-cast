@@ -20,25 +20,45 @@ pub trait InputBackend: Send + Sync {
     fn current_timestamp(&self) -> Option<u64>;
 }
 
-/// Create the appropriate input backend for the current platform
+/// Create the appropriate input backend for the current platform.
+///
+/// Linux uses evdev for both X11 and Wayland: raw pre-acceleration deltas, reaches the
+/// same input layer raw-input consumers read, and works regardless of display server.
+/// rdev is not linked on Linux (see Cargo.toml). macOS/Windows use rdev.
 pub fn create_input_backend() -> Box<dyn InputBackend> {
     #[cfg(target_os = "linux")]
     {
-        // Check if we're on Wayland
-        if std::env::var("XDG_SESSION_TYPE")
-            .map(|s| s == "wayland")
-            .unwrap_or(false)
-        {
-            // Try evdev backend for Wayland
-            if let Ok(backend) = super::evdev_backend::EvdevBackend::new() {
-                tracing::info!("Using evdev backend for Wayland");
+        match super::evdev_backend::EvdevBackend::new() {
+            Ok(backend) => {
+                tracing::info!("Using evdev backend for input capture");
                 return Box::new(backend);
             }
-            tracing::warn!("evdev backend failed, falling back to rdev (may not work on Wayland)");
+            Err(e) => {
+                tracing::error!("evdev backend init failed ({e}); input capture disabled -- ensure the user is in the 'input' group. Screen capture is unaffected.");
+                return Box::new(NoOpBackend);
+            }
         }
     }
 
-    // Default to rdev backend
-    tracing::info!("Using rdev backend for input capture");
-    Box::new(super::rdev_backend::RdevBackend::new())
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::info!("Using rdev backend for input capture");
+        Box::new(super::rdev_backend::RdevBackend::new())
+    }
+}
+
+/// No-op input backend used on Linux only when evdev initialization fails, so the rest of
+/// the app (screen capture) keeps running without input capture.
+#[cfg(target_os = "linux")]
+struct NoOpBackend;
+
+#[cfg(target_os = "linux")]
+impl InputBackend for NoOpBackend {
+    fn start(&mut self, _tx: mpsc::UnboundedSender<InputEvent>) -> Result<()> {
+        Ok(())
+    }
+    fn stop(&mut self) {}
+    fn current_timestamp(&self) -> Option<u64> {
+        None
+    }
 }

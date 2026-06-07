@@ -22,8 +22,9 @@ libobs-simple = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-s
 # vars, so the crate is excluded from the Linux build. See the cfg(not(linux)) target deps
 # below and docs/LINUX_LIBOBS_PROVISIONING.md.
 
-# Input capture
-rdev = { git = "https://github.com/p-doom/rdev" }
+# Input capture: rdev is declared per-platform below (non-Linux only). Linux uses evdev
+# directly (src/input/evdev_backend.rs) -- rdev's X11 listen path cannot emit true mouse
+# deltas, while evdev gives raw pre-accel deltas and works on X11 + Wayland.
 
 # HTTP client for pre-signed URL uploads
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -79,6 +80,8 @@ libc = "0.2"
 # (see src/capture/context.rs + docs/LINUX_LIBOBS_PROVISIONING.md).
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
+# Input capture for macOS/Windows (Linux uses evdev instead).
+rdev = { git = "https://github.com/p-doom/rdev" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux evdev fallback for Wayland

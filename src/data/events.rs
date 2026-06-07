@@ -130,6 +130,7 @@ pub struct MetadataEvent {
     pub timestamp_utc: String,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl From<rdev::Key> for KeyEvent {
     fn from(key: rdev::Key) -> Self {
         let (code, name) = match key {
@@ -266,6 +267,7 @@ impl From<rdev::Key> for KeyEvent {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl From<rdev::Button> for MouseButton {
     fn from(button: rdev::Button) -> Self {
         match button {

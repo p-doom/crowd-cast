@@ -279,13 +279,18 @@ fn main() -> Result<()> {
         engine_handle.join().ok();
     }
 
-    // Send shutdown command to engine (in case tray exited without Ctrl+C)
-    runtime.block_on(async {
-        let _ = cmd_tx.send(EngineCommand::Shutdown).await;
-    });
+    // Send shutdown command to engine (in case tray exited without Ctrl+C), then wait for
+    // the engine thread. On no_tray builds (Linux) the engine was already joined above
+    // (after the Ctrl+C handler sent Shutdown), so this is skipped to avoid a double join.
+    #[cfg(not(no_tray))]
+    {
+        runtime.block_on(async {
+            let _ = cmd_tx.send(EngineCommand::Shutdown).await;
+        });
 
-    // Wait for engine thread to finish
-    let _ = engine_handle.join();
+        // Wait for engine thread to finish
+        let _ = engine_handle.join();
+    }
 
     // Determine exit code: intentional exits (Quit menu, Sparkle update, Ctrl+C)
     // exit with 0 so KeepAlive/Crashed does NOT restart. All other exits
