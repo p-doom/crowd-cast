@@ -54,6 +54,26 @@ jobs:
           CROWD_CAST_BUILD_NUMBER: ${{ steps.ver.outputs.build }}
         run: pwsh scripts/build-windows-installer.ps1 -Version "${{ steps.ver.outputs.marketing }}"
 
+      # Authenticode-sign the installer via Azure Trusted Signing. MUST run before the
+      # Ed25519/appcast step below: that step hashes the final .exe bytes, and signing
+      # appends a signature — sign after, and WinSparkle would reject the download on a
+      # length/signature mismatch. DefaultAzureCredential picks up the SP env vars.
+      - name: Authenticode-sign the installer (Azure Trusted Signing)
+        uses: azure/artifact-signing-action@v2
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        with:
+          endpoint: https://weu.codesigning.azure.net/
+          signing-account-name: crowdcastsign
+          certificate-profile-name: crowdcast-public
+          files-folder: ${{ github.workspace }}/dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Sign installer + generate appcast
         shell: pwsh
         env:
