@@ -56,15 +56,17 @@ jobs:
 
       # Authenticode-sign the installer via Azure Trusted Signing. MUST run before the
       # Ed25519/appcast step below: that step hashes the final .exe bytes, and signing
-      # appends a signature — sign after, and WinSparkle would reject the download on a
-      # length/signature mismatch. DefaultAzureCredential picks up the SP env vars.
+      # appends a signature, so signing afterwards would make WinSparkle reject the
+      # download on a length/signature mismatch. The service-principal creds must go
+      # through the action's own auth INPUTS (azure-*): the action maps those to
+      # action-scoped env vars that the signing subprocess inherits. Step-level env: is
+      # NOT seen by that subprocess (DefaultAzureCredential then fails "not configured").
       - name: Authenticode-sign the installer (Azure Trusted Signing)
         uses: azure/artifact-signing-action@v2
-        env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
           endpoint: https://weu.codesigning.azure.net/
           signing-account-name: crowdcastsign
           certificate-profile-name: crowdcast-public
