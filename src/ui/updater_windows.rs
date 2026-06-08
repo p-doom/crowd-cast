@@ -13,13 +13,20 @@
 //! `CROWD_CAST_ED_PUBLIC_KEY`); WinSparkle refuses any update not signed by the
 //! matching private key.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::os::raw::{c_char, c_int};
-use std::path::PathBuf;
+use std::os::windows::ffi::OsStringExt;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use libloading::{Library, Symbol};
+use tracing::{error, info};
+
+/// WinSparkle's `int` return for "the callback hit an error" (see winsparkle.h).
+const WINSPARKLE_RETURN_ERROR: c_int = -1;
 
 /// Set by WinSparkle (on its own thread) when it has a verified update staged
 /// and wants the app to quit so the installer can replace it. Drained by the
@@ -37,6 +44,81 @@ extern "C" fn shutdown_request_cb() {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// Take over launching the staged installer (registered via
+/// `win_sparkle_set_user_run_installer_callback`).
+///
+/// WinSparkle's default launch runs the installer as a child of the agent and
+/// *then* asks the agent to quit. On Windows that's fatal: the agent's exit
+/// tears the child installer down before it can swap any files, so the update
+/// "downloads", the app disappears, and nothing is installed or relaunched.
+/// Launching it fully detached (below) lets it outlive our exit, replace the
+/// files, and relaunch us via the installer's `[Run] Check: WizardSilent` step.
+///
+/// Returns `1` ("handled") so WinSparkle skips its own launch and proceeds to
+/// request our shutdown; `WINSPARKLE_RETURN_ERROR` on failure (WinSparkle then
+/// reports the error and does NOT shut us down).
+extern "C" fn run_installer_cb(path: *const u16) -> c_int {
+    if path.is_null() {
+        error!("WinSparkle run-installer callback received a null path");
+        return WINSPARKLE_RETURN_ERROR;
+    }
+    // SAFETY: WinSparkle passes a valid NUL-terminated wide string (the path to
+    // the downloaded, signature-verified installer).
+    let len = unsafe { (0..).take_while(|&i| *path.add(i) != 0).count() };
+    let wide = unsafe { std::slice::from_raw_parts(path, len) };
+    let installer = PathBuf::from(OsString::from_wide(wide));
+
+    match spawn_installer_detached(&installer) {
+        Ok(()) => {
+            info!(
+                "Launched update installer detached: {}",
+                installer.display()
+            );
+            1
+        }
+        Err(e) => {
+            error!(
+                "Failed to launch update installer {}: {e}",
+                installer.display()
+            );
+            WINSPARKLE_RETURN_ERROR
+        }
+    }
+}
+
+/// Spawn the Inno installer silently and fully detached, so the agent's
+/// imminent exit can't terminate it mid-install. The silent flags mirror the
+/// appcast's `sparkle:installerArguments`; the agent self-exits on WinSparkle's
+/// shutdown request right after, freeing its files, and the installer's
+/// `[Run] Check: WizardSilent` step relaunches the agent once the swap is done.
+fn spawn_installer_detached(installer: &Path) -> std::io::Result<()> {
+    // Detach from this process's console and group, and break away from any job
+    // object, so nothing about our shutdown propagates to the installer.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    let args = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"];
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+    let spawn = |flags: u32| {
+        Command::new(installer)
+            .args(args)
+            .creation_flags(flags)
+            .spawn()
+            .map(|_child| ())
+    };
+
+    // Prefer breaking away from a job object: a kill-on-close job would
+    // otherwise terminate the installer when we exit. If we're not in a job the
+    // flag is a no-op; if we're in a job that forbids breakaway the spawn fails
+    // with access-denied, so fall back to a plain detached launch.
+    match spawn(base | CREATE_BREAKAWAY_FROM_JOB) {
+        Ok(()) => Ok(()),
+        Err(_) => spawn(base),
+    }
+}
+
 // WinSparkle C API signatures (see winsparkle.h). wchar_t is u16 on Windows.
 type FnVoid = unsafe extern "C" fn();
 type FnCStr = unsafe extern "C" fn(*const c_char);
@@ -45,8 +127,10 @@ type FnDetails = unsafe extern "C" fn(*const u16, *const u16, *const u16);
 type FnInt = unsafe extern "C" fn(c_int);
 type CanShutdownCb = extern "C" fn() -> c_int;
 type ShutdownReqCb = extern "C" fn();
+type UserRunInstallerCb = extern "C" fn(*const u16) -> c_int;
 type FnSetCanShutdown = unsafe extern "C" fn(CanShutdownCb);
 type FnSetShutdownReq = unsafe extern "C" fn(ShutdownReqCb);
+type FnSetUserRunInstaller = unsafe extern "C" fn(UserRunInstallerCb);
 
 struct WinSparkle {
     // Kept alive for the process lifetime so the function pointers stay valid.
@@ -59,6 +143,7 @@ struct WinSparkle {
     set_update_check_interval: FnInt,
     set_can_shutdown_callback: FnSetCanShutdown,
     set_shutdown_request_callback: FnSetShutdownReq,
+    set_user_run_installer_callback: FnSetUserRunInstaller,
     check_update_with_ui: FnVoid,
     check_update_without_ui: FnVoid,
 }
@@ -117,6 +202,10 @@ unsafe fn load() -> Result<WinSparkle, String> {
         sym!(FnSetCanShutdown, b"win_sparkle_set_can_shutdown_callback\0");
     let set_shutdown_request_callback =
         sym!(FnSetShutdownReq, b"win_sparkle_set_shutdown_request_callback\0");
+    let set_user_run_installer_callback = sym!(
+        FnSetUserRunInstaller,
+        b"win_sparkle_set_user_run_installer_callback\0"
+    );
     let check_update_with_ui = sym!(FnVoid, b"win_sparkle_check_update_with_ui\0");
     let check_update_without_ui = sym!(FnVoid, b"win_sparkle_check_update_without_ui\0");
 
@@ -130,6 +219,7 @@ unsafe fn load() -> Result<WinSparkle, String> {
         set_update_check_interval,
         set_can_shutdown_callback,
         set_shutdown_request_callback,
+        set_user_run_installer_callback,
         check_update_with_ui,
         check_update_without_ui,
     })
@@ -166,6 +256,9 @@ pub fn init(appcast_url: &str, eddsa_pubkey: &str, version: &str) -> Result<(), 
         (ws.set_app_details)(company.as_ptr(), app.as_ptr(), ver.as_ptr());
         (ws.set_can_shutdown_callback)(can_shutdown_cb);
         (ws.set_shutdown_request_callback)(shutdown_request_cb);
+        // Launch the installer ourselves (detached) instead of letting WinSparkle
+        // run it as a child that dies with us. See run_installer_cb.
+        (ws.set_user_run_installer_callback)(run_installer_cb);
         (ws.set_automatic_check_for_updates)(1);
         (ws.set_update_check_interval)(60 * 60 * 24); // daily
         (ws.init)();
