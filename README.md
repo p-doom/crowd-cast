@@ -81,7 +81,16 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 
 ### For users
 
-Download `CrowdCast.dmg` from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest), open it and follow the instructions in the wizard. 
+Download the installer for your platform, run it, and follow the setup wizard. On first launch the agent fetches its capture components, then lets you choose which apps to record.
+
+| Platform | Download |
+|----------|----------|
+| **macOS** | [**CrowdCast.dmg**](https://github.com/p-doom/crowd-cast/releases/download/v1.0.3-1092/CrowdCast.dmg) |
+| **Windows** | [**crowd-cast-setup.exe**](https://github.com/p-doom/crowd-cast/releases/download/win-v1.0.4%2B3/crowd-cast-setup-1.0.4.exe) |
+
+> **Windows note:** the installer isn't code-signed yet, so SmartScreen may show *"Windows protected your PC"* — click **More info → Run anyway**.
+
+<!-- Maintainers: bump these two URLs when cutting a release (macOS tag v<ver>-<build>, Windows tag win-v<ver>+<build>). Once releases are unified per version, switch to /releases/latest/download/<asset>. -->
 
 ### Building from source
 
