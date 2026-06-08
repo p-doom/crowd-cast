@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Compiles the release agent binary and runs the Inno Setup compiler (ISCC) on
-    installer\windows\crowd-cast.iss to produce dist\crowd-cast-setup-<version>.exe.
+    installer\windows\crowd-cast.iss to produce dist\crowd-cast-setup.exe.
 
     The upload endpoint is baked in at build time, so CROWD_CAST_API_GATEWAY_URL
     must be set (env var) or passed via -ApiGatewayUrl.
@@ -83,7 +83,7 @@ Write-Host "==> Compiling installer (ISCC)..." -ForegroundColor Cyan
 & $Iscc "/DAppVersion=$Version" "/DAppVersionInfo=$versionInfo" "/DSourceDir=$releaseDir" $iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed." }
 
-$out = Join-Path $repoRoot "dist\crowd-cast-setup-$Version.exe"
+$out = Join-Path $repoRoot "dist\crowd-cast-setup.exe"
 if (Test-Path $out) {
     Write-Host "==> Installer built: $out" -ForegroundColor Green
 } else {
