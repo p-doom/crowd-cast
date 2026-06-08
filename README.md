@@ -1,5 +1,8 @@
 <div align="center">
-  <img src="https://github.com/p-doom/crowd-code/blob/main/img/pdoom-logo.png?raw=true" width="60%" alt="p(doom)" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://huggingface.co/datasets/p-doom/AGI-CAST-0.6k/resolve/main/pdoom_logo_white_transparent.png">
+    <img src="https://huggingface.co/datasets/p-doom/AGI-CAST-0.6k/resolve/main/pdoom_logo_black_transparent.png" width="60%" alt="p(doom)" />
+  </picture>
 </div>
 <hr>
 <div align="center" style="line-height: 1;">
@@ -30,20 +33,21 @@ Infrastructure for capturing paired screencast and keyboard/mouse input data.
 > [![Download for macOS](https://img.shields.io/badge/Download%20for%20macOS-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/CrowdCast.dmg)
 > [![Download for Windows](https://img.shields.io/badge/Download%20for%20Windows-0078D6?style=for-the-badge&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTAgMy40NDkgOS43NSAyLjF2OS40NTFIMFptMTAuOTQ5LTEuNTAxTDI0IDB2MTEuNEgxMC45NDlaTTAgMTIuNmg5Ljc1djkuNDUxTDAgMjAuNjk5Wm0xMC45NDkgMEgyNFYyNGwtMTMuMDUxLTEuODAxWiIvPjwvc3ZnPg%3D%3D&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/crowd-cast-setup.exe)
 
-Download the installer for your platform and run it — no admin required. On first launch crowd-cast fetches its capture components, then a quick wizard lets you choose which apps to record. From then on it lives in your system tray, records the apps you picked, and uploads in the background. Sign in with Google from the tray menu to attribute your uploads.
+Download the installer for your platform and follow the instructions in the setup wizard.
 
-- **macOS** — open the `.dmg` and follow the setup wizard, then grant **Accessibility** (System Settings → Privacy & Security → Accessibility) so it can capture input.
-- **Windows** — run the `.exe`; if SmartScreen shows *"Windows protected your PC"*, click **More info → Run anyway** (the installer isn't code-signed yet). No special permissions are needed.
+- **macOS**: open `CrowdCast.dmg` and grant permissions by following the setup wizard.
+- **Windows**: run `crowd-cast-setup.exe`. The agent runs from a single executable; OBS is fetched automatically on first launch and no special permissions are required. If SmartScreen shows "Windows protected your PC", click More info, then Run anyway.
 
-<!-- Download links use /releases/latest/download/<asset> (stable filenames) so they never need per-release edits. Each resolves to the newest release containing that asset; while macOS and Windows ship as separate releases, only the most-recently-released platform's link resolves until releases are unified per version. -->
+<!-- Download links use /releases/latest/download/<asset> with stable filenames so they never need per-release edits. Each resolves to the newest release containing that asset. -->
 
 ## Features
 
 - **Single binary**: No external OBS installation required (libobs is embedded)
 - **Privacy-aware capture**: Only records when selected applications are in the foreground
-- **Automatic updates**: Sparkle (macOS) / WinSparkle (Windows) keep the app up to date in the background
+- **Full control**: Start or stop recording at any time, and delete the last 10 minutes of recording
+- **Automatic updates**: Sparkle framework keeps the app up to date in the background
 - **Idle detection**: Automatically pauses recording when you step away, resumes on return
-- **Hardware acceleration**: Uses native hardware encoding
+- **Hardware acceleration**: Uses native encoding (VideoToolbox on macOS)
 - **Efficient uploads**: Streaming uploads via pre-signed S3 URLs with retry/backoff
 - **Easy setup**: Wizard handles permissions and application selection
 
@@ -92,7 +96,6 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 Most settings are managed through the setup wizard and the tray menu. The configuration file is at:
 
 - macOS: `~/Library/Application Support/dev.crowd-cast.agent/config.toml`
-- Windows: `%APPDATA%\crowd-cast\agent\config\config.toml`
 
 Key settings:
 
@@ -139,48 +142,30 @@ Event types:
 
 Timestamps are microseconds relative to the segment start. Video and input files share the same session/segment IDs for alignment.
 
-## Building from Source
+## Development
 
-This section is for contributors who want to build or modify crowd-cast.
+This section is for contributors who want to modify crowd-cast.
 
-### Prerequisites
-
-**macOS (Apple Silicon):**
+### First Run (Recommended)
 
 ```bash
-brew install simde       # Required for ARM builds
-brew install create-dmg  # Required for release DMG packaging
+crowd-cast-agent --setup
 ```
 
-**Windows:** Rust (MSVC toolchain) + Visual Studio Build Tools. OBS is fetched at runtime, so no build-time OBS setup is required.
+This runs the interactive setup wizard that guides you through configuration.
 
-### Build & run
+### Normal Usage
 
 ```bash
-# Clone with submodules
-git clone --recursive https://github.com/p-doom/crowd-cast.git
-cd crowd-cast
-
-# Build (endpoint required at build time; macOS auto-installs OBS binaries in build.rs)
-CROWD_CAST_API_GATEWAY_URL="https://your-api-gateway.execute-api.region.amazonaws.com/prod/presign" \
-  cargo build --release
-
-# Run the setup wizard, then run normally
-./target/release/crowd-cast-agent --setup
-./target/release/crowd-cast-agent
-
-# Tests
-cargo test
+crowd-cast-agent
 ```
 
-On macOS, `build.rs` automatically installs OBS binaries via `cargo-obs-build` during `cargo build`. Set `CROWD_CAST_SKIP_OBS_INSTALL=1` to skip this behavior.
-
-When run, the agent will:
+The agent will:
 
 1. Bootstrap OBS libraries (downloads if needed)
 2. Initialize embedded libobs for capture
 3. Show in your system tray
-4. Capture input when selected apps are in the foreground
+4. Capture input when selected apps are in foreground
 
 ### Command Line Options
 
@@ -197,6 +182,31 @@ ENVIRONMENT:
                   Override log directory (default: ~/Library/Logs/crowd-cast on macOS)
     CROWD_CAST_API_GATEWAY_URL
                   Lambda endpoint for pre-signed S3 URLs (set at build time)
+```
+
+### Building from Source
+
+#### Prerequisites
+
+**macOS (Apple Silicon):**
+
+```bash
+brew install simde       # Required for ARM builds
+brew install create-dmg  # Required for release DMG packaging
+```
+
+#### Build Steps
+
+```bash
+# 1. Clone with submodules
+git clone --recursive https://github.com/p-doom/crowd-cast.git
+cd crowd-cast
+
+# 2. Build the agent (macOS auto-installs OBS binaries in build.rs)
+cargo build
+
+# 3. Run tests
+cargo test
 ```
 
 ### libobs-rs Integration
@@ -221,8 +231,6 @@ pub fn new_window_capture(ctx: &ObsContext, window_name: &str) -> Result<ObsSour
 ```
 
 ## Releasing
-
-Builds are signed and published to GitHub Releases, with the auto-update appcast uploaded to S3.
 
 ### macOS
 
@@ -251,9 +259,7 @@ Auto-updates are delivered via Sparkle using an appcast hosted on S3.
 
 ### Windows
 
-Windows releases are cut by the GitHub Actions workflow (`.github/workflows/windows-release.yml`) — dispatch it to build, sign, and publish the installer and update its WinSparkle appcast on S3. No version bump is needed: the comparable version is `{marketing}.{run_number}`, so each run is newer than the last.
-
-To build the per-user installer (no admin / UAC required) locally with [Inno Setup](https://jrsoftware.org/isinfo.php):
+Build the per-user installer (no admin / UAC required) with [Inno Setup](https://jrsoftware.org/isinfo.php):
 
 ```powershell
 # One-time: install the Inno Setup compiler
@@ -262,12 +268,19 @@ winget install JRSoftware.InnoSetup
 # Build the release binary + installer
 $env:CROWD_CAST_API_GATEWAY_URL = "https://.../prod/presign"
 pwsh scripts/build-windows-installer.ps1
-# -> dist/crowd-cast-setup.exe
+# -> dist/crowd-cast-setup-<version>.exe
 ```
 
-The installer (`installer/windows/crowd-cast.iss`) installs the agent and its `obs.dll` loader under `%LOCALAPPDATA%\Programs\crowd-cast`, creates a Start Menu shortcut tagged with the app's AppUserModelID (so toast notifications are branded "crowd-cast"), and registers an uninstaller that stops the agent and removes the autostart entry and install directory. Autostart itself is managed in-app via the setup wizard's "start at login" option.
+The installer (`installer/windows/crowd-cast.iss`) installs the agent and its
+`obs.dll` loader under `%LOCALAPPDATA%\Programs\crowd-cast`, creates a Start Menu
+shortcut tagged with the app's AppUserModelID (so toast notifications are branded
+"crowd-cast"), and registers an uninstaller that stops the agent and removes the
+autostart entry and install directory. Autostart itself is managed in-app via the
+setup wizard's "start at login" option.
 
-On first launch the agent downloads the rest of the OBS runtime (codecs, plugins) into the install folder and relaunches itself automatically — a one-time step that needs network access.
+On first launch the agent downloads the rest of the OBS runtime (codecs,
+plugins) into the install folder and relaunches itself automatically, a
+one-time step that needs network access.
 
 ### Linux
 
