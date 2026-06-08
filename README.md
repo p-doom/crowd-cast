@@ -1,4 +1,10 @@
 <div align="center">
+  <a href="https://github.com/p-doom/crowd-cast/releases/latest/download/CrowdCast.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-111111?style=for-the-badge&logo=apple&logoColor=white" height="60" alt="Download for macOS"></a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/p-doom/crowd-cast/releases/latest/download/crowd-cast-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" height="60" alt="Download for Windows"></a>
+</div>
+
+<div align="center">
   <img src="https://github.com/p-doom/crowd-code/blob/main/img/pdoom-logo.png?raw=true" width="60%" alt="p(doom)" />
 </div>
 <hr>
@@ -24,12 +30,6 @@
 # `crowd-cast`:  Crowd-Sourcing Months-Long Trajectories of Human Computer Work
 
 Infrastructure for capturing paired screencast and keyboard/mouse input data.
-
-<div align="center">
-
-[![Download for macOS](https://img.shields.io/badge/Download_for_macOS-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/CrowdCast.dmg) &nbsp;&nbsp; [![Download for Windows](https://img.shields.io/badge/Download_for_Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/crowd-cast-setup.exe)
-
-</div>
 
 ## Overview
 
