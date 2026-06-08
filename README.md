@@ -85,12 +85,13 @@ Download the installer for your platform, run it, and follow the setup wizard. O
 
 | Platform | Download |
 |----------|----------|
-| **macOS** | [**CrowdCast.dmg**](https://github.com/p-doom/crowd-cast/releases/download/v1.0.3-1092/CrowdCast.dmg) |
-| **Windows** | [**crowd-cast-setup.exe**](https://github.com/p-doom/crowd-cast/releases/download/win-v1.0.4%2B3/crowd-cast-setup-1.0.4.exe) |
+| **macOS** | [**CrowdCast.dmg**](https://github.com/p-doom/crowd-cast/releases/latest/download/CrowdCast.dmg) |
+| **Windows** | [**crowd-cast-setup.exe**](https://github.com/p-doom/crowd-cast/releases/latest/download/crowd-cast-setup.exe) |
 
 > **Windows note:** the installer isn't code-signed yet, so SmartScreen may show *"Windows protected your PC"* — click **More info → Run anyway**.
 
-<!-- Maintainers: bump these two URLs when cutting a release (macOS tag v<ver>-<build>, Windows tag win-v<ver>+<build>). Once releases are unified per version, switch to /releases/latest/download/<asset>. -->
+<!-- These use /releases/latest/download/<asset> (stable filenames) so they never need per-release edits. Each resolves to the newest release that contains that asset. While macOS and Windows ship as separate releases, only the most-recently-released platform's link works; the other 404s until releases are unified per version (then both always resolve). -->
+
 
 ### Building from source
 
