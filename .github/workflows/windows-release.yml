@@ -163,14 +163,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: "crowd-cast for Windows ${{ steps.ver.outputs.marketing }}"
+          name: "v${{ steps.ver.outputs.marketing }}"
           body: |
-            crowd-cast agent for Windows, version ${{ steps.ver.outputs.marketing }}.
+            ## Installation
 
-            ### Install
-            Download **crowd-cast-setup.exe** and run it. It is code-signed (publisher: pdoom UG), installs per-user (no admin required), and keeps itself up to date automatically after install.
-
-            `CrowdCast.dmg` is the current macOS build, bundled here so the macOS download link also resolves from the latest release.
+            See the quickstart guide: https://pdoom.org/crowd-cast-quickstart.html
           # CrowdCast.dmg is carried forward (above) and may be absent on a very
           # first release, so do not fail if it is missing.
           fail_on_unmatched_files: false
