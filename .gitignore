@@ -2,3 +2,6 @@ obs-build/
 target/
 build/
 .venv/
+packaging/linux/.cache/
+packaging/linux/out/
+.claude/
