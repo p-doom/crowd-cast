@@ -40,6 +40,9 @@ pub struct ScreenCaptureSource {
     source: ObsSourceRef,
     name: String,
     is_active: bool,
+    /// Target app/window identifier this source captures (None for display capture).
+    /// Used to key persisted portal restore tokens on Linux/Wayland.
+    app_id: Option<String>,
 }
 
 impl ScreenCaptureSource {
@@ -81,6 +84,7 @@ impl ScreenCaptureSource {
             source,
             name: name.to_string(),
             is_active: true,
+            app_id: None,
         })
     }
 
@@ -124,6 +128,7 @@ impl ScreenCaptureSource {
             source,
             name: name.to_string(),
             is_active: true,
+            app_id: None,
         })
     }
 
@@ -175,6 +180,7 @@ impl ScreenCaptureSource {
         bundle_id: &str,
         display_uuid: &str,
         capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
         info!(
             "Creating macOS application capture source: {} (app: {}, audio: {})",
@@ -201,6 +207,7 @@ impl ScreenCaptureSource {
             source,
             name: name.to_string(),
             is_active: true,
+            app_id: Some(bundle_id.to_string()),
         })
     }
 
@@ -229,15 +236,27 @@ impl ScreenCaptureSource {
         bundle_id: &str,
         _display_uuid: &str,
         _capture_audio: bool,
+        restore_token: Option<&str>,
     ) -> Result<Self> {
         let source = if is_wayland_session() {
             info!(
-                "Creating Linux PipeWire (Wayland) window capture source: {} (app hint: {})",
-                name, bundle_id
+                "Creating Linux PipeWire (Wayland) window capture source: {} (app hint: {}, has_token: {})",
+                name,
+                bundle_id,
+                restore_token.map(|t| !t.is_empty()).unwrap_or(false)
             );
-            context
+            // First launch (no token): the portal asks the user to pick a window, and the
+            // token is read back afterwards (see CaptureContext::collect_restore_tokens).
+            // Later launches pass the saved token so the same window is restored silently.
+            let mut builder = context
                 .source_builder::<PipeWireWindowCaptureSourceBuilder, _>(name)?
-                .set_show_cursor(true)
+                .set_show_cursor(true);
+            if let Some(token) = restore_token {
+                if !token.is_empty() {
+                    builder = builder.set_restore_token(token.to_string());
+                }
+            }
+            builder
                 .add_to_scene(scene)
                 .context("Failed to add PipeWire window capture source to scene")?
         } else {
@@ -258,6 +277,7 @@ impl ScreenCaptureSource {
             source,
             name: name.to_string(),
             is_active: true,
+            app_id: Some(bundle_id.to_string()),
         })
     }
 
@@ -275,6 +295,7 @@ impl ScreenCaptureSource {
         _bundle_id: &str,
         _display_uuid: &str,
         _capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
         anyhow::bail!("Application capture not yet implemented for Windows (use window_capture)")
     }
@@ -288,6 +309,7 @@ impl ScreenCaptureSource {
         _bundle_id: &str,
         _display_uuid: &str,
         _capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
         anyhow::bail!("Application capture not supported on this platform");
     }
@@ -295,6 +317,32 @@ impl ScreenCaptureSource {
     /// Get the source name
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The target app/window identifier this source captures (None for display capture).
+    pub fn app_id(&self) -> Option<&str> {
+        self.app_id.as_deref()
+    }
+
+    /// Read the xdg-desktop-portal restore token from a Wayland window-capture source.
+    /// Returns None for other source types/platforms or before the user has selected a
+    /// window (the token only becomes available once the portal session is established).
+    #[cfg(target_os = "linux")]
+    pub fn restore_token(&self) -> Option<String> {
+        use libobs_simple::sources::linux::PipeWireSourceExtTrait;
+        match self.source.get_restore_token() {
+            Ok(token) => token,
+            Err(e) => {
+                debug!("get_restore_token('{}') unavailable: {}", self.name, e);
+                None
+            }
+        }
+    }
+
+    /// Restore token (non-Linux stub: portal restore tokens are Wayland-only).
+    #[cfg(not(target_os = "linux"))]
+    pub fn restore_token(&self) -> Option<String> {
+        None
     }
 
     /// Check if the source is active (producing frames)

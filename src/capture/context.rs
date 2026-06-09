@@ -77,6 +77,9 @@ pub struct CaptureContext {
     recording_config: RecordingConfig,
     /// Target apps for capture (stored for recreation after display changes)
     target_apps: Vec<String>,
+    /// Per-app xdg-desktop-portal restore tokens (Linux/Wayland), keyed by app id.
+    /// Passed to window-capture sources so previously selected windows restore silently.
+    restore_tokens: HashMap<String, String>,
     /// Whether macOS should keep only one tracked application's source active at a time
     single_active_app_capture: bool,
     /// Currently active application capture target when single-active mode is enabled
@@ -125,6 +128,7 @@ impl CaptureContext {
             output_directory,
             recording_config: RecordingConfig::default(),
             target_apps: Vec::new(),
+            restore_tokens: HashMap::new(),
             single_active_app_capture: false,
             active_capture_app: None,
         })
@@ -391,6 +395,7 @@ impl CaptureContext {
                 bundle_id,
                 &display_uuid,
                 capture_audio,
+                None,
             ) {
                 Ok(source) => {
                     if initial_active_app == Some(bundle_id.as_str()) {
@@ -436,6 +441,7 @@ impl CaptureContext {
 
         let capture_audio = self.recording_config.enable_audio;
         let target_apps = self.target_apps.clone();
+        let restore_tokens = self.restore_tokens.clone();
         let mut capture_sources = Vec::new();
 
         let context = self
@@ -465,6 +471,7 @@ impl CaptureContext {
                     bundle_id,
                     &display_uuid,
                     capture_audio,
+                    restore_tokens.get(bundle_id).map(|s| s.as_str()),
                 ) {
                     Ok(source) => {
                         debug!("Created capture source '{}' for '{}'", source_name, bundle_id);
@@ -503,8 +510,13 @@ impl CaptureContext {
     ///
     /// # Arguments
     /// * `target_apps` - List of bundle identifiers to capture (e.g., ["com.apple.Safari", "com.microsoft.VSCode"])
-    pub fn setup_capture(&mut self, target_apps: &[String]) -> Result<()> {
+    pub fn setup_capture(
+        &mut self,
+        target_apps: &[String],
+        restore_tokens: &HashMap<String, String>,
+    ) -> Result<()> {
         self.target_apps = target_apps.to_vec();
+        self.restore_tokens = restore_tokens.clone();
 
         if self.use_single_active_app_capture() {
             let initial_active_app = self.select_initial_active_app();
@@ -1045,6 +1057,24 @@ impl CaptureContext {
     /// Get information about capture sources
     pub fn capture_source_names(&self) -> Vec<&str> {
         self.capture_sources.iter().map(|s| s.name()).collect()
+    }
+
+    /// Collect the current xdg-desktop-portal restore tokens from active window-capture
+    /// sources, keyed by target app. Used to persist the user's window selections so the
+    /// portal restores the same windows next launch without re-prompting. Empty unless
+    /// running per-app window capture on Linux/Wayland.
+    pub fn collect_restore_tokens(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for source in &self.capture_sources {
+            if let Some(app) = source.app_id() {
+                if let Some(token) = source.restore_token() {
+                    if !token.is_empty() {
+                        out.insert(app.to_string(), token);
+                    }
+                }
+            }
+        }
+        out
     }
 }
 

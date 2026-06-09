@@ -7,6 +7,8 @@ use crate::data::{
     MouseScrollEvent,
 };
 #[cfg(target_os = "linux")]
+use crate::input::secure::SecureInputState;
+#[cfg(target_os = "linux")]
 use crate::input::InputBackend;
 #[cfg(target_os = "linux")]
 use anyhow::{Context, Result};
@@ -29,6 +31,8 @@ use tracing::{debug, error, info, warn};
 pub struct EvdevBackend {
     devices: Vec<Device>,
     capturing: Arc<AtomicBool>,
+    /// Secure-input gate: when set, key events are withheld (e.g. focused password field).
+    secure: Arc<SecureInputState>,
     /// The instant when the backend was started, used for timestamp calculation
     start_time: Option<Instant>,
 }
@@ -37,7 +41,7 @@ pub struct EvdevBackend {
 impl EvdevBackend {
     /// Create a new evdev backend
     /// This will enumerate input devices and filter for keyboards and mice
-    pub fn new() -> Result<Self> {
+    pub fn new(secure: Arc<SecureInputState>) -> Result<Self> {
         let mut devices = Vec::new();
 
         // Enumerate all input devices
@@ -74,6 +78,7 @@ impl EvdevBackend {
         Ok(Self {
             devices,
             capturing: Arc::new(AtomicBool::new(false)),
+            secure,
             start_time: None,
         })
     }
@@ -96,6 +101,7 @@ impl InputBackend for EvdevBackend {
         for mut device in devices {
             let tx = tx.clone();
             let capturing = self.capturing.clone();
+            let secure = self.secure.clone();
             let start_time = start_time;
 
             let handle = thread::spawn(move || {
@@ -115,17 +121,36 @@ impl InputBackend for EvdevBackend {
 
                                 let event_type = match ev.kind() {
                                     InputEventKind::Key(key) => {
-                                        let key_event = KeyEvent {
-                                            code: key.0 as u32,
-                                            name: format!("{:?}", key),
-                                        };
-
-                                        if ev.value() == 1 {
-                                            Some(EventType::KeyPress(key_event))
-                                        } else if ev.value() == 0 {
-                                            Some(EventType::KeyRelease(key_event))
+                                        // In evdev, pointer buttons (BTN_*) arrive as Key events. Route them
+                                        // to mouse events; everything else is treated as a keyboard key.
+                                        if let Some(button) = MouseButton::from_evdev_key(key) {
+                                            // Pointer buttons are NOT gated by the secure-input suppressor,
+                                            // which targets keystrokes only -- matching macOS, where clicks
+                                            // are never withheld for a focused password field.
+                                            let button_event = MouseButtonEvent {
+                                                button,
+                                                x: 0.0, // evdev doesn't provide position with button events
+                                                y: 0.0,
+                                            };
+                                            match ev.value() {
+                                                1 => Some(EventType::MousePress(button_event)),
+                                                0 => Some(EventType::MouseRelease(button_event)),
+                                                _ => None,
+                                            }
+                                        } else if secure.should_suppress_keys() {
+                                            // Withhold keystrokes while a secure context is active (e.g. a
+                                            // focused password field). Default is to capture; only a positive
+                                            // secure signal suppresses. The AT-SPI gate emits a Redacted marker.
+                                            None
                                         } else {
-                                            None // Key repeat, ignore
+                                            // Map into the same curated (code, name) namespace as the macOS
+                                            // rdev backend; unknown keys fall back to a raw reconstructable code.
+                                            let key_event = KeyEvent::from(key);
+                                            match ev.value() {
+                                                1 => Some(EventType::KeyPress(key_event)),
+                                                0 => Some(EventType::KeyRelease(key_event)),
+                                                _ => None, // key repeat (value == 2)
+                                            }
                                         }
                                     }
                                     InputEventKind::RelAxis(axis) => {

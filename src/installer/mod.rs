@@ -11,6 +11,9 @@ pub mod wizard;
 pub mod wizard_ffi;
 pub mod wizard_gui;
 
+#[cfg(target_os = "linux")]
+pub mod requirements;
+
 pub use autostart::*;
 pub use permissions::*;
 pub use wizard::{needs_setup, run_wizard, run_wizard_async, WizardResult};

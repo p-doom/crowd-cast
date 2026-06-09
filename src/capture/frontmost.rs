@@ -147,45 +147,78 @@ unsafe fn nsstring_to_string(nsstring: *mut std::ffi::c_void) -> Option<String> 
 
 #[cfg(target_os = "linux")]
 fn get_frontmost_app_linux() -> Option<AppInfo> {
-    // Try X11 first, then fall back to reading /proc for Wayland
+    // Try the X11/XWayland path first (reads EWMH focus properties natively).
     if let Some(app) = get_frontmost_app_x11() {
         return Some(app);
     }
 
-    // On Wayland, we can't reliably get the focused window from outside
-    // Return None and let the sync engine handle this (capture all or use manual mode)
+    // No reachable X server, or a Wayland-native window is focused (its handle never
+    // appears in X11). Return None; the sync engine treats unknown focus conservatively
+    // (capture only when capture_all is set). A Wayland-native focus signal (e.g.
+    // wlr-foreign-toplevel on wlroots, or AT-SPI) is a separate, compositor-specific path.
     None
 }
 
+/// Resolve the focused application on X11 / XWayland by reading EWMH properties
+/// (`_NET_ACTIVE_WINDOW` -> `_NET_WM_PID`) directly over the X11 socket via x11rb's
+/// pure-Rust connection. This replaces shelling out to the `xdotool` binary, so the agent
+/// no longer requires `xdotool` (or any X client library) to be installed.
+///
+/// Returns `None` when there is no reachable X server, no active X11 window (e.g. a
+/// Wayland-native window is focused — its handle never appears here), or the focused
+/// window advertises no `_NET_WM_PID` (some clients omit it; `xdotool getwindowpid`
+/// relied on the same hint, so this is at parity).
 #[cfg(target_os = "linux")]
 fn get_frontmost_app_x11() -> Option<AppInfo> {
-    use std::process::Command;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
 
-    // Use xdotool to get the active window
-    let output = Command::new("xdotool")
-        .args(["getactivewindow", "getwindowpid"])
-        .output()
-        .ok()?;
+    // RustConnection speaks the X11 wire protocol over the socket — no libX11/libxcb.
+    let (conn, screen_num) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots[screen_num].root;
 
-    if !output.status.success() {
+    // only_if_exists=true: if no WM ever published these atoms, there is nothing to read.
+    let net_active_window = conn
+        .intern_atom(true, b"_NET_ACTIVE_WINDOW")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let net_wm_pid = conn.intern_atom(true, b"_NET_WM_PID").ok()?.reply().ok()?.atom;
+    if net_active_window == 0 || net_wm_pid == 0 {
         return None;
     }
 
-    let pid_str = String::from_utf8_lossy(&output.stdout);
-    let pid: u32 = pid_str.trim().parse().ok()?;
+    // _NET_ACTIVE_WINDOW (a WINDOW on the root) identifies the focused toplevel.
+    let active_window = conn
+        .get_property(false, root, net_active_window, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()
+        .and_then(|mut it| it.next())
+        .filter(|&w| w != 0)?;
 
-    // Get the process name from /proc
+    // _NET_WM_PID (a CARDINAL on the window) gives the owning process.
+    let pid = conn
+        .get_property(false, active_window, net_wm_pid, AtomEnum::CARDINAL, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()
+        .and_then(|mut it| it.next())?;
+
+    // Resolve a display name and an executable-basename identity from /proc — the same
+    // identity key produced by app enumeration in apps.rs, so target-app matching agrees.
     let comm_path = format!("/proc/{}/comm", pid);
     let name = std::fs::read_to_string(&comm_path).ok()?.trim().to_string();
 
-    // Get the command line for a more complete name
     let cmdline_path = format!("/proc/{}/cmdline", pid);
     let cmdline = std::fs::read_to_string(&cmdline_path)
         .ok()
         .and_then(|s| s.split('\0').next().map(|s| s.to_string()))
         .unwrap_or_else(|| name.clone());
 
-    // Use the executable name as bundle_id equivalent
     let bundle_id = std::path::Path::new(&cmdline)
         .file_name()
         .and_then(|s| s.to_str())

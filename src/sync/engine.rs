@@ -386,6 +386,9 @@ pub struct SyncEngine {
     capture_ctx: CaptureContext,
     /// Input backend
     input_backend: Box<dyn InputBackend>,
+    /// Shared secure-input gate consulted by the input backend; flips on while a
+    /// password field is focused (Linux). See src/input/secure/.
+    secure_state: Arc<crate::input::secure::SecureInputState>,
     /// Command receiver
     cmd_rx: mpsc::Receiver<EngineCommand>,
     /// Status broadcaster
@@ -511,10 +514,13 @@ unintended app video."
             );
         }
 
+        let secure_state = Arc::new(crate::input::secure::SecureInputState::new());
+
         Self {
             config,
             capture_ctx,
-            input_backend: create_input_backend(),
+            secure_state: secure_state.clone(),
+            input_backend: create_input_backend(secure_state),
             cmd_rx,
             status_tx,
             event_buffer: InputEventBuffer::new(),
@@ -1613,7 +1619,18 @@ unintended app video."
 
         // Start input capture (events go to a channel)
         let (input_tx, mut input_rx) = mpsc::unbounded_channel();
-        self.input_backend.start(input_tx)?;
+        self.input_backend.start(input_tx.clone())?;
+
+        // Secure-input gating (Linux: AT-SPI password-field detection). Updates
+        // `secure_state` (read by the input backend) and injects Redacted markers into
+        // the input stream. No-op on other platforms / when disabled.
+        if self.config.security.gating_enabled {
+            crate::input::secure::spawn(
+                self.secure_state.clone(),
+                input_tx,
+                self.config.security.enable_accessibility,
+            );
+        }
 
         // Main polling interval
         let poll_interval = Duration::from_millis(self.config.capture.poll_interval_ms);
@@ -2179,8 +2196,10 @@ unintended app video."
 
         // Ensure capture sources are set up
         if !self.capture_ctx.is_capture_setup() {
-            self.capture_ctx
-                .setup_capture(&self.config.capture.target_apps)?;
+            self.capture_ctx.setup_capture(
+                &self.config.capture.target_apps,
+                &self.config.capture.restore_tokens,
+            )?;
         }
 
         let (frontmost_app, should_capture) = self.frontmost_capture_state();

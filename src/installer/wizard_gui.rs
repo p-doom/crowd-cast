@@ -70,6 +70,17 @@ fn run_wizard_native(config: &mut Config) -> Result<WizardResult> {
     // Set apps in the native wizard
     wizard_ffi::set_available_apps(&app_wrappers);
 
+    // Linux: detect host requirements (GPU, screen-capture backend, input group,
+    // VAAPI) and hand them to the wizard to display + gate Finish on.
+    #[cfg(target_os = "linux")]
+    {
+        let reqs = crate::installer::requirements::collect();
+        wizard_ffi::set_requirements(&reqs);
+        wizard_ffi::set_per_app_available(
+            crate::installer::requirements::per_app_capture_available(),
+        );
+    }
+
     // Run the native wizard (blocks until closed)
     info!("Launching native wizard window...");
     let native_result = wizard_ffi::run_native_wizard();

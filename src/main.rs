@@ -90,6 +90,33 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Headless host-requirements diagnostic (Linux): print the same checks the
+    // setup wizard gates on, then exit. Useful for support and CI.
+    #[cfg(target_os = "linux")]
+    {
+        if args.iter().any(|a| a == "--check-requirements") {
+            for r in installer::requirements::collect() {
+                let mark = if r.satisfied {
+                    "OK"
+                } else {
+                    match r.severity {
+                        installer::requirements::Severity::Required => "MISSING",
+                        installer::requirements::Severity::Recommended => "WARN",
+                        installer::requirements::Severity::Optional => "OPTIONAL",
+                    }
+                };
+                println!("[{:>8}] {}", mark, r.label);
+                if !r.satisfied && !r.detail.is_empty() {
+                    println!("           {}", r.detail);
+                }
+                if !r.satisfied && !r.command.is_empty() {
+                    println!("           $ {}", r.command);
+                }
+            }
+            return Ok(());
+        }
+    }
+
     let force_setup = args.iter().any(|a| a == "--setup" || a == "-s");
     let missing_permissions = !installer::all_permissions_granted();
 
@@ -109,8 +136,27 @@ fn main() -> Result<()> {
     let mut config = Config::load()?;
     info!("Configuration loaded from {:?}", config.config_path());
 
+    // On Linux, also re-show the wizard whenever a Required host component is missing
+    // (e.g. the ScreenCast portal backend), or the saved config requires a capture mode
+    // this host can't provide (e.g. per-app capture where it isn't available) -- so the
+    // agent never runs with a config it cannot satisfy.
+    #[cfg(target_os = "linux")]
+    let requirements_unmet = installer::requirements::has_unmet_required();
+    #[cfg(target_os = "linux")]
+    let config_incompatible = !config.capture.target_apps.is_empty()
+        && !installer::requirements::per_app_capture_available();
+    #[cfg(not(target_os = "linux"))]
+    let requirements_unmet = false;
+    #[cfg(not(target_os = "linux"))]
+    let config_incompatible = false;
+
     // Run setup wizard if needed
-    if force_setup || needs_setup(&config) || missing_permissions {
+    if force_setup
+        || needs_setup(&config)
+        || missing_permissions
+        || requirements_unmet
+        || config_incompatible
+    {
         info!("Running setup wizard...");
         let result = run_wizard_gui(&mut config)?;
 
@@ -180,9 +226,9 @@ fn main() -> Result<()> {
 
     capture_ctx.set_single_active_app_capture(config.capture.single_active_app_capture);
 
-    // Set up capture sources (application capture for target apps, or display capture fallback)
-    let target_apps = &config.capture.target_apps;
-    if let Err(e) = capture_ctx.setup_capture(target_apps) {
+    // Set up capture sources (per-app window capture for target apps, or display capture).
+    let target_apps = config.capture.target_apps.clone();
+    if let Err(e) = capture_ctx.setup_capture(&target_apps, &config.capture.restore_tokens) {
         error!("Failed to setup capture: {}", e);
         std::process::exit(1);
     }
@@ -194,6 +240,59 @@ fn main() -> Result<()> {
             target_apps.len(),
             target_apps
         );
+    }
+
+    // Linux/Wayland per-app (window) capture: the first launch asks the user to pick a
+    // window per app via the xdg-desktop-portal; read back and persist the restore tokens
+    // so subsequent launches restore the same windows without prompting. No-op when tokens
+    // already exist, or on display-capture / non-window-capable sessions.
+    #[cfg(target_os = "linux")]
+    if !target_apps.is_empty() && installer::requirements::per_app_capture_available() {
+        use std::time::{Duration, Instant};
+        let pending: Vec<String> = target_apps
+            .iter()
+            .filter(|a| !config.capture.restore_tokens.contains_key(*a))
+            .cloned()
+            .collect();
+        if !pending.is_empty() {
+            info!(
+                "Per-app capture: waiting for window selection to persist restore tokens for {} app(s)...",
+                pending.len()
+            );
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let tokens = capture_ctx.collect_restore_tokens();
+                let mut changed = false;
+                for (app, token) in tokens {
+                    if !token.is_empty()
+                        && config.capture.restore_tokens.get(&app) != Some(&token)
+                    {
+                        config.capture.restore_tokens.insert(app, token);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    match config.save() {
+                        Ok(()) => info!(
+                            "Persisted {} window restore token(s)",
+                            config.capture.restore_tokens.len()
+                        ),
+                        Err(e) => warn!("Failed to save restore tokens: {}", e),
+                    }
+                }
+                let have_all = pending
+                    .iter()
+                    .all(|a| config.capture.restore_tokens.contains_key(a));
+                if have_all {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    warn!("Timed out waiting for some window selections; they will be requested again next launch.");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
     }
 
     // Create engine channels

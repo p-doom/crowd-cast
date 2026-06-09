@@ -44,6 +44,11 @@ pub enum EventType {
 
     /// Segment metadata (emitted once at the start of each segment)
     Metadata(MetadataEvent),
+
+    /// A span of input withheld from capture for privacy (e.g. a focused password
+    /// field). Carries no key content; marks where suppression began so post-processing
+    /// sees a labeled gap rather than a silent hole.
+    Redacted(RedactedEvent),
 }
 
 /// Frontmost application context at a point in time
@@ -128,6 +133,13 @@ pub struct MetadataEvent {
 
     /// UTC timestamp when this segment started (ISO 8601)
     pub timestamp_utc: String,
+}
+
+/// Marker emitted when secure-input gating begins withholding key events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactedEvent {
+    /// Why capture was suppressed (e.g. "secure-field").
+    pub reason: String,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -279,6 +291,186 @@ impl From<rdev::Button> for MouseButton {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl From<evdev::Key> for KeyEvent {
+    /// Map a Linux evdev key into the *same* curated `(code, name)` namespace the macOS
+    /// rdev backend emits (see the `From<rdev::Key>` impl above), so recordings from both
+    /// platforms share one keyboard vocabulary. evdev keycodes are position-based (a stable
+    /// kernel ABI), independent of layout/DE/display server.
+    ///
+    /// Keys with no curated equivalent fall back to the raw kernel code:
+    /// `(code + 1000, "Unknown(code)")` -- mirroring the macOS `Unknown` path -- so
+    /// post-processing can still reconstruct the physical key. The +1000 offset keeps the
+    /// fallback clear of the curated range (0..=228); evdev key codes top out at 0x2ff.
+    fn from(key: evdev::Key) -> Self {
+        use evdev::Key;
+        let (code, name) = match key {
+            Key::KEY_LEFTALT => (0, "Alt"),
+            Key::KEY_RIGHTALT => (1, "AltGr"),
+            Key::KEY_BACKSPACE => (2, "Backspace"),
+            Key::KEY_CAPSLOCK => (3, "CapsLock"),
+            Key::KEY_LEFTCTRL => (4, "ControlLeft"),
+            Key::KEY_RIGHTCTRL => (5, "ControlRight"),
+            Key::KEY_DELETE => (6, "Delete"),
+            Key::KEY_DOWN => (7, "DownArrow"),
+            Key::KEY_END => (8, "End"),
+            Key::KEY_ESC => (9, "Escape"),
+            Key::KEY_F1 => (10, "F1"),
+            Key::KEY_F2 => (11, "F2"),
+            Key::KEY_F3 => (12, "F3"),
+            Key::KEY_F4 => (13, "F4"),
+            Key::KEY_F5 => (14, "F5"),
+            Key::KEY_F6 => (15, "F6"),
+            Key::KEY_F7 => (16, "F7"),
+            Key::KEY_F8 => (17, "F8"),
+            Key::KEY_F9 => (18, "F9"),
+            Key::KEY_F10 => (19, "F10"),
+            Key::KEY_F11 => (20, "F11"),
+            Key::KEY_F12 => (21, "F12"),
+            Key::KEY_F13 => (200, "F13"),
+            Key::KEY_F14 => (201, "F14"),
+            Key::KEY_F15 => (202, "F15"),
+            Key::KEY_F16 => (203, "F16"),
+            Key::KEY_F17 => (204, "F17"),
+            Key::KEY_F18 => (205, "F18"),
+            Key::KEY_F19 => (206, "F19"),
+            Key::KEY_F20 => (207, "F20"),
+            Key::KEY_F21 => (208, "F21"),
+            Key::KEY_F22 => (209, "F22"),
+            Key::KEY_F23 => (210, "F23"),
+            Key::KEY_F24 => (211, "F24"),
+            Key::KEY_HOME => (22, "Home"),
+            Key::KEY_LEFT => (23, "LeftArrow"),
+            Key::KEY_LEFTMETA => (24, "MetaLeft"),
+            Key::KEY_RIGHTMETA => (25, "MetaRight"),
+            Key::KEY_PAGEDOWN => (26, "PageDown"),
+            Key::KEY_PAGEUP => (27, "PageUp"),
+            Key::KEY_ENTER => (28, "Return"),
+            Key::KEY_RIGHT => (29, "RightArrow"),
+            Key::KEY_LEFTSHIFT => (30, "ShiftLeft"),
+            Key::KEY_RIGHTSHIFT => (31, "ShiftRight"),
+            Key::KEY_SPACE => (32, "Space"),
+            Key::KEY_TAB => (33, "Tab"),
+            Key::KEY_UP => (34, "UpArrow"),
+            Key::KEY_SYSRQ => (35, "PrintScreen"),
+            Key::KEY_SCROLLLOCK => (36, "ScrollLock"),
+            Key::KEY_PAUSE => (37, "Pause"),
+            Key::KEY_NUMLOCK => (38, "NumLock"),
+            Key::KEY_GRAVE => (39, "BackQuote"),
+            Key::KEY_1 => (40, "Num1"),
+            Key::KEY_2 => (41, "Num2"),
+            Key::KEY_3 => (42, "Num3"),
+            Key::KEY_4 => (43, "Num4"),
+            Key::KEY_5 => (44, "Num5"),
+            Key::KEY_6 => (45, "Num6"),
+            Key::KEY_7 => (46, "Num7"),
+            Key::KEY_8 => (47, "Num8"),
+            Key::KEY_9 => (48, "Num9"),
+            Key::KEY_0 => (49, "Num0"),
+            Key::KEY_MINUS => (50, "Minus"),
+            Key::KEY_EQUAL => (51, "Equal"),
+            Key::KEY_Q => (52, "KeyQ"),
+            Key::KEY_W => (53, "KeyW"),
+            Key::KEY_E => (54, "KeyE"),
+            Key::KEY_R => (55, "KeyR"),
+            Key::KEY_T => (56, "KeyT"),
+            Key::KEY_Y => (57, "KeyY"),
+            Key::KEY_U => (58, "KeyU"),
+            Key::KEY_I => (59, "KeyI"),
+            Key::KEY_O => (60, "KeyO"),
+            Key::KEY_P => (61, "KeyP"),
+            Key::KEY_LEFTBRACE => (62, "LeftBracket"),
+            Key::KEY_RIGHTBRACE => (63, "RightBracket"),
+            Key::KEY_A => (64, "KeyA"),
+            Key::KEY_S => (65, "KeyS"),
+            Key::KEY_D => (66, "KeyD"),
+            Key::KEY_F => (67, "KeyF"),
+            Key::KEY_G => (68, "KeyG"),
+            Key::KEY_H => (69, "KeyH"),
+            Key::KEY_J => (70, "KeyJ"),
+            Key::KEY_K => (71, "KeyK"),
+            Key::KEY_L => (72, "KeyL"),
+            Key::KEY_SEMICOLON => (73, "SemiColon"),
+            Key::KEY_APOSTROPHE => (74, "Quote"),
+            Key::KEY_BACKSLASH => (75, "BackSlash"),
+            Key::KEY_102ND => (76, "IntlBackslash"),
+            Key::KEY_Z => (77, "KeyZ"),
+            Key::KEY_X => (78, "KeyX"),
+            Key::KEY_C => (79, "KeyC"),
+            Key::KEY_V => (80, "KeyV"),
+            Key::KEY_B => (81, "KeyB"),
+            Key::KEY_N => (82, "KeyN"),
+            Key::KEY_M => (83, "KeyM"),
+            Key::KEY_COMMA => (84, "Comma"),
+            Key::KEY_DOT => (85, "Dot"),
+            Key::KEY_SLASH => (86, "Slash"),
+            Key::KEY_INSERT => (87, "Insert"),
+            Key::KEY_KPENTER => (88, "KpReturn"),
+            Key::KEY_KPMINUS => (89, "KpMinus"),
+            Key::KEY_KPPLUS => (90, "KpPlus"),
+            Key::KEY_KPASTERISK => (91, "KpMultiply"),
+            Key::KEY_KPSLASH => (92, "KpDivide"),
+            Key::KEY_KP0 => (93, "Kp0"),
+            Key::KEY_KP1 => (94, "Kp1"),
+            Key::KEY_KP2 => (95, "Kp2"),
+            Key::KEY_KP3 => (96, "Kp3"),
+            Key::KEY_KP4 => (97, "Kp4"),
+            Key::KEY_KP5 => (98, "Kp5"),
+            Key::KEY_KP6 => (99, "Kp6"),
+            Key::KEY_KP7 => (100, "Kp7"),
+            Key::KEY_KP8 => (101, "Kp8"),
+            Key::KEY_KP9 => (102, "Kp9"),
+            Key::KEY_KPDOT => (103, "KpDelete"),
+            Key::KEY_FN => (104, "Function"),
+            Key::KEY_VOLUMEUP => (220, "VolumeUp"),
+            Key::KEY_VOLUMEDOWN => (221, "VolumeDown"),
+            Key::KEY_MUTE => (222, "VolumeMute"),
+            Key::KEY_BRIGHTNESSUP => (223, "BrightnessUp"),
+            Key::KEY_BRIGHTNESSDOWN => (224, "BrightnessDown"),
+            Key::KEY_PREVIOUSSONG => (225, "PreviousTrack"),
+            Key::KEY_PLAYPAUSE => (226, "PlayPause"),
+            Key::KEY_PLAYCD => (227, "PlayCd"),
+            Key::KEY_NEXTSONG => (228, "NextTrack"),
+            // Raw fallback: preserve the kernel keycode so post-processing can map it
+            // back to a physical key. Offset by 1000 to stay clear of curated codes.
+            _ => {
+                return Self {
+                    code: key.0 as u32 + 1000,
+                    name: format!("Unknown({})", key.0),
+                };
+            }
+        };
+        Self {
+            code,
+            name: name.to_string(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl MouseButton {
+    /// Map an evdev key to a mouse button if it falls in the pointer-button range
+    /// (`BTN_LEFT..=BTN_TASK`). In evdev, pointer buttons arrive as `Key` events
+    /// alongside keystrokes, so the backend uses this to separate the two.
+    ///
+    /// Returns `None` for keyboard keys and non-pointer buttons (gamepad, stylus, ...),
+    /// which the backend treats as key events. `Other` carries the offset from `BTN_LEFT`,
+    /// which also happens to line up with macOS/CGEvent button numbering (left=0, right=1,
+    /// middle=2, extras=3+), so the exact button stays recoverable.
+    pub fn from_evdev_key(key: evdev::Key) -> Option<Self> {
+        use evdev::Key;
+        match key {
+            Key::BTN_LEFT => Some(MouseButton::Left),
+            Key::BTN_RIGHT => Some(MouseButton::Right),
+            Key::BTN_MIDDLE => Some(MouseButton::Middle),
+            Key::BTN_SIDE | Key::BTN_EXTRA | Key::BTN_FORWARD | Key::BTN_BACK | Key::BTN_TASK => {
+                Some(MouseButton::Other((key.0 - Key::BTN_LEFT.0) as u8))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +491,88 @@ mod tests {
             EventType::ContextChanged(ctx) => assert_eq!(ctx.app_id, UNCAPTURED_APP_ID),
             other => panic!("unexpected event after roundtrip: {:?}", other),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod evdev_mapping_tests {
+    use super::*;
+    use evdev::Key;
+
+    // Each evdev key must produce exactly the (code, name) the macOS rdev table
+    // produces for the same physical key -- this is the cross-platform contract.
+    #[test]
+    fn evdev_keys_match_macos_namespace() {
+        let cases: &[(Key, u32, &str)] = &[
+            (Key::KEY_A, 64, "KeyA"),
+            (Key::KEY_Z, 77, "KeyZ"),
+            (Key::KEY_1, 40, "Num1"),
+            (Key::KEY_0, 49, "Num0"),
+            (Key::KEY_ENTER, 28, "Return"),
+            (Key::KEY_ESC, 9, "Escape"),
+            (Key::KEY_SPACE, 32, "Space"),
+            (Key::KEY_TAB, 33, "Tab"),
+            (Key::KEY_LEFTSHIFT, 30, "ShiftLeft"),
+            (Key::KEY_RIGHTSHIFT, 31, "ShiftRight"),
+            (Key::KEY_LEFTCTRL, 4, "ControlLeft"),
+            (Key::KEY_LEFTALT, 0, "Alt"),
+            (Key::KEY_RIGHTALT, 1, "AltGr"),
+            (Key::KEY_LEFTMETA, 24, "MetaLeft"),
+            (Key::KEY_F1, 10, "F1"),
+            (Key::KEY_F12, 21, "F12"),
+            (Key::KEY_F13, 200, "F13"),
+            (Key::KEY_F24, 211, "F24"),
+            (Key::KEY_UP, 34, "UpArrow"),
+            (Key::KEY_LEFT, 23, "LeftArrow"),
+            (Key::KEY_GRAVE, 39, "BackQuote"),
+            (Key::KEY_102ND, 76, "IntlBackslash"),
+            (Key::KEY_KP0, 93, "Kp0"),
+            (Key::KEY_KPENTER, 88, "KpReturn"),
+            (Key::KEY_KPDOT, 103, "KpDelete"),
+            (Key::KEY_FN, 104, "Function"),
+            (Key::KEY_MUTE, 222, "VolumeMute"),
+            (Key::KEY_NEXTSONG, 228, "NextTrack"),
+        ];
+        for &(key, code, name) in cases {
+            let ev = KeyEvent::from(key);
+            assert_eq!(ev.code, code, "code mismatch for {:?}", key);
+            assert_eq!(ev.name, name, "name mismatch for {:?}", key);
+        }
+    }
+
+    #[test]
+    fn unrecognized_key_falls_back_to_raw_code() {
+        // A code with no curated equivalent must round-trip through the raw fallback
+        // so post-processing can reconstruct it.
+        let raw = Key::new(0x2ff);
+        let ev = KeyEvent::from(raw);
+        assert_eq!(ev.code, raw.0 as u32 + 1000);
+        assert_eq!(ev.name, format!("Unknown({})", raw.0));
+        assert!(
+            ev.code >= 1000,
+            "fallback codes stay clear of the curated range"
+        );
+    }
+
+    #[test]
+    fn pointer_buttons_map_to_mouse_buttons() {
+        assert!(matches!(
+            MouseButton::from_evdev_key(Key::BTN_LEFT),
+            Some(MouseButton::Left)
+        ));
+        assert!(matches!(
+            MouseButton::from_evdev_key(Key::BTN_RIGHT),
+            Some(MouseButton::Right)
+        ));
+        assert!(matches!(
+            MouseButton::from_evdev_key(Key::BTN_MIDDLE),
+            Some(MouseButton::Middle)
+        ));
+        assert!(matches!(
+            MouseButton::from_evdev_key(Key::BTN_SIDE),
+            Some(MouseButton::Other(3))
+        ));
+        // Keyboard keys are not pointer buttons.
+        assert!(MouseButton::from_evdev_key(Key::KEY_A).is_none());
     }
 }

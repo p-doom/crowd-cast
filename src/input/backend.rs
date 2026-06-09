@@ -1,7 +1,9 @@
 //! Input capture backend trait
 
 use crate::data::InputEvent;
+use crate::input::secure::SecureInputState;
 use anyhow::Result;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Trait for input capture backends
@@ -25,10 +27,10 @@ pub trait InputBackend: Send + Sync {
 /// Linux uses evdev for both X11 and Wayland: raw pre-acceleration deltas, reaches the
 /// same input layer raw-input consumers read, and works regardless of display server.
 /// rdev is not linked on Linux (see Cargo.toml). macOS/Windows use rdev.
-pub fn create_input_backend() -> Box<dyn InputBackend> {
+pub fn create_input_backend(secure: Arc<SecureInputState>) -> Box<dyn InputBackend> {
     #[cfg(target_os = "linux")]
     {
-        match super::evdev_backend::EvdevBackend::new() {
+        match super::evdev_backend::EvdevBackend::new(secure) {
             Ok(backend) => {
                 tracing::info!("Using evdev backend for input capture");
                 return Box::new(backend);
@@ -42,6 +44,9 @@ pub fn create_input_backend() -> Box<dyn InputBackend> {
 
     #[cfg(not(target_os = "linux"))]
     {
+        // Secure-input gating is Linux-only; macOS/Windows rely on OS facilities
+        // (e.g. macOS Secure Event Input), so the shared gate is inert here.
+        let _ = secure;
         tracing::info!("Using rdev backend for input capture");
         Box::new(super::rdev_backend::RdevBackend::new())
     }

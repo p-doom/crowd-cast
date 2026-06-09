@@ -86,6 +86,16 @@ rdev = { git = "https://github.com/p-doom/rdev" }
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux evdev fallback for Wayland
 evdev = "0.12"
+# AT-SPI client for secure-input gating: detects focused password fields so their
+# keystrokes can be withheld from capture. Pure-Rust (zbus/D-Bus), no C linkage.
+# See src/input/secure/. zbus is re-exported as `atspi::zbus`.
+atspi = { version = "0.30", default-features = false, features = ["connection", "proxies", "tokio", "zbus"] }
+# Native X11 frontmost-window query (replaces shelling out to the `xdotool` binary).
+# x11rb's default RustConnection speaks the X11 wire protocol over the socket directly,
+# so this needs no system library (no libX11/libxcb) and no external binary installed.
+# Only the XWayland/X11 focus path uses it; the Wayland-native focus signal is separate.
+# See src/capture/frontmost.rs::get_frontmost_app_x11.
+x11rb = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS-specific (for permissions)

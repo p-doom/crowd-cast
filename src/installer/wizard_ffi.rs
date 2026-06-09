@@ -264,3 +264,64 @@ pub fn open_screen_recording_settings() {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn open_notifications_settings() {}
+
+// ---- Linux: host requirement checklist (rendered + gated by the GTK wizard) ----
+
+/// Matches the C `WizardRequirement` in src/ui/wizard_linux.c.
+/// `severity`: 0 = Required, 1 = Recommended, 2 = Optional.
+#[repr(C)]
+pub struct WizardRequirement {
+    pub label: *const c_char,
+    pub detail: *const c_char,
+    pub command: *const c_char,
+    pub severity: u32,
+    pub satisfied: bool,
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn wizard_set_requirements(reqs: *const WizardRequirement, count: usize);
+    fn wizard_set_per_app_available(available: bool);
+}
+
+/// Pass the detected host requirements to the GTK wizard for display + gating.
+#[cfg(target_os = "linux")]
+pub fn set_requirements(reqs: &[crate::installer::requirements::Requirement]) {
+    let labels: Vec<CString> = reqs
+        .iter()
+        .map(|r| CString::new(r.label.as_str()).unwrap_or_default())
+        .collect();
+    let details: Vec<CString> = reqs
+        .iter()
+        .map(|r| CString::new(r.detail.as_str()).unwrap_or_default())
+        .collect();
+    let commands: Vec<CString> = reqs
+        .iter()
+        .map(|r| CString::new(r.command.as_str()).unwrap_or_default())
+        .collect();
+    let ffi: Vec<WizardRequirement> = reqs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| WizardRequirement {
+            label: labels[i].as_ptr(),
+            detail: details[i].as_ptr(),
+            command: commands[i].as_ptr(),
+            severity: r.severity as u32,
+            satisfied: r.satisfied,
+        })
+        .collect();
+    unsafe {
+        wizard_set_requirements(ffi.as_ptr(), ffi.len());
+    }
+    // `labels`/`details`/`commands` must outlive the call; the C side strdup's them.
+    drop(labels);
+    drop(details);
+    drop(commands);
+}
+
+/// Tell the wizard whether per-app capture is available; when false it greys out the
+/// per-app picker and forces full-screen capture.
+#[cfg(target_os = "linux")]
+pub fn set_per_app_available(available: bool) {
+    unsafe { wizard_set_per_app_available(available) }
+}
