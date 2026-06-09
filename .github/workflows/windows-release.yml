@@ -167,7 +167,10 @@ jobs:
           body: |
             ## Installation
 
-            See the quickstart guide: https://pdoom.org/crowd-cast-quickstart.html
+            Please refer to the [quickstart guide](https://pdoom.org/crowd-cast-quickstart.html) for installation instructions.
+
+            ## What's changed
+            <!-- Add the user-facing changes for this release. -->
           # CrowdCast.dmg is carried forward (above) and may be absent on a very
           # first release, so do not fail if it is missing.
           fail_on_unmatched_files: false
