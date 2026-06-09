@@ -94,12 +94,50 @@ jobs:
             Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
           }
 
+      # Carry the current macOS installer forward into this release. The download
+      # buttons use /releases/latest/download/..., and this Windows release becomes
+      # "Latest", so without the dmg here the macOS button 404s whenever Windows
+      # shipped most recently. We copy the dmg from the most recent release that has
+      # one (the latest macOS build, or the carried copy from the previous Windows
+      # release). The macOS Sparkle appcast still points at its own immutable asset,
+      # so auto-update is untouched; this is purely the human download.
+      - name: Carry forward the latest macOS download (CrowdCast.dmg)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Best-effort: never fail the release over the carried download.
+          $repo = "${{ github.repository }}"
+          $dmgTag = $null
+          try {
+            $tags = (gh release list --repo $repo --limit 40 --json tagName,createdAt |
+              ConvertFrom-Json | Sort-Object { [datetime]$_.createdAt } -Descending).tagName
+            foreach ($t in $tags) {
+              $names = (gh release view $t --repo $repo --json assets | ConvertFrom-Json).assets.name
+              if ($names -contains 'CrowdCast.dmg') { $dmgTag = $t; break }
+            }
+            if ($dmgTag) {
+              gh release download $dmgTag --repo $repo --pattern 'CrowdCast.dmg' --dir dist
+              Write-Host "Carried forward CrowdCast.dmg from $dmgTag"
+            } else {
+              Write-Host "No macOS CrowdCast.dmg found yet; shipping Windows-only (mac button stays 404 until macOS releases)."
+            }
+          } catch {
+            Write-Host "Carry-forward skipped (non-fatal): $_"
+          }
+          exit 0
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: "crowd-cast (Windows) ${{ steps.ver.outputs.marketing }} build ${{ steps.ver.outputs.build }}"
-          files: dist/crowd-cast-setup.exe
+          # CrowdCast.dmg is carried forward (above) and may be absent on a very
+          # first release, so do not fail if it is missing.
+          fail_on_unmatched_files: false
+          files: |
+            dist/crowd-cast-setup.exe
+            dist/CrowdCast.dmg
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
