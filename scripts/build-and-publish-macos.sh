@@ -21,6 +21,7 @@ GITHUB_REPO="${CROWD_CAST_GITHUB_REPO:-}"
 S3_BUCKET="${CROWD_CAST_S3_BUCKET:-}"
 CHANNEL="${CROWD_CAST_CHANNEL:-dev}"
 DRY_RUN=0
+ALLOW_MISMATCH=0
 
 # --- Args we need to extract but also pass through ---
 BUILD_NUMBER=""
@@ -39,6 +40,7 @@ Publish options:
   --s3-bucket <bucket>         S3 bucket for appcast.xml
   --s3-appcast-key <key>       S3 object key for appcast (default: appcast.xml)
   --dry-run                    Print publish steps without executing them
+  --allow-version-mismatch     Release even if Windows is on a different marketing version
 
 All other options are forwarded to release-macos.sh (run with -h to see them).
 At minimum you need: --build-number, --identity.
@@ -68,6 +70,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             DRY_RUN=1
+            shift
+            ;;
+        --allow-version-mismatch)
+            ALLOW_MISMATCH=1
             shift
             ;;
         --version)
@@ -147,6 +153,23 @@ aws sts get-caller-identity >/dev/null 2>&1 || { echo "AWS session expired. Run:
 if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
     echo "Release $RELEASE_TAG already exists on GitHub." >&2
     exit 1
+fi
+
+# Version guard: refuse to release macOS at a marketing version that differs from
+# the latest Windows release, so the carried-forward exe and the download buttons
+# never advertise two different marketing versions. Override with --allow-version-mismatch.
+WIN_MKT=""
+while IFS= read -r tag; do
+    if [[ "$tag" =~ ^win-v([0-9.]+)[+] ]]; then WIN_MKT="${BASH_REMATCH[1]}"; break; fi
+done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+if [[ -n "$WIN_MKT" && "$WIN_MKT" != "$APP_VERSION" ]]; then
+    if [[ "$ALLOW_MISMATCH" -eq 1 ]]; then
+        echo "Warning: releasing macOS $APP_VERSION while the latest Windows release is $WIN_MKT (proceeding, --allow-version-mismatch)." >&2
+    else
+        echo "Version mismatch: releasing macOS $APP_VERSION while the latest Windows release is $WIN_MKT." >&2
+        echo "Release Windows $APP_VERSION first, or pass --allow-version-mismatch." >&2
+        exit 1
+    fi
 fi
 
 echo "Will publish as: $RELEASE_TAG"
