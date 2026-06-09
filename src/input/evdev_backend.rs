@@ -84,6 +84,87 @@ impl EvdevBackend {
     }
 }
 
+/// Translates a stream of evdev events into the unified `EventType` schema shared with the
+/// macOS backend. Relative motion/scroll are accumulated and flushed as a single combined
+/// event per `SYN_REPORT` (matching macOS' one-MouseMove-per-motion); keys and pointer
+/// buttons are emitted immediately. `suppress_keys` withholds keystrokes for secure-input
+/// gating but never pointer buttons.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct EventCoalescer {
+    dx: f64,
+    dy: f64,
+    scroll_x: i64,
+    scroll_y: i64,
+}
+
+#[cfg(target_os = "linux")]
+impl EventCoalescer {
+    fn feed(
+        &mut self,
+        kind: InputEventKind,
+        value: i32,
+        suppress_keys: bool,
+        out: &mut Vec<EventType>,
+    ) {
+        use evdev::RelativeAxisType;
+        match kind {
+            InputEventKind::Key(key) => {
+                // Pointer buttons (BTN_*) arrive as Key events; route them to mouse events.
+                // Buttons are never gated by secure-input (matches macOS, where clicks aren't
+                // withheld for a focused password field).
+                if let Some(button) = MouseButton::from_evdev_key(key) {
+                    let be = MouseButtonEvent { button, x: 0.0, y: 0.0 };
+                    match value {
+                        1 => out.push(EventType::MousePress(be)),
+                        0 => out.push(EventType::MouseRelease(be)),
+                        _ => {}
+                    }
+                } else if suppress_keys {
+                    // Withhold keystrokes while a secure context is active.
+                } else {
+                    let ke = KeyEvent::from(key);
+                    match value {
+                        1 => out.push(EventType::KeyPress(ke)),
+                        0 => out.push(EventType::KeyRelease(ke)),
+                        _ => {} // key repeat (value == 2)
+                    }
+                }
+            }
+            InputEventKind::RelAxis(axis) => match axis {
+                RelativeAxisType::REL_X => self.dx += value as f64,
+                RelativeAxisType::REL_Y => self.dy += value as f64,
+                RelativeAxisType::REL_WHEEL => self.scroll_y += value as i64,
+                RelativeAxisType::REL_HWHEEL => self.scroll_x += value as i64,
+                _ => {}
+            },
+            // SYN_REPORT delimits one device packet: flush accumulated motion/scroll as
+            // single combined events, then reset.
+            InputEventKind::Synchronization(_) => {
+                if self.dx != 0.0 || self.dy != 0.0 {
+                    out.push(EventType::MouseMove(MouseMoveEvent {
+                        delta_x: self.dx,
+                        delta_y: self.dy,
+                    }));
+                    self.dx = 0.0;
+                    self.dy = 0.0;
+                }
+                if self.scroll_x != 0 || self.scroll_y != 0 {
+                    out.push(EventType::MouseScroll(MouseScrollEvent {
+                        delta_x: self.scroll_x,
+                        delta_y: self.scroll_y,
+                        x: 0.0,
+                        y: 0.0,
+                    }));
+                    self.scroll_x = 0;
+                    self.scroll_y = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl InputBackend for EvdevBackend {
     fn start(&mut self, tx: mpsc::UnboundedSender<InputEvent>) -> Result<()> {
@@ -108,96 +189,29 @@ impl InputBackend for EvdevBackend {
                 let device_name = device.name().unwrap_or("Unknown").to_string();
                 info!("Started evdev capture for: {}", device_name);
 
+                // Translate evdev events into the unified, macOS-matching schema via
+                // EventCoalescer (motion/scroll combined per SYN_REPORT; keys/buttons immediate).
+                let mut coalescer = EventCoalescer::default();
+                let mut out: Vec<EventType> = Vec::with_capacity(4);
+
                 loop {
                     if !capturing.load(Ordering::SeqCst) {
                         break;
                     }
 
-                    // Fetch events with timeout
                     match device.fetch_events() {
                         Ok(events) => {
                             for ev in events {
                                 let timestamp_us = start_time.elapsed().as_micros() as u64;
-
-                                let event_type = match ev.kind() {
-                                    InputEventKind::Key(key) => {
-                                        // In evdev, pointer buttons (BTN_*) arrive as Key events. Route them
-                                        // to mouse events; everything else is treated as a keyboard key.
-                                        if let Some(button) = MouseButton::from_evdev_key(key) {
-                                            // Pointer buttons are NOT gated by the secure-input suppressor,
-                                            // which targets keystrokes only -- matching macOS, where clicks
-                                            // are never withheld for a focused password field.
-                                            let button_event = MouseButtonEvent {
-                                                button,
-                                                x: 0.0, // evdev doesn't provide position with button events
-                                                y: 0.0,
-                                            };
-                                            match ev.value() {
-                                                1 => Some(EventType::MousePress(button_event)),
-                                                0 => Some(EventType::MouseRelease(button_event)),
-                                                _ => None,
-                                            }
-                                        } else if secure.should_suppress_keys() {
-                                            // Withhold keystrokes while a secure context is active (e.g. a
-                                            // focused password field). Default is to capture; only a positive
-                                            // secure signal suppresses. The AT-SPI gate emits a Redacted marker.
-                                            None
-                                        } else {
-                                            // Map into the same curated (code, name) namespace as the macOS
-                                            // rdev backend; unknown keys fall back to a raw reconstructable code.
-                                            let key_event = KeyEvent::from(key);
-                                            match ev.value() {
-                                                1 => Some(EventType::KeyPress(key_event)),
-                                                0 => Some(EventType::KeyRelease(key_event)),
-                                                _ => None, // key repeat (value == 2)
-                                            }
-                                        }
-                                    }
-                                    InputEventKind::RelAxis(axis) => {
-                                        use evdev::RelativeAxisType;
-                                        match axis {
-                                            // Emit raw delta values directly (true relative motion)
-                                            RelativeAxisType::REL_X => {
-                                                Some(EventType::MouseMove(MouseMoveEvent {
-                                                    delta_x: ev.value() as f64,
-                                                    delta_y: 0.0,
-                                                }))
-                                            }
-                                            RelativeAxisType::REL_Y => {
-                                                Some(EventType::MouseMove(MouseMoveEvent {
-                                                    delta_x: 0.0,
-                                                    delta_y: ev.value() as f64,
-                                                }))
-                                            }
-                                            RelativeAxisType::REL_WHEEL => {
-                                                Some(EventType::MouseScroll(MouseScrollEvent {
-                                                    delta_x: 0,
-                                                    delta_y: ev.value() as i64,
-                                                    x: 0.0,
-                                                    y: 0.0,
-                                                }))
-                                            }
-                                            RelativeAxisType::REL_HWHEEL => {
-                                                Some(EventType::MouseScroll(MouseScrollEvent {
-                                                    delta_x: ev.value() as i64,
-                                                    delta_y: 0,
-                                                    x: 0.0,
-                                                    y: 0.0,
-                                                }))
-                                            }
-                                            _ => None,
-                                        }
-                                    }
-                                    _ => None,
-                                };
-
-                                if let Some(event_type) = event_type {
-                                    let input_event = InputEvent {
-                                        timestamp_us,
-                                        event: event_type,
-                                    };
-
-                                    if let Err(e) = tx.send(input_event) {
+                                out.clear();
+                                coalescer.feed(
+                                    ev.kind(),
+                                    ev.value(),
+                                    secure.should_suppress_keys(),
+                                    &mut out,
+                                );
+                                for event in out.drain(..) {
+                                    if let Err(e) = tx.send(InputEvent { timestamp_us, event }) {
                                         debug!("Failed to send input event: {}", e);
                                     }
                                 }
@@ -225,5 +239,79 @@ impl InputBackend for EvdevBackend {
 
     fn current_timestamp(&self) -> Option<u64> {
         self.start_time.map(|t| t.elapsed().as_micros() as u64)
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod coalescer_tests {
+    use super::*;
+    use evdev::{InputEventKind, Key, RelativeAxisType, Synchronization};
+
+    fn syn() -> InputEventKind {
+        InputEventKind::Synchronization(Synchronization::SYN_REPORT)
+    }
+
+    // A motion packet (REL_X, REL_Y, SYN_REPORT) must coalesce into ONE MouseMove carrying
+    // both axes -- matching macOS, not two split-axis events.
+    #[test]
+    fn diagonal_motion_coalesces_to_one_event() {
+        let mut c = EventCoalescer::default();
+        let mut out = Vec::new();
+        c.feed(InputEventKind::RelAxis(RelativeAxisType::REL_X), 7, false, &mut out);
+        c.feed(InputEventKind::RelAxis(RelativeAxisType::REL_Y), 4, false, &mut out);
+        assert!(out.is_empty(), "nothing emitted before SYN_REPORT");
+        c.feed(syn(), 0, false, &mut out);
+        assert_eq!(out.len(), 1, "exactly one combined event per packet");
+        match &out[0] {
+            EventType::MouseMove(m) => {
+                assert_eq!(m.delta_x, 7.0);
+                assert_eq!(m.delta_y, 4.0);
+            }
+            other => panic!("expected combined MouseMove, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn key_emitted_immediately_with_macos_code() {
+        let mut c = EventCoalescer::default();
+        let mut out = Vec::new();
+        c.feed(InputEventKind::Key(Key::KEY_A), 1, false, &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            EventType::KeyPress(k) => {
+                assert_eq!(k.code, 64);
+                assert_eq!(k.name, "KeyA");
+            }
+            other => panic!("expected KeyPress, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn secure_gate_withholds_keys_not_buttons() {
+        let mut c = EventCoalescer::default();
+        let mut out = Vec::new();
+        c.feed(InputEventKind::Key(Key::KEY_A), 1, true, &mut out);
+        assert!(out.is_empty(), "keystroke withheld under secure gate");
+        c.feed(InputEventKind::Key(Key::BTN_LEFT), 1, true, &mut out);
+        assert_eq!(out.len(), 1, "pointer buttons are never gated");
+        assert!(matches!(out[0], EventType::MousePress(_)));
+    }
+
+    #[test]
+    fn scroll_coalesces_on_syn() {
+        let mut c = EventCoalescer::default();
+        let mut out = Vec::new();
+        c.feed(InputEventKind::RelAxis(RelativeAxisType::REL_WHEEL), -1, false, &mut out);
+        assert!(out.is_empty());
+        c.feed(syn(), 0, false, &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            EventType::MouseScroll(s) => {
+                assert_eq!(s.delta_y, -1);
+                assert_eq!(s.delta_x, 0);
+            }
+            other => panic!("expected MouseScroll, got {:?}", other),
+        }
     }
 }
