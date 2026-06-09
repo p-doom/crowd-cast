@@ -175,17 +175,46 @@ if [[ ! -f "$SPARKLE_ARCHIVE_DIR/appcast.xml" ]]; then
     exit 1
 fi
 
+# --- Carry the current Windows installer forward ---
+# The download buttons use /releases/latest/download/..., and this macOS release
+# becomes "Latest" when it is the most recent, so it must also carry the current
+# crowd-cast-setup.exe or the Windows button 404s. We copy it from the most recent
+# release that has one. The Windows WinSparkle appcast still points at its own
+# immutable asset, so auto-update is unaffected; this is purely the human download.
+CARRY_DIR="target/release/carry-forward"
+WIN_EXE="$CARRY_DIR/crowd-cast-setup.exe"
+rm -rf "$CARRY_DIR" && mkdir -p "$CARRY_DIR"
+WIN_TAG=""
+while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
+    names="$(gh release view "$tag" --repo "$GITHUB_REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+    if grep -qx 'crowd-cast-setup.exe' <<<"$names"; then WIN_TAG="$tag"; break; fi
+done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+
+# Assets always include the Sparkle zip + dmg; append the carried exe if found.
+ASSETS=("$SPARKLE_ARCHIVE_DIR/$SPARKLE_ZIP" "$DMG_PATH")
+if [[ -n "$WIN_TAG" ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[dry-run] would carry forward crowd-cast-setup.exe from $WIN_TAG"
+    else
+        gh release download "$WIN_TAG" --repo "$GITHUB_REPO" \
+            --pattern 'crowd-cast-setup.exe' --dir "$CARRY_DIR" --clobber
+        echo "Carried forward crowd-cast-setup.exe from $WIN_TAG"
+    fi
+    ASSETS+=("$WIN_EXE")
+else
+    echo "No Windows crowd-cast-setup.exe found yet; publishing macOS-only (win button stays 404 until Windows releases)."
+fi
+
 # --- Publish to GitHub Releases ---
 echo
 echo "=== Publishing to GitHub Releases ==="
 if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[dry-run] gh release create $RELEASE_TAG"
-    echo "[dry-run]   $SPARKLE_ARCHIVE_DIR/$SPARKLE_ZIP"
-    echo "[dry-run]   $DMG_PATH"
+    for a in "${ASSETS[@]}"; do echo "[dry-run]   $a"; done
 else
     gh release create "$RELEASE_TAG" \
-        "$SPARKLE_ARCHIVE_DIR/$SPARKLE_ZIP" \
-        "$DMG_PATH" \
+        "${ASSETS[@]}" \
         --repo "$GITHUB_REPO" \
         --title "$RELEASE_TAG" \
         --generate-notes \
