@@ -10,7 +10,7 @@ use libobs_wrapper::scenes::ObsSceneRef;
 use libobs_wrapper::sources::{ObsSourceBuilder, ObsSourceRef};
 use libobs_wrapper::unsafe_send::Sendable;
 use libobs_wrapper::utils::traits::ObsUpdatable;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[cfg(target_os = "macos")]
 use libobs_simple::sources::macos::{
@@ -24,6 +24,24 @@ pub struct ScreenCaptureSource {
     source: ObsSourceRef,
     name: String,
     is_active: bool,
+}
+
+/// Fit a freshly added scene item to the recording canvas.
+///
+/// OBS places a new scene item at its native pixel size in the top-left corner,
+/// so a window larger than the canvas (for example a maximized window on an
+/// external or ultrawide monitor) is clipped to the canvas rectangle. Giving the
+/// item "scale to inner" bounds equal to the canvas makes OBS scale it to fit
+/// inside the frame (preserving aspect, letterboxed) and keep it fit every frame
+/// even as the window resizes. A failure here is non-fatal: the source still
+/// records, just possibly cropped.
+fn fit_source_to_canvas(scene: &ObsSceneRef, source: &ObsSourceRef, name: &str) {
+    if let Err(e) = scene.fit_source_to_screen(source) {
+        warn!(
+            "Could not fit capture source '{}' to the canvas (capture may be cropped): {}",
+            name, e
+        );
+    }
 }
 
 impl ScreenCaptureSource {
@@ -58,6 +76,8 @@ impl ScreenCaptureSource {
             .set_audio_capture(capture_audio)
             .add_to_scene(scene)
             .context("Failed to add screen capture source to scene")?;
+
+        fit_source_to_canvas(scene, &source, name);
 
         debug!("Screen capture source '{}' created successfully", name);
 
@@ -109,6 +129,8 @@ impl ScreenCaptureSource {
         let source = builder
             .add_to_scene(scene)
             .context("Failed to add monitor capture source to scene")?;
+
+        fit_source_to_canvas(scene, &source, name);
 
         debug!("Monitor capture source '{}' created successfully", name);
 
@@ -167,6 +189,8 @@ impl ScreenCaptureSource {
             .add_to_scene(scene)
             .context("Failed to add application capture source to scene")?;
 
+        fit_source_to_canvas(scene, &source, name);
+
         debug!(
             "Application capture source '{}' for '{}' created successfully",
             name, bundle_id
@@ -213,6 +237,8 @@ impl ScreenCaptureSource {
             .set_capture_method(ObsWindowCaptureMethod::MethodWgc)
             .add_to_scene(scene)
             .context("Failed to add window capture source to scene")?;
+
+        fit_source_to_canvas(scene, &source, name);
 
         debug!(
             "Window capture source '{}' for '{}' created successfully",

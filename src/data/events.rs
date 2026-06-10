@@ -111,14 +111,22 @@ pub struct MouseScrollEvent {
     pub y: f64,
 }
 
-/// Segment metadata (display resolution, timing, video output dimensions)
+/// Recording geometry at a point in time: the canvas the frame is composited
+/// into, the encoded output, and the native size of the captured source (which
+/// may be larger than the canvas, e.g. a window on an external/ultrawide monitor,
+/// and is scaled to fit). Emitted at the start of each segment and again whenever
+/// the captured source's resolution changes, so every resolution and aspect ratio
+/// seen during a recording is recorded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataEvent {
-    /// Native display width in logical points
+    /// Recording canvas width in pixels (the native primary display)
     pub display_width: u32,
 
-    /// Native display height in logical points
+    /// Recording canvas height in pixels (the native primary display)
     pub display_height: u32,
+
+    /// Canvas aspect ratio (width / height)
+    pub display_aspect: f64,
 
     /// Video output width in pixels (after downscale)
     pub output_width: u32,
@@ -126,7 +134,19 @@ pub struct MetadataEvent {
     /// Video output height in pixels (after downscale)
     pub output_height: u32,
 
-    /// UTC timestamp when this segment started (ISO 8601)
+    /// Output aspect ratio (width / height)
+    pub output_aspect: f64,
+
+    /// Native pixel width of the captured source/window, or 0 if not yet known
+    pub source_width: u32,
+
+    /// Native pixel height of the captured source/window, or 0 if not yet known
+    pub source_height: u32,
+
+    /// Source aspect ratio (width / height), or 0.0 if not yet known
+    pub source_aspect: f64,
+
+    /// UTC timestamp when this metadata was recorded (ISO 8601)
     pub timestamp_utc: String,
 }
 
