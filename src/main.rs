@@ -51,10 +51,14 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
             });
         }
     }
-    #[cfg(not(no_tray))]
+    // Break the tray loop so main() can run its clean shutdown. macOS exits the Cocoa
+    // run loop via the tray C library; Linux flips an atomic the ksni poll loop reads.
+    #[cfg(all(not(no_tray), target_os = "macos"))]
     unsafe {
         ui::tray_ffi::tray_exit();
     }
+    #[cfg(all(not(no_tray), target_os = "linux"))]
+    ui::request_tray_exit();
 }
 
 use config::Config;
@@ -114,6 +118,73 @@ fn main() -> Result<()> {
                 }
             }
             return Ok(());
+        }
+
+        // Print the follow-focus provider's view of the focused app as you switch windows,
+        // for ~15s, then exit. Diagnostic for the Linux follow-focus provider.
+        if args.iter().any(|a| a == "--print-focus") {
+            crate::capture::focus::ensure_started();
+            println!("follow-focus diagnostic: switch focus between windows (~15s)...");
+            let mut last = String::new();
+            for _ in 0..150 {
+                let live = crate::capture::focus::is_live();
+                let focused = crate::capture::get_frontmost_app()
+                    .map(|a| format!("{} (pid {})", a.bundle_id, a.pid))
+                    .unwrap_or_else(|| "<none>".into());
+                let cur = format!("live={live} focused={focused}");
+                if cur != last {
+                    println!("{cur}");
+                    last = cur;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            return Ok(());
+        }
+
+        // X11 per-window capture diagnostic: report whether this session can do XComposite
+        // per-app capture, and for each app identity passed after the flag, the window id the
+        // source would bind. Follow-focus binds only the *focused* window, so an app resolves
+        // only while it is focused — focus the app, then run e.g.
+        //   crowd-cast-agent --print-windows firefox
+        if let Some(pos) = args.iter().position(|a| a == "--print-windows") {
+            let capable = crate::capture::x11_windows::x11_per_app_capable();
+            println!("x11 per-app (XComposite) capable: {capable}");
+            match crate::capture::get_main_display_resolution() {
+                Ok((w, h)) => println!("display resolution: {w}x{h}"),
+                Err(e) => println!("display resolution: <undetected: {e}>"),
+            }
+            let apps: Vec<&str> = args[pos + 1..]
+                .iter()
+                .map(String::as_str)
+                .filter(|s| !s.starts_with('-'))
+                .collect();
+            if apps.is_empty() {
+                println!("(pass app identities to resolve, e.g. --print-windows firefox code)");
+            }
+            for app in apps {
+                match crate::capture::x11_windows::resolve_capture_window(app) {
+                    Some(cw) => println!("  {app} -> {cw:?}"),
+                    None => println!("  {app} -> <no resolvable window>"),
+                }
+            }
+            return Ok(());
+        }
+
+        // Install + enable the bundled GNOME focus extension, then exit. This is the
+        // command the wizard surfaces for the GNOME follow-focus prerequisite; it writes
+        // no shell state beyond the per-user extensions dir and gsettings, and takes effect
+        // after the next login (gnome-shell loads the extension at session start).
+        if args.iter().any(|a| a == "--install-focus-extension") {
+            match installer::gnome_focus::install_and_enable() {
+                Ok(msg) => {
+                    println!("{msg}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("Failed to install focus extension: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 
@@ -316,7 +387,7 @@ fn main() -> Result<()> {
         status_tx.clone(),
         notification_rx,
         auth_manager.clone(),
-    );
+    )?;
 
     // Wrap runtime in Arc for sharing with signal handler
     let runtime = Arc::new(runtime);
@@ -379,7 +450,7 @@ fn main() -> Result<()> {
     }
 
     // Send shutdown command to engine (in case tray exited without Ctrl+C), then wait for
-    // the engine thread. On no_tray builds (Linux) the engine was already joined above
+    // the engine thread. On no_tray builds (Windows) the engine was already joined above
     // (after the Ctrl+C handler sent Shutdown), so this is skipped to avoid a double join.
     #[cfg(not(no_tray))]
     {
@@ -441,6 +512,18 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    -h, --help    Print this help message");
     println!("    -s, --setup   Run the setup wizard");
+    #[cfg(target_os = "linux")]
+    {
+        println!("        --check-requirements");
+        println!("                  Print host requirement checks and exit (Linux)");
+        println!("        --install-focus-extension");
+        println!("                  Install + enable the GNOME follow-focus extension (Linux)");
+        println!("        --print-focus");
+        println!("                  Diagnostic: print the focused app for ~15s (Linux)");
+        println!("        --print-windows [APP...]");
+        println!("                  Diagnostic: report X11 per-app capability and resolve each");
+        println!("                  APP identity to its XComposite capture window (Linux/X11)");
+    }
     println!();
     println!("ENVIRONMENT:");
     println!("    RUST_LOG      Set log level (e.g., debug, info, warn)");

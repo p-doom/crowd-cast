@@ -22,8 +22,10 @@ use libobs_wrapper::data::ObsObjectUpdater;
 #[cfg(target_os = "linux")]
 use libobs_simple::sources::linux::{
     PipeWireDesktopCaptureSourceBuilder, PipeWireWindowCaptureSourceBuilder,
-    X11CaptureSourceBuilder, XCompositeInputSourceBuilder,
+    X11CaptureSourceBuilder, XCompositeInputSourceBuilder, XCompositeInputSourceUpdater,
 };
+#[cfg(target_os = "linux")]
+use libobs_wrapper::data::ObsObjectUpdater;
 
 /// Returns true when running under a Wayland session (vs X11), used to choose the right
 /// Linux capture backend (PipeWire/portal on Wayland, XSHM/XComposite on X11).
@@ -260,13 +262,22 @@ impl ScreenCaptureSource {
                 .add_to_scene(scene)
                 .context("Failed to add PipeWire window capture source to scene")?
         } else {
+            // X11: `bundle_id` is the app identity (`/proc/comm`), not a window id. Bind the
+            // app's window id *only if it is the focused window right now* (no fallback — see
+            // x11_windows). Empty otherwise (e.g. created at setup before the app is focused);
+            // the source stays blank and not-ready, so the engine's readiness gate keeps input
+            // capture off until a focus switch re-resolves it. Fail-closed, never a wrong window.
+            let capture_window =
+                crate::capture::x11_windows::resolve_capture_window(bundle_id).unwrap_or_default();
             info!(
-                "Creating Linux X11 (xcomposite) window capture source: {} (window id: {})",
-                name, bundle_id
+                "Creating Linux X11 (xcomposite) window capture source: {} (app: {}, resolved: {})",
+                name,
+                bundle_id,
+                if capture_window.is_empty() { "<no window yet>" } else { &capture_window }
             );
             context
                 .source_builder::<XCompositeInputSourceBuilder, _>(name)?
-                .set_capture_window(bundle_id)
+                .set_capture_window(capture_window)
                 .set_show_cursor(true)
                 .add_to_scene(scene)
                 .context("Failed to add XComposite window capture source to scene")?
@@ -399,8 +410,40 @@ impl ScreenCaptureSource {
         Ok(())
     }
 
-    /// Update the target application (non-macOS stub)
-    #[cfg(not(target_os = "macos"))]
+    /// Re-resolve and re-point this source at the app's focused window, in-place.
+    ///
+    /// On X11 the window id is ephemeral (app restart / new window), so on every focus switch
+    /// and capture-watchdog refresh we re-resolve `bundle_id` deterministically to the *focused
+    /// window* (only if it still belongs to this app — no fallback) and update `capture_window`
+    /// via `obs_source_update()` (no source recreation). Binds empty when this app isn't the
+    /// focused one, leaving the source blank/not-ready so input capture stays gated off (the
+    /// engine never switches the active capture to a non-frontmost app, so in practice this
+    /// updates the just-focused app to its focused window). No-op on Wayland, where the
+    /// portal/PipeWire selection is user-driven and persisted via a restore token.
+    #[cfg(target_os = "linux")]
+    pub fn update_application(&mut self, bundle_id: &str) -> Result<()> {
+        if is_wayland_session() {
+            return Ok(());
+        }
+        let capture_window =
+            crate::capture::x11_windows::resolve_capture_window(bundle_id).unwrap_or_default();
+        let runtime = self.source.runtime();
+        XCompositeInputSourceUpdater::create_update(runtime, &mut self.source)
+            .context("Failed to create XComposite source updater")?
+            .set_capture_window(capture_window.clone())
+            .update()
+            .context("Failed to update XComposite capture window")?;
+        self.app_id = Some(bundle_id.to_string());
+        debug!(
+            "Re-resolved XComposite capture for '{}' (window: {})",
+            bundle_id,
+            if capture_window.is_empty() { "<none>" } else { &capture_window }
+        );
+        Ok(())
+    }
+
+    /// Update the target application (other non-macOS platforms: no-op stub).
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub fn update_application(&mut self, _bundle_id: &str) -> Result<()> {
         Ok(())
     }
@@ -647,13 +690,21 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
 
 /// Get the actual resolution of the main display (Linux).
 ///
-/// Not yet implemented: callers (`CaptureContext::initialize`) fall back to OBS's default
-/// canvas size on `Err`, and libobs scales the captured source to the canvas, so capture
-/// still works — just not at the native display resolution. A proper implementation can
-/// query the X11 (`RANDR`) or Wayland (`wl_output`) mode later.
+/// Detects per session type — pure X11 reads the root-window geometry, Wayland reads the
+/// largest `wl_output` current mode — with no cross-backend fallback: the chosen backend
+/// either reports a size or this returns `Err`, and callers fail closed (never a guessed
+/// default), so the capture canvas and recording metadata always reflect the real display.
 #[cfg(target_os = "linux")]
 pub fn get_main_display_resolution() -> Result<(u32, u32)> {
-    anyhow::bail!("Display resolution detection not yet implemented on Linux (using OBS defaults)")
+    if crate::capture::x11_windows::is_pure_x11_session() {
+        crate::capture::x11_windows::x11_screen_size()
+            .context("X11 root window reported no usable screen geometry")
+    } else if is_wayland_session() {
+        crate::capture::wayland_output::wayland_output_size()
+            .context("no Wayland output reported a current mode")
+    } else {
+        anyhow::bail!("no X11 or Wayland session detected for display resolution detection")
+    }
 }
 
 /// Get the actual resolution of the main display (Windows).

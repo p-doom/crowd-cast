@@ -154,7 +154,10 @@ fn default_idle_timeout_secs() -> u64 {
 }
 
 fn default_single_active_app_capture() -> bool {
-    cfg!(target_os = "macos")
+    // On by default where follow-focus per-app capture exists: macOS (ScreenCaptureKit) and
+    // Linux (XComposite, pure-X11 sessions). Whether it actually applies at runtime is gated
+    // per-session by `capture::is_single_active_capable()`.
+    cfg!(target_os = "macos") || cfg!(target_os = "linux")
 }
 
 fn default_capture_watchdog_timeout_ms() -> u64 {

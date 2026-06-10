@@ -11,10 +11,35 @@
 
 mod apps;
 mod context;
+#[cfg(target_os = "linux")]
+pub(crate) mod focus;
 mod frontmost;
 mod recording;
 mod recovery;
 mod sources;
+#[cfg(target_os = "linux")]
+pub(crate) mod wayland_output;
+#[cfg(target_os = "linux")]
+pub(crate) mod x11_windows;
+
+/// Whether this platform/session can drive the single-active-app capture model (capture
+/// only the frontmost tracked app, switching on focus). macOS always can (ScreenCaptureKit
+/// per-app); Linux can only on a **pure X11 session** (XComposite per-window capture) — on
+/// Wayland the portal/PipeWire multi-source path owns window capture instead.
+pub fn is_single_active_capable() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        x11_windows::is_pure_x11_session()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
 
 pub use apps::{list_capturable_apps, list_running_apps};
 pub use context::{CaptureContext, RecordingSession};

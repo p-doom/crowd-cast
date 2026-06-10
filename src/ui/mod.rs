@@ -5,9 +5,13 @@ pub mod notifications;
 mod platform_tray;
 mod tray;
 pub mod tray_ffi;
+#[cfg(target_os = "linux")]
+mod tray_linux;
 #[cfg(target_os = "macos")]
 mod tray_macos;
 mod updater;
+#[cfg(target_os = "linux")]
+mod updater_linux;
 
 pub use notifications::{
     init_notifications, is_authorized as notifications_authorized,
@@ -18,6 +22,8 @@ pub use notifications::{
     show_update_completed_notification, show_update_installing_notification, NotificationAction,
 };
 pub use tray::*;
+#[cfg(target_os = "linux")]
+pub use tray_linux::request_tray_exit;
 pub use updater::UpdaterController;
 
 #[cfg(target_os = "macos")]

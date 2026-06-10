@@ -6,6 +6,13 @@
 fn main() {
     configure_upload_endpoint();
     configure_google_oauth();
+    configure_updater();
+
+    // OBS ABI this build's libobs bindings target. Baked so the runtime bundle path
+    // (src/capture/context.rs) and the Linux RUNPATH below agree on which bundle dir to use.
+    let obs_abi = resolve_obs_abi();
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_OBS_ABI");
+    println!("cargo:rustc-env=CROWD_CAST_OBS_ABI={obs_abi}");
 
     // Tell Cargo about the no_tray cfg
     println!("cargo::rustc-check-cfg=cfg(no_tray)");
@@ -64,8 +71,7 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     {
-        // Native GTK3 setup wizard (mirrors the macOS Cocoa wizard). The system tray
-        // is still disabled on Linux for now (no_tray); only the wizard is wired up.
+        // Native GTK3 setup wizard (mirrors the macOS Cocoa wizard).
         let gtk = pkg_config::Config::new()
             .atleast_version("3.0.0")
             .probe("gtk+-3.0")
@@ -78,8 +84,18 @@ fn main() {
         wizard.compile("wizard_linux");
         println!("cargo:rerun-if-changed=src/ui/wizard_linux.c");
 
-        // Tray not yet implemented on Linux.
-        println!("cargo:rustc-cfg=no_tray");
+        // Tray: Linux uses the pure-Rust StatusNotifierItem tray (src/ui/tray_linux.rs via
+        // the `ksni` crate), so `no_tray` is NOT set here — Linux runs the shared TrayApp
+        // loop like macOS. The dmikushin/tray C library is macOS-only (see tray_ffi.rs).
+
+        // RUNPATH so a binary installed at ~/.local/bin resolves the shipped libobs bundle
+        // (~/.local/share/crowd-cast/obs/<abi>/usr/lib) WITHOUT LD_LIBRARY_PATH — this is what
+        // lets us drop the interim run-crowd-cast.sh wrapper and makes the autostart .desktop
+        // (Exec=<bare binary>) work. --enable-new-dtags emits DT_RUNPATH (searched AFTER
+        // LD_LIBRARY_PATH), so dev runs that still set LD_LIBRARY_PATH are unaffected, and a
+        // non-existent path (e.g. running from target/) is simply skipped by ld.so.
+        println!("cargo:rustc-link-arg=-Wl,--enable-new-dtags");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../share/crowd-cast/obs/{obs_abi}/usr/lib");
     }
 
     #[cfg(target_os = "windows")]
@@ -98,6 +114,16 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ui/wizard_darwin.m");
 }
 
+// OBS ABI (OBS major.minor.patch) this build's libobs-rs bindings target. Defaults to the
+// pinned 32.0.2; overridable via CROWD_CAST_OBS_ABI when the bindings are bumped.
+fn resolve_obs_abi() -> String {
+    std::env::var("CROWD_CAST_OBS_ABI")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "32.0.2".to_string())
+}
+
 fn configure_google_oauth() {
     println!("cargo:rerun-if-env-changed=CROWD_CAST_GOOGLE_CLIENT_ID");
     println!("cargo:rerun-if-env-changed=CROWD_CAST_GOOGLE_CLIENT_SECRET");
@@ -112,6 +138,28 @@ fn configure_google_oauth() {
         let client_secret = client_secret.trim();
         if !client_secret.is_empty() {
             println!("cargo:rustc-env=CROWD_CAST_GOOGLE_CLIENT_SECRET={client_secret}");
+        }
+    }
+}
+
+// Optional in-app auto-update config, baked at build time and read via option_env! in
+// src/ui/updater_linux.rs. If unset, the Linux updater stays inert (mirrors macOS treating a
+// missing SUFeedURL as "auto-update unavailable"), so default builds are unaffected.
+//   CROWD_CAST_UPDATE_FEED_URL: URL of the Ed25519-signed JSON manifest (manifest + manifest.sig).
+//   CROWD_CAST_UPDATE_PUBKEY:   base64 of the 32-byte raw Ed25519 public key (== Sparkle SUPublicEDKey).
+fn configure_updater() {
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_UPDATE_FEED_URL");
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_UPDATE_PUBKEY");
+    if let Ok(url) = std::env::var("CROWD_CAST_UPDATE_FEED_URL") {
+        let url = url.trim();
+        if !url.is_empty() {
+            println!("cargo:rustc-env=CROWD_CAST_UPDATE_FEED_URL={url}");
+        }
+    }
+    if let Ok(key) = std::env::var("CROWD_CAST_UPDATE_PUBKEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            println!("cargo:rustc-env=CROWD_CAST_UPDATE_PUBKEY={key}");
         }
     }
 }

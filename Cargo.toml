@@ -96,6 +96,21 @@ atspi = { version = "0.30", default-features = false, features = ["connection", 
 # Only the XWayland/X11 focus path uses it; the Wayland-native focus signal is separate.
 # See src/capture/frontmost.rs::get_frontmost_app_x11.
 x11rb = "0.13"
+# Wayland follow-focus provider for wlroots compositors (sway/Hyprland/river/...):
+# binds zwlr_foreign_toplevel_manager_v1 and reports the `activated` toplevel's app_id.
+# Complete coverage (all apps, no a11y dependency). zbus (via atspi) carries the GNOME
+# provider; these carry the wlroots one. See src/capture/focus/.
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# Ed25519 verification for the in-app auto-updater (src/ui/updater_linux.rs). Verifies the
+# signed update manifest with the SAME raw-Ed25519 key as macOS Sparkle's SUPublicEDKey, so the
+# existing keypair is reused. Pure-Rust, no C linkage.
+ed25519-dalek = "2"
+# System tray via the freedesktop StatusNotifierItem protocol (src/ui/tray_linux.rs). Pure-Rust
+# over D-Bus (zbus) — works on X11 + Wayland, needs NO GTK main loop and NO libappindicator/
+# libayatana C runtime .so (unlike tray-icon/tray-item). The `blocking` feature runs the SNI
+# service on its own thread so our synchronous TrayApp loop needs no tokio context.
+ksni = { version = "0.3", features = ["blocking"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS-specific (for permissions)

@@ -14,6 +14,9 @@ pub mod wizard_gui;
 #[cfg(target_os = "linux")]
 pub mod requirements;
 
+#[cfg(target_os = "linux")]
+pub mod gnome_focus;
+
 pub use autostart::*;
 pub use permissions::*;
 pub use wizard::{needs_setup, run_wizard, run_wizard_async, WizardResult};

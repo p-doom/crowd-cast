@@ -576,3 +576,142 @@ mod evdev_mapping_tests {
         assert!(MouseButton::from_evdev_key(Key::KEY_A).is_none());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod evdev_device_audit {
+    use super::*;
+    use evdev::{Device, Key, RelativeAxisType};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Hardware coverage audit: enumerate the real input devices on this machine,
+    /// push every key/button they can physically emit through the *production*
+    /// mapping (`KeyEvent::from` / `MouseButton::from_evdev_key`), and report any
+    /// that fall through to the raw `Unknown()` fallback. Records nothing the user
+    /// types -- it only inspects device capabilities. Ignored by default (needs
+    /// `/dev/input` access). Run with:
+    ///   cargo test audit_device_coverage -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn audit_device_coverage() {
+        let mut all_keys: BTreeSet<u16> = BTreeSet::new();
+        let mut rel_axes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut devices_seen = 0;
+
+        let entries = std::fs::read_dir("/dev/input").expect("read /dev/input");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.to_string_lossy().contains("event") {
+                continue;
+            }
+            let device = match Device::open(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let has_keys = device.supported_keys().is_some();
+            let has_rel = device.supported_relative_axes().is_some();
+            if !(has_keys || has_rel) {
+                continue;
+            }
+            let name = device.name().unwrap_or("Unknown").to_string();
+            devices_seen += 1;
+            println!(
+                "device: {name}  ({})  keys={has_keys} rel={has_rel}",
+                path.display()
+            );
+
+            if let Some(keys) = device.supported_keys() {
+                for key in keys.iter() {
+                    all_keys.insert(key.0);
+                }
+            }
+            if let Some(axes) = device.supported_relative_axes() {
+                let mut set = BTreeSet::new();
+                for ax in axes.iter() {
+                    let label = match ax {
+                        RelativeAxisType::REL_X => "REL_X(move)".to_string(),
+                        RelativeAxisType::REL_Y => "REL_Y(move)".to_string(),
+                        RelativeAxisType::REL_WHEEL => "REL_WHEEL(scroll,handled)".to_string(),
+                        RelativeAxisType::REL_HWHEEL => "REL_HWHEEL(hscroll,handled)".to_string(),
+                        RelativeAxisType::REL_WHEEL_HI_RES => {
+                            "REL_WHEEL_HI_RES(NOT handled)".to_string()
+                        }
+                        RelativeAxisType::REL_HWHEEL_HI_RES => {
+                            "REL_HWHEEL_HI_RES(NOT handled)".to_string()
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    set.insert(label);
+                }
+                rel_axes.insert(name.clone(), set);
+            }
+        }
+
+        let mut curated: Vec<(u16, String)> = Vec::new();
+        let mut pointer_buttons: Vec<(u16, String, String)> = Vec::new();
+        let mut unmapped_keys: Vec<(u16, String)> = Vec::new();
+        let mut unmapped_buttons: Vec<(u16, String)> = Vec::new();
+
+        for &code in &all_keys {
+            let key = Key::new(code);
+            let dbg = format!("{key:?}");
+            if let Some(btn) = MouseButton::from_evdev_key(key) {
+                pointer_buttons.push((code, dbg, format!("{btn:?}")));
+                continue;
+            }
+            let ke = KeyEvent::from(key);
+            if ke.name.starts_with("Unknown(") {
+                if dbg.starts_with("BTN_") {
+                    unmapped_buttons.push((code, dbg));
+                } else {
+                    unmapped_keys.push((code, dbg));
+                }
+            } else {
+                curated.push((code, ke.name));
+            }
+        }
+
+        println!("\n==== evdev hardware coverage audit ====");
+        println!("devices inspected: {devices_seen}");
+        println!("distinct key/button codes supported: {}", all_keys.len());
+        println!("  curated keyboard keys:      {}", curated.len());
+        println!("  pointer buttons:            {}", pointer_buttons.len());
+        println!("  UNMAPPED keyboard keys:     {}", unmapped_keys.len());
+        println!(
+            "  non-pointer BTN_* (-> Unknown key events): {}",
+            unmapped_buttons.len()
+        );
+
+        println!("\n-- pointer buttons (BTN_* -> MouseButton) --");
+        for (code, dbg, btn) in &pointer_buttons {
+            println!("   {dbg} ({code}) -> {btn}");
+        }
+
+        println!("\n-- UNMAPPED keyboard keys (emit Unknown(code), reconstructable) --");
+        if unmapped_keys.is_empty() {
+            println!("   (none -- every keyboard key on this hardware maps to a curated name)");
+        }
+        for (code, dbg) in &unmapped_keys {
+            println!("   {dbg} ({code}) -> Unknown({code})");
+        }
+
+        println!("\n-- non-pointer buttons present (gamepad/stylus/etc -> Unknown key events) --");
+        if unmapped_buttons.is_empty() {
+            println!("   (none)");
+        }
+        for (code, dbg) in &unmapped_buttons {
+            println!("   {dbg} ({code})");
+        }
+
+        println!("\n-- relative axes per device (scroll/move) --");
+        for (dev, axes) in &rel_axes {
+            let joined: Vec<&str> = axes.iter().map(|s| s.as_str()).collect();
+            println!("   {dev}: {}", joined.join(", "));
+        }
+        println!("\n==== end audit ====");
+
+        assert!(
+            devices_seen > 0,
+            "no input devices accessible -- are you in the 'input' group?"
+        );
+    }
+}

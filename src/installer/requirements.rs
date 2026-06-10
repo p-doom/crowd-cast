@@ -330,24 +330,37 @@ fn screencast_dbus_available() -> Option<bool> {
 }
 
 /// Whether crowd-cast can do per-app (per-window) capture on this host.
-/// Requires a Wayland session whose xdg-desktop-portal ScreenCast advertises WINDOW
-/// capture (bit 2 of AvailableSourceTypes). GNOME/KDE do; wlroots/sway report MONITOR
-/// only. Returns false on X11 (window-id capture isn't wired up) and non-Linux. When
-/// false the wizard greys out the per-app picker and an existing per-app config
-/// re-triggers the (gated) wizard, so the agent never runs an unsatisfiable config.
+///
+/// Two backends:
+/// - **Wayland**: xdg-desktop-portal ScreenCast advertising WINDOW capture (bit 2 of
+///   AvailableSourceTypes). GNOME/KDE do; wlroots/sway report MONITOR only.
+/// - **Pure X11**: XComposite per-window capture, gated on an EWMH-capable WM and the X
+///   Composite extension (see `capture::x11_windows`).
+///
+/// Returns false on non-Linux. When false the wizard greys out the per-app picker and an
+/// existing per-app config re-triggers the (gated) wizard, so the agent never runs an
+/// unsatisfiable config.
 pub fn per_app_capture_available() -> bool {
     window_capture_supported()
 }
 
-/// Whether the active session's ScreenCast portal can capture individual windows
-/// (WINDOW bit of AvailableSourceTypes). Wayland-only; false on X11/non-Wayland.
+/// Whether the active session can capture individual windows — via the Wayland ScreenCast
+/// portal (WINDOW bit) or, on a pure X11 session, via XComposite.
 pub fn window_capture_supported() -> bool {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var("XDG_SESSION_TYPE")
             .map(|s| s.eq_ignore_ascii_case("wayland"))
             .unwrap_or(false);
     if !wayland {
-        return false;
+        // Pure X11: XComposite per-window capture (EWMH + Composite extension required).
+        #[cfg(target_os = "linux")]
+        {
+            return crate::capture::x11_windows::x11_per_app_capable();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return false;
+        }
     }
     // AvailableSourceTypes bitmask: 1=MONITOR, 2=WINDOW, 4=VIRTUAL.
     available_source_types().map(|t| t & 2 != 0).unwrap_or(false)
@@ -493,6 +506,84 @@ fn vaapi_packages(pkg: Pkg) -> Vec<String> {
 // Public API
 // ===========================================================================
 
+/// `<this binary> --install-focus-extension` — the copy-pasteable command that installs
+/// and enables the bundled GNOME focus extension.
+fn self_install_focus_cmd() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .map(|exe| format!("{exe} --install-focus-extension"))
+        .unwrap_or_else(|| "crowd-cast --install-focus-extension".into())
+}
+
+/// Build the follow-focus provider requirement for the current session.
+///
+/// GNOME has no app-callable native focus API, so it requires the bundled focus extension
+/// to be installed, enabled, and *loaded* (live on D-Bus). The other states map to exact
+/// remediations. Other compositors (wlroots/KDE/X11) expose focus natively, so the host
+/// requirement is considered met there (the matching in-process provider is wired
+/// separately; see capture/focus).
+fn focus_provider_requirement() -> Requirement {
+    use super::gnome_focus::{self, State};
+    let label = "Follow-focus (detect which window is focused)".to_string();
+
+    if gnome_focus::is_gnome() {
+        let (satisfied, detail, command) = match gnome_focus::state() {
+            State::Live => (true, String::new(), String::new()),
+            State::PendingRelogin => (
+                false,
+                "The crowd-cast focus extension is installed but GNOME hasn't loaded it yet. \
+                 Log out and back in once to activate it."
+                    .into(),
+                String::new(),
+            ),
+            State::NotInstalled => (
+                false,
+                "GNOME needs the bundled crowd-cast focus extension to detect the focused \
+                 window (GNOME exposes no other reliable way). Install it, then log out and \
+                 back in once."
+                    .into(),
+                self_install_focus_cmd(),
+            ),
+            State::NotEnabled => (
+                false,
+                "The crowd-cast focus extension is installed but not enabled. Enable it, then \
+                 log out and back in once."
+                    .into(),
+                self_install_focus_cmd(),
+            ),
+            State::Blocked => (
+                false,
+                "GNOME user extensions are disabled on this system (disable-user-extensions / \
+                 org policy), so the focus extension cannot load. crowd-cast cannot record on \
+                 GNOME until extensions are permitted."
+                    .into(),
+                String::new(),
+            ),
+            State::VersionUnsupported(v) => (
+                false,
+                format!(
+                    "This GNOME Shell version ({v}) isn't supported by the bundled focus \
+                     extension yet. Please update crowd-cast."
+                ),
+                String::new(),
+            ),
+        };
+        return Requirement { label, detail, command, severity: Severity::Required, satisfied };
+    }
+
+    // wlroots (wlr-foreign-toplevel) / KDE (KWin) / X11 (_NET_ACTIVE_WINDOW) expose focus
+    // natively and completely, so the host requirement is met. The in-process provider that
+    // consumes them is wired separately; this gate only asserts host capability.
+    Requirement {
+        label,
+        detail: String::new(),
+        command: String::new(),
+        severity: Severity::Required,
+        satisfied: true,
+    }
+}
+
 /// Collect the host requirements for the current Linux session.
 pub fn collect() -> Vec<Requirement> {
     let pkg = detect_pkg();
@@ -569,6 +660,13 @@ pub fn collect() -> Vec<Requirement> {
             satisfied: false,
         });
     }
+
+    // 2b. Follow-focus provider: crowd-cast records input only while a configured target
+    // app is focused, so it needs a reliable, complete-coverage "which window is focused"
+    // source for this session. There is no fallback by design — recording is gated on this.
+    // GNOME (no app-callable native focus API) requires the bundled focus extension; other
+    // compositors expose it natively (wlr-foreign-toplevel / KWin) or via EWMH on X11.
+    reqs.push(focus_provider_requirement());
 
     // 3. input group (evdev input capture).
     let input = in_input_group();

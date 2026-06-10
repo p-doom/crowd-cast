@@ -113,7 +113,38 @@ impl CaptureContext {
 
         #[cfg(target_os = "linux")]
         {
-            debug!("Linux: skipping OBS bootstrapper (libobs provided by system install or bundle via StartupPaths)");
+            // No runtime bootstrapper *download*: the ~17 MB libobs bundle ships with the binary
+            // and is located by compiled-in ABI under ~/.local/share/crowd-cast/obs/<abi>/. Here
+            // we only validate + report; the actual StartupPaths wiring happens in initialize()
+            // via obs_startup_paths_from_env(). Precedence there: CROWD_CAST_OBS_* env override ->
+            // self-provisioned bundle -> system OBS install.
+            match self_provisioned_bundle_root() {
+                Some(root) if bundle_is_present(&root) => {
+                    info!(
+                        "libobs bundle present at {} (self-provisioned, ABI {})",
+                        root.display(),
+                        OBS_ABI
+                    );
+                }
+                Some(root) => {
+                    if std::env::var_os("CROWD_CAST_OBS_DATA_PATH").is_some() {
+                        debug!(
+                            "Self-provisioned libobs bundle absent at {}; using CROWD_CAST_OBS_* env override",
+                            root.display()
+                        );
+                    } else {
+                        warn!(
+                            "Self-provisioned libobs bundle not found at {} (ABI {}); falling back to a system OBS install. \
+                             Ship the bundle there, or set CROWD_CAST_OBS_* to override.",
+                            root.display(),
+                            OBS_ABI
+                        );
+                    }
+                }
+                None => {
+                    debug!("HOME not set; relying on CROWD_CAST_OBS_* env or a system OBS install for libobs");
+                }
+            }
         }
 
         Ok(Self {
@@ -182,25 +213,11 @@ impl CaptureContext {
 
         info!("Initializing libobs context...");
 
-        // Get actual display resolution from CoreGraphics (handles Retina correctly)
-        // Fall back to OBS defaults if detection fails
-        let (base_width, base_height) = match get_main_display_resolution() {
-            Ok((w, h)) => {
-                debug!("Detected display resolution: {}x{}", w, h);
-                (w, h)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to detect display resolution: {}. Using OBS defaults.",
-                    e
-                );
-                let default_video_info = ObsVideoInfoBuilder::new().build();
-                (
-                    default_video_info.get_base_width(),
-                    default_video_info.get_base_height(),
-                )
-            }
-        };
+        // Detect the real display resolution and fail closed — never initialize the capture
+        // canvas at a guessed size (no fallback; the canvas must reflect the real display).
+        let (base_width, base_height) = get_main_display_resolution()
+            .context("could not detect display resolution; refusing to initialize capture at a guessed canvas size")?;
+        debug!("Detected display resolution: {}x{}", base_width, base_height);
 
         // Calculate output dimensions (aspect-preserving, max height from config)
         let (output_width, output_height) = calculate_output_dimensions(
@@ -249,7 +266,9 @@ impl CaptureContext {
     }
 
     fn use_single_active_app_capture(&self) -> bool {
-        cfg!(target_os = "macos") && self.single_active_app_capture && !self.target_apps.is_empty()
+        crate::capture::is_single_active_capable()
+            && self.single_active_app_capture
+            && !self.target_apps.is_empty()
     }
 
     fn build_scene_name(prefix: &str) -> String {
@@ -375,8 +394,17 @@ impl CaptureContext {
             #[cfg(not(target_os = "macos"))]
             HashSet::new()
         };
+        // Only consulted on macOS (see the per-app skip below).
+        #[cfg(not(target_os = "macos"))]
+        let _ = &running_bundles;
 
         for bundle_id in &target_apps {
+            // macOS: ScreenCaptureKit sources for apps not running at startup must be created
+            // in a fresh OBS context (the engine restarts the process to do so), so skip them
+            // here and create them lazily. XComposite (X11) has no such constraint — we
+            // pre-create a scene for every target app, so `needs_scene_for_app` stays false
+            // (no restart) and the source binds its window on creation and each focus switch.
+            #[cfg(target_os = "macos")]
             if !running_bundles.contains(bundle_id.as_str()) {
                 debug!("Skipping scene for '{}' (not running)", bundle_id);
                 continue;
@@ -586,24 +614,10 @@ impl CaptureContext {
                 .context("Failed to stop recording before video reset")?;
         }
 
-        // Get new display resolution
-        let (base_width, base_height) = match get_main_display_resolution() {
-            Ok((w, h)) => {
-                info!("New display resolution: {}x{}", w, h);
-                (w, h)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to detect new display resolution: {}. Using defaults.",
-                    e
-                );
-                let default_video_info = ObsVideoInfoBuilder::new().build();
-                (
-                    default_video_info.get_base_width(),
-                    default_video_info.get_base_height(),
-                )
-            }
-        };
+        // Detect the new display resolution and fail closed (no guessed default).
+        let (base_width, base_height) = get_main_display_resolution()
+            .context("could not detect display resolution after video reset")?;
+        info!("New display resolution: {}x{}", base_width, base_height);
 
         // Calculate output dimensions
         let (output_width, output_height) = calculate_output_dimensions(
@@ -897,7 +911,17 @@ impl CaptureContext {
 
         match &next_app {
             Some(bundle_id) => {
-                if let Some((scene, _)) = self.app_scenes.get_mut(bundle_id.as_str()) {
+                if let Some((scene, source)) = self.app_scenes.get_mut(bundle_id.as_str()) {
+                    // X11: the app's window id is ephemeral and the focused window may have
+                    // changed since this scene was created — re-resolve and re-point the
+                    // XComposite source before showing it. No-op on macOS (scene switch is
+                    // sufficient there) and on Wayland.
+                    #[cfg(target_os = "linux")]
+                    if let Err(e) = source.update_application(bundle_id) {
+                        debug!("X11 re-resolve of capture window for '{}' failed: {}", bundle_id, e);
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = source;
                     Self::activate_scene(scene)?;
                     info!(
                         "Switched active application capture to '{}' (scene switch)",
@@ -1130,33 +1154,77 @@ fn obs_startup_paths_from_env() -> Option<StartupPaths> {
     Some(paths)
 }
 
-/// Build OBS runtime paths for Linux from environment overrides.
+/// Compile-time OBS ABI this binary's libobs bindings target (e.g. "32.0.2"), baked by build.rs.
+/// The self-provisioned bundle lives under `~/.local/share/crowd-cast/obs/<abi>/` (rooted at `usr/`).
+#[cfg(target_os = "linux")]
+const OBS_ABI: &str = env!("CROWD_CAST_OBS_ABI");
+
+/// Root of the libobs bundle shipped with / provisioned for this binary's ABI.
+#[cfg(target_os = "linux")]
+fn self_provisioned_bundle_root() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".local/share/crowd-cast/obs")
+            .join(OBS_ABI),
+    )
+}
+
+/// A bundle is considered present/intact when libobs' effects data dir is there.
+#[cfg(target_os = "linux")]
+fn bundle_is_present(root: &std::path::Path) -> bool {
+    root.join("usr/share/obs/libobs/default.effect").exists()
+}
+
+/// StartupPaths for the self-provisioned bundle (tree rooted at `usr/`). Matches the layout
+/// produced by packaging/linux/build-bundle.sh and the legacy CROWD_CAST_OBS_* vars.
+#[cfg(target_os = "linux")]
+fn self_provisioned_startup_paths() -> Option<StartupPaths> {
+    let root = self_provisioned_bundle_root()?;
+    if !bundle_is_present(&root) {
+        return None;
+    }
+    let data = root.join("usr/share/obs/libobs");
+    let plugin_bin = root.join("usr/lib/obs-plugins");
+    let plugin_data = root.join("usr/share/obs/obs-plugins/%module%");
+    info!("Using self-provisioned libobs bundle at {}", root.display());
+    Some(StartupPaths::new(
+        ObsPath::new(data.to_string_lossy().as_ref()),
+        ObsPath::new(plugin_bin.to_string_lossy().as_ref()),
+        ObsPath::new(plugin_data.to_string_lossy().as_ref()),
+    ))
+}
+
+/// Resolve libobs runtime paths for Linux, in precedence order:
+///   1. Explicit `CROWD_CAST_OBS_*` env overrides (dev / system-install escape hatch). All three
+///      must be set: `CROWD_CAST_OBS_DATA_PATH`, `CROWD_CAST_OBS_PLUGIN_BIN_PATH`,
+///      `CROWD_CAST_OBS_PLUGIN_DATA_PATH`.
+///   2. The self-provisioned bundle shipped with the binary
+///      (`~/.local/share/crowd-cast/obs/<abi>/usr/...`, ABI baked at build time) — the default,
+///      so the bare binary needs no env/wrapper.
+///   3. `None` -> `StartupInfo::default()`, which points libobs-wrapper at a system OBS install
+///      (`/usr/share/obs/libobs` + `/usr/lib/<arch>/obs-plugins`).
 ///
-/// Lets the Linux build point libobs at either a downloaded relocatable bundle or a
-/// system OBS install WITHOUT recompiling. All three granular overrides must be set:
-///   - `CROWD_CAST_OBS_DATA_PATH`        -> libobs data dir (the `data/libobs` effects dir)
-///   - `CROWD_CAST_OBS_PLUGIN_BIN_PATH`  -> plugin binary dir (may contain the `%module%` token)
-///   - `CROWD_CAST_OBS_PLUGIN_DATA_PATH` -> plugin data dir (typically `.../%module%`)
-///
-/// When they are not all set, returns `None` so that `StartupInfo::default()` is used —
-/// which on Linux already points libobs-wrapper at the system OBS install (e.g.
-/// `/usr/share/obs/libobs` + `/usr/lib/<arch>/obs-plugins`). The relocatable-bundle layout
-/// these vars are expected to point at is defined in docs/LINUX_LIBOBS_PROVISIONING.md.
+/// The relocatable-bundle layout is defined in docs/LINUX_LIBOBS_PROVISIONING.md.
 #[cfg(target_os = "linux")]
 fn obs_startup_paths_from_env() -> Option<StartupPaths> {
-    let data = std::env::var("CROWD_CAST_OBS_DATA_PATH").ok()?;
-    let plugin_bin = std::env::var("CROWD_CAST_OBS_PLUGIN_BIN_PATH").ok()?;
-    let plugin_data = std::env::var("CROWD_CAST_OBS_PLUGIN_DATA_PATH").ok()?;
+    if let (Ok(data), Ok(plugin_bin), Ok(plugin_data)) = (
+        std::env::var("CROWD_CAST_OBS_DATA_PATH"),
+        std::env::var("CROWD_CAST_OBS_PLUGIN_BIN_PATH"),
+        std::env::var("CROWD_CAST_OBS_PLUGIN_DATA_PATH"),
+    ) {
+        info!(
+            "Using OBS runtime paths from env overrides (data={}, plugin_bin={}, plugin_data={})",
+            data, plugin_bin, plugin_data
+        );
+        return Some(StartupPaths::new(
+            ObsPath::new(data.as_str()),
+            ObsPath::new(plugin_bin.as_str()),
+            ObsPath::new(plugin_data.as_str()),
+        ));
+    }
 
-    info!(
-        "Using OBS runtime paths from env overrides (data={}, plugin_bin={}, plugin_data={})",
-        data, plugin_bin, plugin_data
-    );
-    Some(StartupPaths::new(
-        ObsPath::new(data.as_str()),
-        ObsPath::new(plugin_bin.as_str()),
-        ObsPath::new(plugin_data.as_str()),
-    ))
+    self_provisioned_startup_paths()
 }
 
 #[cfg(not(target_os = "linux"))]

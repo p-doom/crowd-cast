@@ -146,17 +146,31 @@ unsafe fn nsstring_to_string(nsstring: *mut std::ffi::c_void) -> Option<String> 
 // ============================================================================
 
 #[cfg(target_os = "linux")]
+fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|s| s.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 fn get_frontmost_app_linux() -> Option<AppInfo> {
-    // Try the X11/XWayland path first (reads EWMH focus properties natively).
-    if let Some(app) = get_frontmost_app_x11() {
-        return Some(app);
+    // Wayland: a complete-coverage focus provider (wlr-foreign-toplevel on wlroots, or the
+    // GNOME extension) maintains the focused app on its own thread. We deliberately do NOT
+    // use the X11 path here — under XWayland it would only ever see XWayland windows.
+    if is_wayland_session() {
+        crate::capture::focus::ensure_started();
+        return crate::capture::focus::snapshot().map(|f| AppInfo {
+            // Identity key is the Wayland app_id (wlroots) / wm_class (GNOME). Match
+            // config.target_apps against this on Wayland.
+            bundle_id: f.app_id.clone(),
+            name: f.app_id,
+            pid: f.pid.unwrap_or(0),
+        });
     }
 
-    // No reachable X server, or a Wayland-native window is focused (its handle never
-    // appears in X11). Return None; the sync engine treats unknown focus conservatively
-    // (capture only when capture_all is set). A Wayland-native focus signal (e.g.
-    // wlr-foreign-toplevel on wlroots, or AT-SPI) is a separate, compositor-specific path.
-    None
+    // Pure X11 session: native EWMH query (_NET_ACTIVE_WINDOW -> _NET_WM_PID).
+    get_frontmost_app_x11()
 }
 
 /// Resolve the focused application on X11 / XWayland by reading EWMH properties
@@ -208,26 +222,21 @@ fn get_frontmost_app_x11() -> Option<AppInfo> {
         .value32()
         .and_then(|mut it| it.next())?;
 
-    // Resolve a display name and an executable-basename identity from /proc — the same
-    // identity key produced by app enumeration in apps.rs, so target-app matching agrees.
-    let comm_path = format!("/proc/{}/comm", pid);
-    let name = std::fs::read_to_string(&comm_path).ok()?.trim().to_string();
-
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    let cmdline = std::fs::read_to_string(&cmdline_path)
-        .ok()
-        .and_then(|s| s.split('\0').next().map(|s| s.to_string()))
-        .unwrap_or_else(|| name.clone());
-
-    let bundle_id = std::path::Path::new(&cmdline)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&name)
+    // Identity key: `/proc/<pid>/comm` — the SAME key app enumeration (apps.rs) produces and
+    // the wizard persists in `target_apps`, so `should_capture_app` matching agrees on X11.
+    // (Both sides are kernel-truncated to 15 chars identically; the XComposite window
+    // resolver additionally matches on the exe basename and WM_CLASS, see x11_windows.)
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .ok()?
+        .trim()
         .to_string();
+    if comm.is_empty() {
+        return None;
+    }
 
     Some(AppInfo {
-        bundle_id,
-        name,
+        bundle_id: comm.clone(),
+        name: comm,
         pid,
     })
 }

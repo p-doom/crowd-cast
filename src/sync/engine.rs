@@ -480,7 +480,7 @@ impl SyncEngine {
         status_tx: broadcast::Sender<EngineStatus>,
         notification_rx: mpsc::UnboundedReceiver<NotificationAction>,
         auth: Option<Arc<tokio::sync::Mutex<crate::auth::AuthManager>>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let output_dir = config
             .recording
             .output_directory
@@ -501,7 +501,7 @@ impl SyncEngine {
         };
         let pause_uploads_on_idle = config.capture.pause_uploads_on_idle;
         let single_active_app_capture = config.capture.single_active_app_capture
-            && cfg!(target_os = "macos")
+            && crate::capture::is_single_active_capable()
             && !config.capture.target_apps.is_empty();
         let blank_video_on_untracked_app = config.capture.blank_video_on_untracked_app;
         let capture_watchdog_timeout =
@@ -516,7 +516,12 @@ unintended app video."
 
         let secure_state = Arc::new(crate::input::secure::SecureInputState::new());
 
-        Self {
+        // Record the real display resolution into segment metadata (input coordinates are
+        // normalized against it downstream); fail closed rather than recording a guessed size.
+        let display_resolution = get_main_display_resolution()
+            .map_err(|e| anyhow::anyhow!("display resolution detection failed: {e}"))?;
+
+        Ok(Self {
             config,
             capture_ctx,
             secure_state: secure_state.clone(),
@@ -558,8 +563,8 @@ unintended app video."
             buffered_non_context_event_count: 0,
             any_source_ever_ready: false,
             restart_alert_shown: false,
-            display_resolution: get_main_display_resolution().unwrap_or((1920, 1080)),
-        }
+            display_resolution,
+        })
     }
 
     fn send_status(&mut self, status: EngineStatus) {
@@ -1632,6 +1637,12 @@ unintended app video."
             );
         }
 
+        // Start the follow-focus provider (Linux): a background thread that tracks which
+        // window is focused (wlr-foreign-toplevel on wlroots / the GNOME focus extension /
+        // EWMH on X11), consumed by get_frontmost_app() to gate input capture by app.
+        #[cfg(target_os = "linux")]
+        crate::capture::focus::ensure_started();
+
         // Main polling interval
         let poll_interval = Duration::from_millis(self.config.capture.poll_interval_ms);
         let mut poll_timer = tokio::time::interval(poll_interval);
@@ -2190,6 +2201,39 @@ unintended app video."
                 show_permissions_missing_notification(&message);
             }
             return Err(anyhow::anyhow!("{}", message));
+        }
+
+        // Follow-focus preflight (Linux): when capturing by app (not capture-all), recording
+        // requires a live focus provider — otherwise input could be recorded against the
+        // wrong app or while an unconsented app is focused. No fallback: fail closed. The
+        // wizard hard-gates this at setup; this is the runtime backstop (e.g. the GNOME
+        // extension isn't loaded yet, or a relogin is still pending).
+        #[cfg(target_os = "linux")]
+        {
+            let follow_focus = !self.config.capture.capture_all
+                && !self.config.capture.target_apps.is_empty();
+            // Grace for the provider thread to connect on a cold start before failing closed.
+            if follow_focus && !crate::capture::focus::is_live() {
+                for _ in 0..15 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if crate::capture::focus::is_live() {
+                        break;
+                    }
+                }
+            }
+            if follow_focus && !crate::capture::focus::is_live() {
+                let message = "Recording not started: no follow-focus provider is available \
+                    for this session, so per-app capture can't be done safely. On GNOME, \
+                    install the crowd-cast focus extension and log out and back in (see the \
+                    setup wizard); on other compositors, ensure a supported session."
+                    .to_string();
+                warn!("{}", message);
+                self.send_status_force(EngineStatus::Error(message.clone()));
+                if self.config.recording.notify_on_start_stop && notifications_authorized() {
+                    show_permissions_missing_notification(&message);
+                }
+                return Err(anyhow::anyhow!("{}", message));
+            }
         }
 
         info!("Starting recording...");
