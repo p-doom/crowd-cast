@@ -270,7 +270,7 @@ pub fn agent_self_identifier() -> &'static str {
 }
 
 /// Whether `bundle_id` refers to the crowd-cast agent itself.
-fn is_agent_self(bundle_id: &str) -> bool {
+pub fn is_agent_self(bundle_id: &str) -> bool {
     let me = agent_self_identifier();
     !me.is_empty() && bundle_id.eq_ignore_ascii_case(me)
 }
