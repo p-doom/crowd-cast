@@ -149,7 +149,12 @@ fn list_windowed_apps() -> Vec<(String, String)> {
     // exe stem (lowercase) -> display label
     let mut by_exe: BTreeMap<String, String> = BTreeMap::new();
 
-    if let Ok(windows) = WindowCaptureSourceBuilder::get_windows(WindowSearchMode::ExcludeMinimized) {
+    // Include minimized windows (and windows on other virtual desktops, which
+    // Windows "cloaks"). The picker is about choosing which apps to TRACK, so an
+    // app shouldn't be missing from the list just because its window happens to be
+    // minimized or on another desktop at that instant. ExcludeMinimized would
+    // hide, e.g., a minimized VS Code, making it look like the app isn't supported.
+    if let Ok(windows) = WindowCaptureSourceBuilder::get_windows(WindowSearchMode::IncludeMinimized) {
         for w in windows {
             let exe = std::path::Path::new(&w.0.full_exe)
                 .file_stem()
