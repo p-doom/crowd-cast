@@ -160,7 +160,9 @@ fn list_windowed_apps() -> Vec<(String, String)> {
                 continue;
             }
             let exe_l = exe.to_ascii_lowercase();
-            if SYSTEM_EXES.contains(&exe_l.as_str()) {
+            if SYSTEM_EXES.contains(&exe_l.as_str())
+                || exe_l.as_str() == crate::config::agent_self_identifier()
+            {
                 continue;
             }
             let product = w.0.product_name.clone().unwrap_or_default();
@@ -174,7 +176,9 @@ fn list_windowed_apps() -> Vec<(String, String)> {
         // Fallback: running processes (noisier, but better than an empty list).
         for app in crate::capture::list_capturable_apps() {
             let exe_l = app.bundle_id.to_ascii_lowercase();
-            if SYSTEM_EXES.contains(&exe_l.as_str()) {
+            if SYSTEM_EXES.contains(&exe_l.as_str())
+                || exe_l.as_str() == crate::config::agent_self_identifier()
+            {
                 continue;
             }
             by_exe.entry(exe_l).or_insert(app.name);
