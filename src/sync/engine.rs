@@ -33,8 +33,7 @@ use crate::data::{
 use crate::input::{create_input_backend, InputBackend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
-    is_authorized as notifications_authorized, show_idle_paused_notification,
-    show_idle_resumed_notification, show_permissions_missing_notification,
+    is_authorized as notifications_authorized, show_permissions_missing_notification,
     show_recording_paused_notification, show_recording_resumed_notification,
     show_recording_started_notification, show_recording_stopped_notification, NotificationAction,
 };
@@ -2629,12 +2628,9 @@ unintended app video."
         );
 
         self.idle_paused = true;
+        // pause_recording() already emits the "Recording paused" toast; emitting a
+        // second idle-specific one here is what produced the duplicate notification.
         self.pause_recording();
-
-        // Show notification if enabled
-        if self.config.recording.notify_on_start_stop && notifications_authorized() {
-            show_idle_paused_notification();
-        }
     }
 
     /// Resume recording after idle-pause when user activity is detected
@@ -2648,17 +2644,14 @@ unintended app video."
 
         info!("User activity detected, resuming capture from idle...");
 
+        // resume_recording() already emits the "Recording resumed" toast; emitting a
+        // second idle-specific one here is what produced the duplicate notification.
         self.resume_recording();
         if self.is_paused {
             return;
         }
         self.idle_paused = false;
         self.last_recorded_action_time = Instant::now();
-
-        // Show notification if enabled
-        if self.config.recording.notify_on_start_stop && notifications_authorized() {
-            show_idle_resumed_notification();
-        }
     }
 
     /// Poll the frontmost application and update capture state
