@@ -33,13 +33,66 @@ use crate::data::{
 use crate::input::{create_input_backend, InputBackend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
-    is_authorized as notifications_authorized, show_permissions_missing_notification,
-    show_recording_paused_notification, show_recording_resumed_notification,
-    show_recording_started_notification, show_recording_stopped_notification, NotificationAction,
+    is_authorized as notifications_authorized, show_low_disk_notification,
+    show_permissions_missing_notification, show_recording_paused_notification,
+    show_recording_resumed_notification, show_recording_started_notification,
+    show_recording_stopped_notification, NotificationAction,
 };
 use crate::upload::Uploader;
 
 use super::{EngineCommand, EngineStatus};
+
+/// Warn when free space on the recording volume drops below this. crowd-cast's
+/// own files stay small (uploads delete them), so this mostly catches the disk
+/// filling from other things, which would otherwise silently stop recording.
+const LOW_DISK_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// How often to check free space (it's a syscall, so don't run it every poll).
+const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Free bytes available to the caller on the volume containing `path`, or None
+/// if it can't be determined (e.g. the path doesn't exist).
+#[cfg(target_os = "windows")]
+fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lp_directory_name: *const u16,
+            lp_free_bytes_available_to_caller: *mut u64,
+            lp_total_number_of_bytes: *mut u64,
+            lp_total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_avail: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_avail,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free_avail)
+}
+
+/// Free bytes available on the volume containing `path` (unix), or None on error.
+#[cfg(not(target_os = "windows"))]
+fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    let rc = unsafe { libc::statfs(cpath.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_bsize as u64))
+}
 
 /// Restart the current process with a clean OBS context.
 /// Uses a fresh process on macOS so AppKit/ControlCenter also get a fresh
@@ -465,6 +518,10 @@ pub struct SyncEngine {
     restart_alert_shown: bool,
     /// Native display resolution (logical points) — updated on display change
     display_resolution: (u32, u32),
+    /// Whether we've already warned about low disk space (re-armed once it recovers)
+    low_disk_warned: bool,
+    /// Last time we checked free disk space (throttles the syscall)
+    last_disk_check: Instant,
 }
 
 impl SyncEngine {
@@ -552,6 +609,8 @@ unintended app video."
             any_source_ever_ready: false,
             restart_alert_shown: false,
             display_resolution: get_main_display_resolution().unwrap_or((1920, 1080)),
+            low_disk_warned: false,
+            last_disk_check: Instant::now(),
         }
     }
 
@@ -1881,6 +1940,7 @@ unintended app video."
                     self.check_display_changes().await;
                     self.graduate_upload_buffer();
                     self.check_capture_health();
+                    self.check_low_disk_space();
                 }
 
                 // Apply a queued app-driven capture source switch
@@ -2652,6 +2712,45 @@ unintended app video."
         }
         self.idle_paused = false;
         self.last_recorded_action_time = Instant::now();
+    }
+
+    /// Warn (once per low-disk episode) if free space on the recording volume is
+    /// running out. Recording into a full disk fails silently, so surface it.
+    fn check_low_disk_space(&mut self) {
+        if self.current_session.is_none() {
+            return;
+        }
+        if self.last_disk_check.elapsed() < DISK_CHECK_INTERVAL {
+            return;
+        }
+        self.last_disk_check = Instant::now();
+
+        let dir = self
+            .config
+            .recording
+            .output_directory
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"));
+        let Some(free) = free_space_bytes(&dir) else {
+            return;
+        };
+
+        if free < LOW_DISK_THRESHOLD_BYTES {
+            if !self.low_disk_warned {
+                self.low_disk_warned = true;
+                let free_mb = free / (1024 * 1024);
+                warn!(
+                    "Low disk space: {} MB free on the recording volume; recording may stop soon",
+                    free_mb
+                );
+                if notifications_authorized() {
+                    show_low_disk_notification(free_mb);
+                }
+            }
+        } else if self.low_disk_warned {
+            self.low_disk_warned = false;
+            info!("Disk space recovered above the low-space threshold");
+        }
     }
 
     /// Poll the frontmost application and update capture state

@@ -396,6 +396,20 @@ pub fn show_idle_resumed_notification() {
     platform_notify("Resumed — activity detected");
 }
 
+/// Low disk space warning. No macOS toast yet (the engine logs it regardless);
+/// add an FFI toast here if/when macOS distribution needs one.
+#[cfg(target_os = "macos")]
+pub fn show_low_disk_notification(_free_mb: u64) {}
+
+/// Low disk space warning (non-macOS).
+#[cfg(not(target_os = "macos"))]
+pub fn show_low_disk_notification(free_mb: u64) {
+    platform_notify(&format!(
+        "Low disk space: {} MB free. Recording may stop soon.",
+        free_mb
+    ));
+}
+
 /// Show notification when an update is being installed
 #[cfg(target_os = "macos")]
 pub fn show_update_installing_notification() {
