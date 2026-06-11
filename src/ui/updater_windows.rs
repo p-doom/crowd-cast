@@ -44,6 +44,35 @@ extern "C" fn shutdown_request_cb() {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// Set while a user-initiated check ("Check for Updates") is in flight, so the
+/// result callbacks below toast feedback only for manual checks, not for the
+/// silent every-10-minute background checks (which would otherwise spam).
+static MANUAL_CHECK: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn did_find_update_cb() {
+    if MANUAL_CHECK.swap(false, Ordering::SeqCst) {
+        crate::ui::notifications::show_update_check_notification(
+            "Update available. Downloading and installing it now…",
+        );
+    }
+}
+
+extern "C" fn did_not_find_update_cb() {
+    if MANUAL_CHECK.swap(false, Ordering::SeqCst) {
+        crate::ui::notifications::show_update_check_notification(
+            "You're on the latest version of crowd-cast.",
+        );
+    }
+}
+
+extern "C" fn update_error_cb() {
+    if MANUAL_CHECK.swap(false, Ordering::SeqCst) {
+        crate::ui::notifications::show_update_check_notification(
+            "Couldn't check for updates. Please try again later.",
+        );
+    }
+}
+
 /// Take over launching the staged installer (registered via
 /// `win_sparkle_set_user_run_installer_callback`).
 ///
@@ -131,6 +160,8 @@ type UserRunInstallerCb = extern "C" fn(*const u16) -> c_int;
 type FnSetCanShutdown = unsafe extern "C" fn(CanShutdownCb);
 type FnSetShutdownReq = unsafe extern "C" fn(ShutdownReqCb);
 type FnSetUserRunInstaller = unsafe extern "C" fn(UserRunInstallerCb);
+type UpdateStatusCb = extern "C" fn();
+type FnSetUpdateStatusCb = unsafe extern "C" fn(UpdateStatusCb);
 
 struct WinSparkle {
     // Kept alive for the process lifetime so the function pointers stay valid.
@@ -144,7 +175,12 @@ struct WinSparkle {
     set_can_shutdown_callback: FnSetCanShutdown,
     set_shutdown_request_callback: FnSetShutdownReq,
     set_user_run_installer_callback: FnSetUserRunInstaller,
-    check_update_with_ui: FnVoid,
+    // Optional result callbacks (used only for manual-check feedback toasts).
+    // Loaded best-effort so an unexpected missing/renamed symbol can never break
+    // the core updater (init/check/install); the toast just won't fire.
+    set_did_find_update_callback: Option<FnSetUpdateStatusCb>,
+    set_did_not_find_update_callback: Option<FnSetUpdateStatusCb>,
+    set_update_error_callback: Option<FnSetUpdateStatusCb>,
     check_update_without_ui: FnVoid,
 }
 
@@ -190,6 +226,12 @@ unsafe fn load() -> Result<WinSparkle, String> {
             *s
         }};
     }
+    // Best-effort: returns None if the symbol is absent instead of failing load.
+    macro_rules! opt_sym {
+        ($ty:ty, $name:literal) => {{
+            lib.get::<$ty>($name).ok().map(|s| *s)
+        }};
+    }
 
     let init = sym!(FnVoid, b"win_sparkle_init\0");
     let set_appcast_url = sym!(FnCStr, b"win_sparkle_set_appcast_url\0");
@@ -206,7 +248,16 @@ unsafe fn load() -> Result<WinSparkle, String> {
         FnSetUserRunInstaller,
         b"win_sparkle_set_user_run_installer_callback\0"
     );
-    let check_update_with_ui = sym!(FnVoid, b"win_sparkle_check_update_with_ui\0");
+    let set_did_find_update_callback = opt_sym!(
+        FnSetUpdateStatusCb,
+        b"win_sparkle_set_did_find_update_callback\0"
+    );
+    let set_did_not_find_update_callback = opt_sym!(
+        FnSetUpdateStatusCb,
+        b"win_sparkle_set_did_not_find_update_callback\0"
+    );
+    let set_update_error_callback =
+        opt_sym!(FnSetUpdateStatusCb, b"win_sparkle_set_error_callback\0");
     let check_update_without_ui = sym!(FnVoid, b"win_sparkle_check_update_without_ui\0");
 
     Ok(WinSparkle {
@@ -220,7 +271,9 @@ unsafe fn load() -> Result<WinSparkle, String> {
         set_can_shutdown_callback,
         set_shutdown_request_callback,
         set_user_run_installer_callback,
-        check_update_with_ui,
+        set_did_find_update_callback,
+        set_did_not_find_update_callback,
+        set_update_error_callback,
         check_update_without_ui,
     })
 }
@@ -259,6 +312,16 @@ pub fn init(appcast_url: &str, eddsa_pubkey: &str, version: &str) -> Result<(), 
         // Launch the installer ourselves (detached) instead of letting WinSparkle
         // run it as a child that dies with us. See run_installer_cb.
         (ws.set_user_run_installer_callback)(run_installer_cb);
+        // Result callbacks for manual-check feedback toasts (best-effort).
+        if let Some(f) = ws.set_did_find_update_callback {
+            f(did_find_update_cb);
+        }
+        if let Some(f) = ws.set_did_not_find_update_callback {
+            f(did_not_find_update_cb);
+        }
+        if let Some(f) = ws.set_update_error_callback {
+            f(update_error_cb);
+        }
         (ws.set_automatic_check_for_updates)(1);
         // Check hourly (WinSparkle's enforced minimum) rather than daily, so a
         // freshly published release reaches users within ~an hour instead of up
@@ -272,13 +335,20 @@ pub fn init(appcast_url: &str, eddsa_pubkey: &str, version: &str) -> Result<(), 
     Ok(())
 }
 
-/// Trigger an interactive update check (tray "Check for Updates").
+/// Trigger a manual update check (tray "Check for Updates").
+///
+/// WinSparkle's interactive (with-UI) check does not render a dialog for our
+/// windowless tray app (the click reaches it, but no window appears). So drive
+/// the same silent check the background loop uses, which reliably finds,
+/// downloads, and installs updates, and report progress/result via toasts from
+/// the did-find / did-not-find / error callbacks (gated on MANUAL_CHECK so the
+/// every-10-minute background checks stay silent).
 pub fn check_with_ui() {
     if let Some(ws) = WINSPARKLE.get() {
-        // Log so we can tell from the file whether a "nothing happened" click
-        // actually reached WinSparkle (vs. the tray menu not dispatching).
         info!("Manual update check requested (tray Check for Updates)");
-        unsafe { (ws.check_update_with_ui)() };
+        MANUAL_CHECK.store(true, Ordering::SeqCst);
+        crate::ui::notifications::show_update_check_notification("Checking for updates…");
+        unsafe { (ws.check_update_without_ui)() };
     } else {
         error!("Manual update check requested but WinSparkle is not initialized");
     }
