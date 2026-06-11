@@ -26,22 +26,50 @@ pub struct ScreenCaptureSource {
     is_active: bool,
 }
 
-/// Fit a freshly added scene item to the recording canvas.
+/// Fit a freshly added scene item to the recording canvas (shrink-only).
 ///
 /// Windows `window_capture` adds the scene item at the window's native pixel size
 /// in the top-left corner, so a window larger than the canvas (for example a
 /// maximized window on an external or ultrawide monitor) is clipped to the canvas
-/// rectangle. Giving the item "scale to inner" bounds equal to the canvas makes
-/// OBS scale it to fit inside the frame (preserving aspect, letterboxed) and keep
-/// it fit every frame even as the window resizes. A failure here is non-fatal:
-/// the source still records, just possibly cropped.
+/// rectangle. We give the item `MAX_ONLY` bounds equal to the canvas: OBS scales
+/// the window DOWN to fit inside the frame if it is larger (preserving aspect,
+/// letterboxed/pillarboxed), but never scales it UP, so a window smaller than the
+/// canvas keeps its true pixel size, centered. A failure here is non-fatal: the
+/// source still records, just possibly cropped.
 ///
 /// Windows-only: macOS ScreenCaptureKit sources are display-sized (already match
 /// the canvas), so this would be a no-op there, and macOS is a shipped product we
 /// keep untouched.
 #[cfg(target_os = "windows")]
 fn fit_source_to_canvas(scene: &ObsSceneRef, source: &ObsSourceRef, name: &str) {
-    if let Err(e) = scene.fit_source_to_screen(source) {
+    use libobs_wrapper::enums::ObsBoundsType;
+    use libobs_wrapper::scenes::ObsTransformInfoBuilder;
+
+    // Read the canvas (base) size: the box we shrink oversized windows into.
+    let runtime = source.runtime();
+    let ovi = libobs_wrapper::run_with_obs!(runtime, (), move || unsafe {
+        let mut ovi = std::mem::MaybeUninit::<libobs::obs_video_info>::uninit();
+        libobs::obs_get_video_info(ovi.as_mut_ptr());
+        Sendable(ovi.assume_init())
+    });
+    let (base_width, base_height) = match ovi {
+        Ok(o) => (o.0.base_width, o.0.base_height),
+        Err(e) => {
+            tracing::warn!(
+                "Could not read canvas size to fit '{}' (capture may be cropped): {}",
+                name, e
+            );
+            return;
+        }
+    };
+
+    // MAX_ONLY: scale the window down to fit if it exceeds the canvas, never up;
+    // bounds = the canvas, centered (the builder's defaults).
+    let info = ObsTransformInfoBuilder::new()
+        .set_bounds_type(ObsBoundsType::MaxOnly)
+        .build(base_width, base_height);
+
+    if let Err(e) = scene.set_transform_info(source, &info) {
         tracing::warn!(
             "Could not fit capture source '{}' to the canvas (capture may be cropped): {}",
             name, e
