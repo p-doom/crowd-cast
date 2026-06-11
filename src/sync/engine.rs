@@ -1994,6 +1994,9 @@ unintended app video."
                 // Poll frontmost app and check for display changes
                 _ = poll_timer.tick() => {
                     self.poll_frontmost_app().await;
+                    // Track the active window's real on-monitor position/scale
+                    // (Windows monitor-level fit; no-op elsewhere).
+                    self.capture_ctx.apply_monitor_fit_to_active();
                     self.check_display_changes().await;
                     self.graduate_upload_buffer();
                     self.check_capture_health();

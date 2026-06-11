@@ -15,6 +15,8 @@ mod frontmost;
 mod recording;
 mod recovery;
 mod sources;
+#[cfg(target_os = "windows")]
+mod window_geometry;
 
 pub use apps::{list_capturable_apps, list_running_apps};
 pub use context::{CaptureContext, RecordingSession};
