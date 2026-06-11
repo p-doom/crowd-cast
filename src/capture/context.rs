@@ -70,6 +70,11 @@ pub struct CaptureContext {
     single_active_app_capture: bool,
     /// Currently active application capture target when single-active mode is enabled
     active_capture_app: Option<String>,
+    /// Windows monitor-level fit last applied to the active source, used to skip
+    /// re-applying an unchanged transform every poll: (app, scale, pos_x, pos_y)
+    /// with the floats stored as bits so it derives Eq.
+    #[cfg(target_os = "windows")]
+    last_monitor_fit: Option<(String, u32, u32, u32)>,
 }
 
 impl CaptureContext {
@@ -121,6 +126,8 @@ impl CaptureContext {
             target_apps: Vec::new(),
             single_active_app_capture: false,
             active_capture_app: None,
+            #[cfg(target_os = "windows")]
+            last_monitor_fit: None,
         })
     }
 
@@ -161,21 +168,24 @@ impl CaptureContext {
         .context("Failed to bootstrap OBS binaries")
     }
 
-    /// Initialize the libobs context (must be called from main thread on some platforms)
+    /// Compute the recording canvas (base) and encoded output dimensions.
     ///
-    /// This configures the video output based on `recording_config`:
-    /// - Output resolution is downscaled to max_output_height while preserving aspect ratio
-    /// - FPS is set from recording_config.fps
-    pub fn initialize(&mut self) -> Result<()> {
-        if self.context.is_some() {
-            debug!("libobs context already initialized");
-            return Ok(());
+    /// On Windows the canvas is the bounding box of all monitors, each normalized
+    /// to a 1080px shortest edge (so a window's monitor-level scale renders it at a
+    /// consistent resolution regardless of orientation); the output equals the
+    /// canvas since it is already in 1080-short-edge space. On macOS (and as a
+    /// fallback) the canvas is the main display and the output is downscaled to
+    /// `max_output_height`.
+    fn canvas_and_output_dimensions(&self) -> ((u32, u32), (u32, u32)) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some((bw, bh)) = super::window_geometry::capture_canvas_size() {
+                debug!("Monitor-normalized capture canvas: {}x{}", bw, bh);
+                return ((bw, bh), (bw, bh));
+            }
+            warn!("Could not enumerate monitors for canvas sizing; falling back to primary display");
         }
 
-        info!("Initializing libobs context...");
-
-        // Get actual display resolution from CoreGraphics (handles Retina correctly)
-        // Fall back to OBS defaults if detection fails
         let (base_width, base_height) = match get_main_display_resolution() {
             Ok((w, h)) => {
                 debug!("Detected display resolution: {}x{}", w, h);
@@ -193,16 +203,34 @@ impl CaptureContext {
                 )
             }
         };
-
-        // Calculate output dimensions (aspect-preserving, max height from config)
-        let (output_width, output_height) = calculate_output_dimensions(
+        let output = calculate_output_dimensions(
             base_width,
             base_height,
             self.recording_config.max_output_height,
         );
+        ((base_width, base_height), output)
+    }
+
+    /// Initialize the libobs context (must be called from main thread on some platforms)
+    ///
+    /// This configures the video output based on `recording_config`:
+    /// - Output resolution is downscaled to max_output_height while preserving aspect ratio
+    /// - FPS is set from recording_config.fps
+    pub fn initialize(&mut self) -> Result<()> {
+        if self.context.is_some() {
+            debug!("libobs context already initialized");
+            return Ok(());
+        }
+
+        info!("Initializing libobs context...");
+
+        // Canvas + output dimensions (Windows: monitor-normalized bounding box;
+        // macOS/fallback: main display downscaled to max_output_height).
+        let ((base_width, base_height), (output_width, output_height)) =
+            self.canvas_and_output_dimensions();
 
         info!(
-            "Video config: {}x{} (native) -> {}x{} (output), {} fps",
+            "Video config: {}x{} (canvas) -> {}x{} (output), {} fps",
             base_width, base_height, output_width, output_height, self.recording_config.fps
         );
 
@@ -592,34 +620,13 @@ impl CaptureContext {
                 .context("Failed to stop recording before video reset")?;
         }
 
-        // Get new display resolution
-        let (base_width, base_height) = match get_main_display_resolution() {
-            Ok((w, h)) => {
-                info!("New display resolution: {}x{}", w, h);
-                (w, h)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to detect new display resolution: {}. Using defaults.",
-                    e
-                );
-                let default_video_info = ObsVideoInfoBuilder::new().build();
-                (
-                    default_video_info.get_base_width(),
-                    default_video_info.get_base_height(),
-                )
-            }
-        };
-
-        // Calculate output dimensions
-        let (output_width, output_height) = calculate_output_dimensions(
-            base_width,
-            base_height,
-            self.recording_config.max_output_height,
-        );
+        // Recompute canvas + output (monitors may have changed: hot-plug, rotation,
+        // resolution). Same monitor-normalized logic as initialize().
+        let ((base_width, base_height), (output_width, output_height)) =
+            self.canvas_and_output_dimensions();
 
         info!(
-            "Resetting video: {}x{} (native) -> {}x{} (output), {} fps",
+            "Resetting video: {}x{} (canvas) -> {}x{} (output), {} fps",
             base_width, base_height, output_width, output_height, self.recording_config.fps
         );
 
@@ -980,6 +987,57 @@ impl CaptureContext {
             None => Ok(None),
         }
     }
+
+    /// Apply the monitor-level fit to the active app's capture source: scale the
+    /// window by its monitor's 1080-shortest-edge factor and place it at its real
+    /// on-monitor position. Re-applied each poll so it tracks the window as it
+    /// moves/resizes; de-duplicated so an unchanged transform is a no-op.
+    /// Windows-only; a no-op elsewhere (macOS captures the main display only).
+    #[cfg(target_os = "windows")]
+    pub fn apply_monitor_fit_to_active(&mut self) {
+        use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
+        use libobs_wrapper::graphics::Vec2;
+        use libobs_wrapper::scenes::ObsTransformInfoBuilder;
+
+        let Some(app) = self.active_capture_app.clone() else {
+            return;
+        };
+        let Some(fit) = super::window_geometry::monitor_fit_for_app(&app) else {
+            return;
+        };
+        let key = (
+            app.clone(),
+            fit.scale.to_bits(),
+            fit.pos_x.to_bits(),
+            fit.pos_y.to_bits(),
+        );
+        if self.last_monitor_fit.as_ref() == Some(&key) {
+            return;
+        }
+
+        // Explicit transform: no bounds, top-left aligned, scaled by the monitor
+        // factor, positioned at the window's real on-monitor offset (in canvas px).
+        let info = ObsTransformInfoBuilder::new()
+            .set_pos(Vec2::new(fit.pos_x, fit.pos_y))
+            .set_scale(Vec2::new(fit.scale, fit.scale))
+            .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
+            .set_bounds_type(ObsBoundsType::None)
+            .build(0, 0);
+
+        let applied = {
+            let Some((scene, source)) = self.app_scenes.get(&app) else {
+                return;
+            };
+            scene.set_transform_info(source.source(), &info).is_ok()
+        };
+        if applied {
+            self.last_monitor_fit = Some(key);
+        }
+    }
+
+    /// No-op on non-Windows platforms (macOS captures the main display only).
+    #[cfg(not(target_os = "windows"))]
+    pub fn apply_monitor_fit_to_active(&mut self) {}
 
     /// Return whether the active source has started producing non-zero-sized frames.
     pub fn active_source_is_ready(&self) -> Result<bool> {
