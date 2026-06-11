@@ -107,9 +107,8 @@ unsafe extern "system" fn collect_window(hwnd: *mut c_void, data: isize) -> i32 
     1
 }
 
-/// Recording canvas size: bounding box of all monitors, each normalized so its
-/// shortest edge is `TARGET_SHORT_EDGE`. Returns `None` if no monitors are found.
-pub fn capture_canvas_size() -> Option<(u32, u32)> {
+/// Every monitor's rectangle (virtual-screen, physical pixels).
+fn all_monitor_rects() -> Vec<Rect> {
     let mut rects: Vec<Rect> = Vec::new();
     unsafe {
         EnumDisplayMonitors(
@@ -119,6 +118,25 @@ pub fn capture_canvas_size() -> Option<(u32, u32)> {
             &mut rects as *mut Vec<Rect> as isize,
         );
     }
+    rects
+}
+
+/// Stable signature of the current monitor layout (sorted per-monitor rectangles).
+/// Used to detect when monitors are added/removed/moved/resized (e.g. plugging in
+/// an ultrawide) so the canvas can be recomputed. Empty if enumeration fails.
+pub fn monitor_signature() -> Vec<(i32, i32, i32, i32)> {
+    let mut sig: Vec<(i32, i32, i32, i32)> = all_monitor_rects()
+        .into_iter()
+        .map(|r| (r.left, r.top, r.right, r.bottom))
+        .collect();
+    sig.sort_unstable();
+    sig
+}
+
+/// Recording canvas size: bounding box of all monitors, each normalized so its
+/// shortest edge is `TARGET_SHORT_EDGE`. Returns `None` if no monitors are found.
+pub fn capture_canvas_size() -> Option<(u32, u32)> {
+    let rects = all_monitor_rects();
 
     let mut max_w = 0u32;
     let mut max_h = 0u32;
