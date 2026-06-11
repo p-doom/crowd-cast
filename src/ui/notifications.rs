@@ -410,6 +410,18 @@ pub fn show_low_disk_notification(free_mb: u64) {
     ));
 }
 
+/// Feedback toast for a manual "Check for Updates" (macOS uses Sparkle's own UI).
+#[cfg(target_os = "macos")]
+pub fn show_update_check_notification(_message: &str) {}
+
+/// Feedback toast for a manual "Check for Updates" (non-macOS): WinSparkle's
+/// interactive dialog does not surface for our windowless tray app, so the tray
+/// drives the silent check and we report progress/result via this toast.
+#[cfg(not(target_os = "macos"))]
+pub fn show_update_check_notification(message: &str) {
+    platform_notify(message);
+}
+
 /// Show notification when an update is being installed
 #[cfg(target_os = "macos")]
 pub fn show_update_installing_notification() {
