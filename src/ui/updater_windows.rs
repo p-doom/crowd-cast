@@ -230,7 +230,7 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// Load WinSparkle, configure it (appcast, key, version, callbacks, automatic
-/// daily checks) and start it. Returns Err (without starting) if the DLL is
+/// hourly checks) and start it. Returns Err (without starting) if the DLL is
 /// missing or the key is rejected; the caller then marks the updater
 /// unavailable. Idempotent.
 pub fn init(appcast_url: &str, eddsa_pubkey: &str, version: &str) -> Result<(), String> {
@@ -260,7 +260,11 @@ pub fn init(appcast_url: &str, eddsa_pubkey: &str, version: &str) -> Result<(), 
         // run it as a child that dies with us. See run_installer_cb.
         (ws.set_user_run_installer_callback)(run_installer_cb);
         (ws.set_automatic_check_for_updates)(1);
-        (ws.set_update_check_interval)(60 * 60 * 24); // daily
+        // Check hourly (WinSparkle's enforced minimum) rather than daily, so a
+        // freshly published release reaches users within ~an hour instead of up
+        // to a day. The background check respects this interval, so a long-running
+        // agent would otherwise sit on a stale version until the daily mark.
+        (ws.set_update_check_interval)(60 * 60);
         (ws.init)();
     }
 
@@ -271,7 +275,12 @@ pub fn init(appcast_url: &str, eddsa_pubkey: &str, version: &str) -> Result<(), 
 /// Trigger an interactive update check (tray "Check for Updates").
 pub fn check_with_ui() {
     if let Some(ws) = WINSPARKLE.get() {
+        // Log so we can tell from the file whether a "nothing happened" click
+        // actually reached WinSparkle (vs. the tray menu not dispatching).
+        info!("Manual update check requested (tray Check for Updates)");
         unsafe { (ws.check_update_with_ui)() };
+    } else {
+        error!("Manual update check requested but WinSparkle is not initialized");
     }
 }
 

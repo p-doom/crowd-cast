@@ -188,4 +188,6 @@ jobs:
       # Publish the appcast LAST — once it's live, clients start updating, so the
       # release asset (previous step) must already exist for the download URL.
       - name: Publish appcast to S3
-        run: aws s3 cp dist/appcast-win.xml s3://crowd-cast-bucket/appcast-win.xml
+        # no-cache so WinSparkle/WinINet always revalidates the appcast and never
+        # serves a stale version that hides a freshly published release.
+        run: aws s3 cp dist/appcast-win.xml s3://crowd-cast-bucket/appcast-win.xml --cache-control "no-cache"
