@@ -25,12 +25,12 @@ use libobs_simple::sources::linux::{
     X11CaptureSourceBuilder, XCompositeInputSourceBuilder, XCompositeInputSourceUpdater,
 };
 #[cfg(target_os = "linux")]
-use libobs_wrapper::data::ObsObjectUpdater;
+use libobs_wrapper::data::{ObsData, ObsObjectUpdater};
 
 /// Returns true when running under a Wayland session (vs X11), used to choose the right
 /// Linux capture backend (PipeWire/portal on Wayland, XSHM/XComposite on X11).
 #[cfg(target_os = "linux")]
-fn is_wayland_session() -> bool {
+pub(crate) fn is_wayland_session() -> bool {
     std::env::var("XDG_SESSION_TYPE")
         .map(|s| s.eq_ignore_ascii_case("wayland"))
         .unwrap_or(false)
@@ -292,6 +292,37 @@ impl ScreenCaptureSource {
         })
     }
 
+    /// Create a per-app capture source on Linux that binds an already-existing PipeWire node
+    /// directly (no portal, no picker). The node is produced out-of-band by
+    /// `gnome_screencast` via Mutter `RecordWindow`; OBS connects to it through the
+    /// obs-pipewire `ConnectNode` setting (bundled-OBS patch). The node must stay alive (its
+    /// Mutter session is held by the `GnomeScreenCast` manager) for this source's lifetime.
+    #[cfg(target_os = "linux")]
+    pub fn new_window_node_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        app_id: &str,
+        node_id: u32,
+    ) -> Result<Self> {
+        info!(
+            "Creating Linux PipeWire node capture source: {} (app: {}, node: {})",
+            name, app_id, node_id
+        );
+        let source = context
+            .source_builder::<PipeWireWindowCaptureSourceBuilder, _>(name)?
+            .set_connect_node(node_id as i64)
+            .set_show_cursor(true)
+            .add_to_scene(scene)
+            .context("Failed to add PipeWire node capture source to scene")?;
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+            app_id: Some(app_id.to_string()),
+        })
+    }
+
     /// Create a per-application/window capture source on Windows.
     ///
     /// WINDOWS (for whoever adds Windows support): implement using
@@ -347,6 +378,45 @@ impl ScreenCaptureSource {
                 debug!("get_restore_token('{}') unavailable: {}", self.name, e);
                 None
             }
+        }
+    }
+
+    /// Wayland: block until this per-app PipeWire source is actually producing frames
+    /// (non-zero dimensions). Frames only flow once its xdg-desktop-portal ScreenCast
+    /// session is fully established — after the user picks a window on first run, or
+    /// after the silent restore handshake on later runs. We key on frame production
+    /// rather than the restore token because a token passed in up front reads as "ready"
+    /// immediately while the portal handshake is still in flight.
+    ///
+    /// This lets the caller create per-app sources ONE AT A TIME: two portal sessions
+    /// negotiating concurrently abort the OBS pipewire plugin (`free(): invalid pointer`).
+    /// On X11 (XComposite) there is no portal handshake, so this returns immediately.
+    ///
+    /// Returns `true` once the source is streaming, `false` on timeout (e.g. the user
+    /// dismissed the portal picker).
+    #[cfg(target_os = "linux")]
+    pub fn wait_until_capturing(&self, timeout: std::time::Duration) -> bool {
+        if !is_wayland_session() {
+            return true;
+        }
+        let start = std::time::Instant::now();
+        loop {
+            if let Ok((w, h)) = self.dimensions() {
+                if w > 0 && h > 0 {
+                    debug!(
+                        "Portal session for '{}' is streaming ({}x{}) after {:?}",
+                        self.name,
+                        w,
+                        h,
+                        start.elapsed()
+                    );
+                    return true;
+                }
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
         }
     }
 
@@ -439,6 +509,24 @@ impl ScreenCaptureSource {
             bundle_id,
             if capture_window.is_empty() { "<none>" } else { &capture_window }
         );
+        Ok(())
+    }
+
+    /// Re-point a GNOME Wayland direct-node capture (created by `new_window_node_capture`) to a
+    /// different PipeWire node, in place. Sets the `ConnectNode` setting and calls
+    /// `obs_source_update`; the bundled obs-pipewire patch sees the changed node in its update
+    /// handler and reconnects the stream to it — no source recreation, the scene item (and its
+    /// transform/z-order) is preserved. Used by GNOME follow-focus to track the focused window.
+    #[cfg(target_os = "linux")]
+    pub fn update_connect_node(&mut self, node_id: u32) -> Result<()> {
+        let mut data =
+            ObsData::new(self.source.runtime()).context("Failed to allocate ObsData for ConnectNode")?;
+        data.set_int("ConnectNode", node_id as i64)
+            .context("Failed to set ConnectNode")?;
+        self.source
+            .update_raw(data)
+            .context("Failed to obs_source_update ConnectNode")?;
+        debug!("Re-pointed node capture '{}' to node {}", self.name, node_id);
         Ok(())
     }
 

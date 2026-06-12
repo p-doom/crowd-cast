@@ -26,17 +26,31 @@ pub struct FocusInfo {
     /// Owning PID when the provider exposes it (GNOME extension); `None` on wlroots, where
     /// `zwlr_foreign_toplevel` carries no PID.
     pub pid: Option<u32>,
+    /// Focused window's Mutter id when the provider exposes it (GNOME extension) — the SAME
+    /// id `RecordWindow` expects, so GNOME per-window capture can re-point to the exact focused
+    /// window (not just the app) among an app's several toplevels. `None` on wlroots / when no
+    /// window is focused.
+    pub window_id: Option<u64>,
 }
 
 /// Shared, thread-safe focus state written by a provider thread and read by the engine.
 pub struct FocusState {
     inner: Mutex<Option<FocusInfo>>,
     live: AtomicBool,
+    /// All current toplevel `app_id`s, maintained by providers that can enumerate windows
+    /// without a request/response round-trip (wlroots tracks every toplevel locally). Used by
+    /// `list_app_ids` to source the wizard's app list from the SAME identity the gate uses.
+    /// GNOME does not populate this (it answers `list_app_ids` with an on-demand D-Bus call).
+    windows: Mutex<Vec<String>>,
 }
 
 impl FocusState {
     fn new() -> Self {
-        Self { inner: Mutex::new(None), live: AtomicBool::new(false) }
+        Self {
+            inner: Mutex::new(None),
+            live: AtomicBool::new(false),
+            windows: Mutex::new(Vec::new()),
+        }
     }
     /// Set the currently focused app (None = no/unknown focused window).
     pub fn set(&self, info: Option<FocusInfo>) {
@@ -46,6 +60,15 @@ impl FocusState {
     }
     fn snapshot(&self) -> Option<FocusInfo> {
         self.inner.lock().ok().and_then(|g| g.clone())
+    }
+    /// Replace the tracked set of all toplevel `app_id`s (wlroots provider).
+    pub fn set_windows(&self, ids: Vec<String>) {
+        if let Ok(mut g) = self.windows.lock() {
+            *g = ids;
+        }
+    }
+    fn windows(&self) -> Vec<String> {
+        self.windows.lock().map(|g| g.clone()).unwrap_or_default()
     }
     /// Mark whether the provider can currently report focus.
     pub fn set_live(&self, v: bool) {
@@ -70,6 +93,30 @@ pub fn snapshot() -> Option<FocusInfo> {
 /// trusted, so recording must be gated off (no silent fallback).
 pub fn is_live() -> bool {
     global().live()
+}
+
+/// All currently-open windows' `app_id`/`wm_class`, sourced from the active compositor focus
+/// provider — the SAME identity the gate matches against, so the wizard's app list agrees by
+/// construction (no `.desktop` heuristic). GNOME answers via the extension's `ListWindows`
+/// D-Bus method on demand; wlroots returns its locally-tracked toplevel set. Empty when no
+/// provider is live or the session isn't Wayland (X11 enumeration uses `/proc/comm` instead).
+/// Deduplicated and sorted; empties filtered.
+pub fn list_app_ids() -> Vec<String> {
+    if !is_wayland() {
+        return Vec::new();
+    }
+    ensure_started();
+    let mut ids = if is_gnome() {
+        gnome::list_app_ids()
+    } else if is_wlroots() {
+        global().windows()
+    } else {
+        Vec::new()
+    };
+    ids.retain(|s| !s.trim().is_empty());
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn env(n: &str) -> String {

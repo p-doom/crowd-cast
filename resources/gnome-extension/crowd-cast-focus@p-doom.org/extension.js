@@ -18,11 +18,16 @@ const IFACE = `
 <node>
   <interface name="org.crowdcast.FocusProvider">
     <method name="GetFocused">
+      <arg type="t" name="window_id" direction="out"/>
       <arg type="i" name="pid" direction="out"/>
       <arg type="s" name="wm_class" direction="out"/>
       <arg type="s" name="title" direction="out"/>
     </method>
+    <method name="ListWindows">
+      <arg type="a(tiss)" name="windows" direction="out"/>
+    </method>
     <signal name="FocusChanged">
+      <arg type="t" name="window_id"/>
       <arg type="i" name="pid"/>
       <arg type="s" name="wm_class"/>
       <arg type="s" name="title"/>
@@ -69,14 +74,18 @@ export default class CrowdCastFocusExtension extends Extension {
     _focused() {
         const w = global.display.focus_window;
         if (!w)
-            return [0, '', ''];
+            return [0, 0, '', ''];
+        // Mutter window stamp — the SAME id ListWindows reports and RecordWindow expects, so
+        // crowd-cast can pin/capture the exact focused window (not just the app).
+        let id = 0;
+        try { id = w.get_id() || 0; } catch (e) {}
         let pid = 0;
         try { pid = w.get_pid() || 0; } catch (e) {}
         let cls = '';
         try { cls = w.get_wm_class() || ''; } catch (e) {}
         let title = '';
         try { title = w.get_title() || ''; } catch (e) {}
-        return [pid, cls, title];
+        return [id, pid, cls, title];
     }
 
     // D-Bus method: current focused window (0/'' when no window is focused).
@@ -84,11 +93,43 @@ export default class CrowdCastFocusExtension extends Extension {
         return this._focused();
     }
 
+    // D-Bus method: enumerate all current toplevel windows as (window_id, pid, wm_class,
+    // title). window_id is the Mutter window stamp (Meta.Window.get_id()) — the same id
+    // org.gnome.Mutter.ScreenCast.RecordWindow expects. crowd-cast filters these by app
+    // identity (wm_class / pid->comm) to bind every window of a target app for capture,
+    // since an external client cannot enumerate windows itself (Shell.Introspect.GetWindows
+    // is access-denied). Read-only; never throws into the shell.
+    ListWindows() {
+        const out = [];
+        try {
+            for (const actor of global.get_window_actors()) {
+                let w = null;
+                try { w = actor.meta_window; } catch (e) {}
+                if (!w)
+                    continue;
+                let id = 0;
+                try { id = w.get_id() || 0; } catch (e) {}
+                if (!id)
+                    continue;
+                let pid = 0;
+                try { pid = w.get_pid() || 0; } catch (e) {}
+                let cls = '';
+                try { cls = w.get_wm_class() || ''; } catch (e) {}
+                let title = '';
+                try { title = w.get_title() || ''; } catch (e) {}
+                out.push([id, pid, cls, title]);
+            }
+        } catch (e) {
+            logError(e, 'crowd-cast-focus: ListWindows failed');
+        }
+        return out;
+    }
+
     _emit() {
         try {
-            const [pid, cls, title] = this._focused();
+            const [id, pid, cls, title] = this._focused();
             this._impl?.emit_signal(
-                'FocusChanged', new GLib.Variant('(iss)', [pid, cls, title]));
+                'FocusChanged', new GLib.Variant('(tiss)', [id, pid, cls, title]));
         } catch (e) {
             logError(e, 'crowd-cast-focus: emit failed');
         }

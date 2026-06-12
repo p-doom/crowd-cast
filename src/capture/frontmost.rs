@@ -160,12 +160,29 @@ fn get_frontmost_app_linux() -> Option<AppInfo> {
     // use the X11 path here — under XWayland it would only ever see XWayland windows.
     if is_wayland_session() {
         crate::capture::focus::ensure_started();
-        return crate::capture::focus::snapshot().map(|f| AppInfo {
-            // Identity key is the Wayland app_id (wlroots) / wm_class (GNOME). Match
-            // config.target_apps against this on Wayland.
-            bundle_id: f.app_id.clone(),
-            name: f.app_id,
-            pid: f.pid.unwrap_or(0),
+        // Canonical Wayland identity is the focus provider's `app_id` (wlroots) / `wm_class`
+        // (GNOME) — the SAME key the wizard stores in `target_apps` (resolved from each app's
+        // `.desktop` `StartupWMClass`/id; see `apps.rs::list_installed_apps_wayland`), and what
+        // `should_capture_app` compares against to gate input.
+        //
+        // We deliberately do NOT translate via the PID to `/proc/<pid>/comm`. `Meta.Window`
+        // `get_pid()` is unreliable (XWayland windows that omit `_NET_WM_PID` report no PID), and
+        // even when present, comm is a *different namespace* than the app_id the wizard stores —
+        // e.g. comm `evince` vs wm_class `org.gnome.Evince`, or `alacritty` vs `Alacritty`. Any
+        // such translation can silently disagree with `target_apps` and drop a focused target's
+        // capture, which is exactly the silent-incorrectness the no-fallback design law forbids.
+        // An empty app_id means the provider cannot identify the window → fail closed (`None`,
+        // treated as non-target), never guess.
+        return crate::capture::focus::snapshot().and_then(|f| {
+            let identity = f.app_id.trim().to_string();
+            if identity.is_empty() {
+                return None;
+            }
+            Some(AppInfo {
+                bundle_id: identity.clone(),
+                name: identity,
+                pid: f.pid.unwrap_or(0),
+            })
         });
     }
 

@@ -69,6 +69,25 @@ else echo "::: GLib already built (skip)"; fi
 echo "::: OBS Studio $OBS_TAG"
 [ -d "$SRC/obs-studio" ] || git clone --recursive --depth 1 -b "$OBS_TAG" https://github.com/obsproject/obs-studio.git "$SRC/obs-studio"
 cd "$SRC/obs-studio"
+
+# crowd-cast: patch obs-pipewire so the screencast sources can bind an already-existing
+# PipeWire node directly (settings key "ConnectNode" > 0) and skip the xdg-desktop-portal
+# session + window/screen picker. The node is produced out-of-band (e.g. by
+# org.gnome.Mutter.ScreenCast RecordWindow) for picker-free, define-once per-app capture.
+# Idempotent across cached re-runs, and FAIL-CLOSED if the patch no longer applies (e.g. an
+# OBS_TAG bump) rather than silently shipping an unpatched plugin.
+PW_PATCH=/patches/obs-pipewire-connect-node.patch
+# Restore the patched files to pristine first, so an UPDATED patch (e.g. follow-focus
+# in-place re-point) re-applies cleanly on a cached source tree that still has the previous
+# revision of the patch applied. Without this, `git apply --reverse --check` matches neither
+# the old nor the new patch and the build would fail-closed (exit 4) on every patch edit.
+git checkout -- plugins/linux-pipewire/pipewire.c plugins/linux-pipewire/screencast-portal.c 2>/dev/null || true
+if git apply --check "$PW_PATCH" 2>/dev/null; then
+  git apply "$PW_PATCH" && echo "::: applied obs-pipewire ConnectNode patch"
+else
+  echo "FATAL: obs-pipewire ConnectNode patch does not apply to OBS $OBS_TAG (packaging/linux/patches/)"; exit 4
+fi
+
 # OBS 32 builds a fixed Linux plugin set with no per-plugin ENABLE flags; the defaults pull
 # hard deps we don't want (v4l2, qsv11/libvpl, nvenc, webrtc/libdatachannel, outputs/mbedtls,
 # vst, aja, decklink, browser/CEF, websocket). Overwrite the plugin list with our minimal set.

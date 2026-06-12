@@ -166,6 +166,16 @@ fn recording_state_path() -> Option<PathBuf> {
         .map(|p| p.data_dir().join("recording_state"))
 }
 
+/// Whether this is a Wayland session (vs X11). Used to runtime-gate Wayland-portal-specific
+/// logic on Linux, since one binary serves both session types.
+#[cfg(target_os = "linux")]
+fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|s| s.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+}
+
 fn read_recording_state() -> Option<PersistedRecordingState> {
     let path = recording_state_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
@@ -467,6 +477,28 @@ pub struct SyncEngine {
     any_source_ever_ready: bool,
     /// Whether we've already shown the "restart your Mac" alert this session
     restart_alert_shown: bool,
+    /// Linux: set when a previously-ready capture source dies mid-recording (e.g. the user
+    /// closes the portal ScreenCast session via the system "stop sharing" control). While
+    /// set, recording is stopped and start is refused until setup is re-run (the portal
+    /// session must be re-established).
+    #[cfg(target_os = "linux")]
+    capture_lost: bool,
+    /// Linux: when the active source first started reporting "not ready" mid-recording,
+    /// used to debounce transient blips before declaring the capture lost.
+    #[cfg(target_os = "linux")]
+    capture_loss_since: Option<Instant>,
+    /// Linux: whether the *current* capture source has reported ready at least once. Lets
+    /// the loss check distinguish a fresh source's startup `(0,0)` (warmup, ignore) from a
+    /// previously-live source going `(0,0)` (a real portal teardown). Reset when capture is
+    /// (re)established or invalidated.
+    #[cfg(target_os = "linux")]
+    capture_was_ready: bool,
+    /// Linux: the single-active capture target the liveness check last observed. A change
+    /// means a focus-driven scene switch occurred — the freshly-shown source resumes from
+    /// pause and reports `(0,0)` briefly, which is not a teardown — so readiness tracking is
+    /// reset on change to grant the new source the same warm-up grace a startup source gets.
+    #[cfg(target_os = "linux")]
+    last_alive_target: Option<String>,
     /// Native display resolution (logical points) — updated on display change
     display_resolution: (u32, u32),
 }
@@ -563,6 +595,14 @@ unintended app video."
             buffered_non_context_event_count: 0,
             any_source_ever_ready: false,
             restart_alert_shown: false,
+            #[cfg(target_os = "linux")]
+            capture_lost: false,
+            #[cfg(target_os = "linux")]
+            capture_loss_since: None,
+            #[cfg(target_os = "linux")]
+            capture_was_ready: false,
+            #[cfg(target_os = "linux")]
+            last_alive_target: None,
             display_resolution,
         })
     }
@@ -576,6 +616,11 @@ unintended app video."
     }
 
     fn send_status_internal(&mut self, status: EngineStatus, force: bool) {
+        // Always log error statuses in full: the tray truncates the message, so this is the
+        // only place the complete text is recoverable.
+        if let EngineStatus::Error(msg) = &status {
+            error!("engine error status: {}", msg);
+        }
         let status_kind = StatusKind::from_status(&status);
         let now = Instant::now();
 
@@ -1022,6 +1067,12 @@ unintended app video."
             self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
 
         if self.single_active_app_capture && self.current_session.is_some() {
+            // GNOME Wayland follow-focus: re-point the focused target app's capture to the
+            // window the user is actually on (a within-app window switch, a window created
+            // after capture started, or an app launched after startup) before any scene
+            // switch. No-op off GNOME dynamic capture.
+            #[cfg(target_os = "linux")]
+            self.gnome_follow_focus(frontmost_app.as_deref(), should_capture);
             self.schedule_app_switch(desired_target.clone());
             self.apply_due_app_switch().await;
             self.rearm_capture_recovery_if_needed(should_capture, desired_target.as_deref());
@@ -1122,6 +1173,35 @@ unintended app video."
         (bundle_id, should_capture)
     }
 
+    /// GNOME Wayland follow-focus: keep the focused target app's capture bound to the window
+    /// the user actually has focused. Reads the focus snapshot (focused window title/pid) and
+    /// asks the capture context to create-or-re-point the app's node source accordingly. A
+    /// no-op unless GNOME dynamic capture is active and a *target* app is frontmost. Idempotent
+    /// and cheap (an unchanged focus short-circuits before any D-Bus call), so it's safe to
+    /// call every poll tick — that's what makes within-app window switches follow focus.
+    #[cfg(target_os = "linux")]
+    fn gnome_follow_focus(&mut self, frontmost: Option<&str>, should_capture: bool) {
+        if !should_capture || !self.capture_ctx.is_gnome_dynamic() {
+            return;
+        }
+        let Some(bundle) = frontmost else { return };
+        let Some(focus) = crate::capture::focus::snapshot() else { return };
+        // The frontmost target and the focus snapshot are both derived from the focus provider;
+        // guard against a transient mismatch so we never bind one app to another's window.
+        if !focus.app_id.eq_ignore_ascii_case(bundle) {
+            return;
+        }
+        // The focus provider gives the exact focused window-id; without it we can't bind (e.g.
+        // no window focused, or the focus extension predates window-id reporting) — skip.
+        let Some(window_id) = focus.window_id else { return };
+        if let Err(e) = self
+            .capture_ctx
+            .gnome_ensure_focused_window(bundle, window_id)
+        {
+            debug!("GNOME follow-focus bind for '{}' failed: {}", bundle, e);
+        }
+    }
+
     async fn apply_pending_app_switch(&mut self) {
         let Some(pending) = self.pending_app_switch.take() else {
             return;
@@ -1142,12 +1222,19 @@ unintended app video."
 
         let target_app = desired_target;
 
+        // GNOME Wayland follow-focus: bind/re-point the target app's capture to its focused
+        // window before activating it, so a freshly-focused (or just-launched) target app gets
+        // its scene lazily instead of via the process restart below.
+        #[cfg(target_os = "linux")]
+        self.gnome_follow_focus(frontmost_app.as_deref(), should_capture);
+
         // SCK sources only work when created before the OBS context's first
         // recording. If a tracked app wasn't running at startup, it has no
         // scene. The only reliable fix is to restart the process so all
-        // currently-running apps get scenes in a fresh OBS context.
+        // currently-running apps get scenes in a fresh OBS context. GNOME dynamic capture
+        // binds late-appearing apps lazily (see gnome_follow_focus), so it never restarts.
         if let Some(app) = target_app.as_deref() {
-            if self.capture_ctx.needs_scene_for_app(app) {
+            if self.capture_ctx.needs_scene_for_app(app) && !self.capture_ctx.is_gnome_dynamic() {
                 info!(
                     "App '{}' wasn't running at startup — restarting to create its capture source",
                     app
@@ -1326,6 +1413,20 @@ unintended app video."
     /// Emit a metadata event with the current display resolution.
     /// Called once at the start of each segment (before the first context event).
     fn emit_metadata_event(&mut self, timestamp_us: u64) {
+        // For full-screen display capture, the recorded resolution must be the *captured*
+        // monitor — on Wayland the portal lets the user pick which output, and only the live
+        // capture source knows that choice (a display probe like `get_main_display_resolution`
+        // can't tell which monitor was selected, and would report e.g. the largest output).
+        // Read it straight from the captured source, which carries the negotiated stream size.
+        // No-op on X11 full-screen / macOS (source dims already equal the probe). Per-app
+        // capture keeps `display_resolution` for now (pending the per-window framing follow-up).
+        if self.config.capture.target_apps.is_empty() {
+            if let Ok(Some((w, h))) = self.capture_ctx.active_source_dimensions() {
+                if w > 0 && h > 0 {
+                    self.display_resolution = (w, h);
+                }
+            }
+        }
         let (dw, dh) = self.display_resolution;
         let (ow, oh) = crate::capture::calculate_output_dimensions(dw, dh, 1080);
         let utc_now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -1819,10 +1920,83 @@ unintended app video."
                                 capture_all, target_apps
                             );
                             // Config is already persisted to disk by the tray before sending
-                            // this command. Restart to get a fresh OBS context — SCK sources
-                            // only work reliably when created before the first recording.
+                            // this command.
+                            //
+                            // Capture whether recording was active BEFORE stopping, so the
+                            // in-place Linux reload below can resume it. (The restart path
+                            // resumes via the persisted recording state, which this transient
+                            // stop does not overwrite — see write_recording_state call sites.)
+                            #[cfg(target_os = "linux")]
+                            let was_recording = self.current_session.is_some();
+
                             self.stop_recording().await.ok();
+
+                            // macOS/Windows: restart for a fresh OBS context. On macOS,
+                            // ScreenCaptureKit sources only work reliably when created before
+                            // the context's first recording, so a fresh process is the only
+                            // dependable way to switch capture targets.
+                            #[cfg(not(target_os = "linux"))]
                             restart_process();
+
+                            // Linux: reload capture sources in the LIVE OBS context instead of
+                            // restarting. restart_process() exec()s the process, which tears
+                            // down the StatusNotifierItem tray with no clean SNI handoff — and
+                            // the host typically won't re-render the re-registered item — so the
+                            // tray icon vanishes on every settings change. OBS can swap
+                            // scenes/sources within the running context, so an in-place re-setup
+                            // suffices here and keeps the tray alive.
+                            #[cfg(target_os = "linux")]
+                            {
+                                self.config.capture.target_apps = target_apps;
+                                self.config.capture.capture_all = capture_all;
+                                self.capture_ctx.set_single_active_app_capture(
+                                    self.config.capture.single_active_app_capture,
+                                );
+
+                                // setup_capture is called WITHOUT obs_call_with_watchdog: on
+                                // Wayland it drives the xdg-desktop-portal picker, which blocks
+                                // on user interaction far past the 5s watchdog (whose timeout
+                                // would restart_process() and defeat this fix). block_in_place
+                                // keeps the async runtime healthy while it blocks. Mirrors the
+                                // startup path in main.rs.
+                                let reload = {
+                                    let target_apps = self.config.capture.target_apps.clone();
+                                    let restore_tokens =
+                                        self.config.capture.restore_tokens.clone();
+                                    let ctx = &mut self.capture_ctx;
+                                    tokio::task::block_in_place(|| {
+                                        ctx.setup_capture(&target_apps, &restore_tokens)
+                                    })
+                                };
+
+                                match reload {
+                                    Ok(()) => {
+                                        // A freshly (re)created source must warm up again before
+                                        // the capture-loss watchdog can declare it dead (Wayland
+                                        // reports 0x0 until the portal negotiates).
+                                        self.capture_lost = false;
+                                        self.capture_loss_since = None;
+                                        self.capture_was_ready = false;
+                                        self.refresh_capture_enabled_from_frontmost();
+                                        if was_recording {
+                                            if let Err(e) = self.start_recording().await {
+                                                error!(
+                                                    "Failed to resume recording after capture reload: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                        info!("Capture reloaded in place (no process restart)");
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to reload capture sources: {}", e);
+                                        self.send_status_force(EngineStatus::Error(format!(
+                                            "Failed to reload capture: {}",
+                                            e
+                                        )));
+                                    }
+                                }
+                            }
                         }
                         EngineCommand::PauseUploads => {
                             info!("Uploads paused");
@@ -1916,6 +2090,8 @@ unintended app video."
                     self.check_display_changes().await;
                     self.graduate_upload_buffer();
                     self.check_capture_health();
+                    #[cfg(target_os = "linux")]
+                    self.check_capture_alive().await;
                 }
 
                 // Apply a queued app-driven capture source switch
@@ -2191,6 +2367,20 @@ unintended app video."
             return Ok(());
         }
 
+        // Linux: refuse to (re)start once the capture session was closed externally — the
+        // portal ScreenCast session is gone and must be re-established via setup. Fail
+        // closed rather than start into a dead stream.
+        #[cfg(target_os = "linux")]
+        if self.capture_lost {
+            let message = "Recording not started: the screen-capture session was closed. \
+                Re-run setup (crowd-cast --setup) to choose what to capture again."
+                .to_string();
+            warn!("{}", message);
+            self.send_status_force(EngineStatus::Error(message.clone()));
+            crate::ui::notify_linux::notify("crowd-cast: cannot record", &message).await;
+            return Err(anyhow::anyhow!("{}", message));
+        }
+
         let missing = describe_missing_permissions();
         if !missing.is_empty() {
             let details = missing.join(" ");
@@ -2406,7 +2596,14 @@ unintended app video."
 
         self.send_status_force(EngineStatus::Idle);
 
-        if self.config.recording.notify_on_start_stop && notifications_authorized() {
+        // A Linux portal-session death stops recording with `capture_lost` set, and the
+        // dead-source handler (`check_capture_alive`) emits its own, more actionable toast in
+        // that case — so skip the generic one here to avoid a double notification.
+        // (`capture_lost` is only ever set on Linux, so this is a no-op on macOS.)
+        if self.config.recording.notify_on_start_stop
+            && notifications_authorized()
+            && !self.capture_lost
+        {
             show_recording_stopped_notification();
         }
 
@@ -2589,6 +2786,104 @@ unintended app video."
         }
     }
 
+    /// Linux: detect a capture source dying *mid-recording* (it was healthy, then stopped
+    /// producing frames) — e.g. the user closes the portal ScreenCast session via the
+    /// system "stop sharing" control, or the portal/PipeWire stream is torn down. Unlike
+    /// `check_capture_health` (which only catches "never became ready" at startup), this
+    /// catches loss after the source had been ready. On confirmed loss it stops recording,
+    /// flags `capture_lost` (so a restart is refused until setup re-establishes the portal
+    /// session), and notifies the user. macOS has its own source-recovery path, so this is
+    /// Linux-only.
+    #[cfg(target_os = "linux")]
+    async fn check_capture_alive(&mut self) {
+        // Short debounce: long enough to ride out a single transient blip, short enough to
+        // catch a portal teardown before the user can react and click again. (The old 3s
+        // grace lost that race during rapid use, so `capture_lost` was often never set.)
+        const CAPTURE_LOSS_DEBOUNCE: Duration = Duration::from_millis(300);
+
+        // Wayland-only: detects xdg-desktop-portal ScreenCast teardown (the system "stop
+        // sharing" control). X11 XSHM/XComposite has no such session, so it's a no-op.
+        // (Compile-time cfg(linux) + this runtime guard == Wayland.)
+        if !is_wayland_session() || self.capture_lost {
+            return;
+        }
+
+        // Only while actively recording. Outside recording a source may legitimately report
+        // 0x0 (e.g. the stream idles), which would false-trigger; and the short debounce
+        // already wins the race against rapid clicking, so watching the idle state isn't
+        // needed. `capture_was_ready` resets here so each recording re-derives it.
+        if self.current_session.is_none() || self.is_paused {
+            self.capture_loss_since = None;
+            self.capture_was_ready = false;
+            self.last_alive_target = None;
+            return;
+        }
+
+        // Single-active (scene-per-app) capture changes the active source on every focus
+        // switch, and neither kind of switch is a teardown:
+        //   * focusing an untracked app shows the blank scene (no active source) by design
+        //     (`blank_video_on_untracked_app`) — recording legitimately continues blank;
+        //   * focusing another tracked app shows a source that resumes from pause and reports
+        //     `(0,0)` for a moment.
+        // So skip the blank case entirely, and when the target changes reset readiness so the
+        // freshly-shown source gets the same warm-up grace a startup source gets. A genuine
+        // teardown of the *currently active, already-ready* app's source is still caught below
+        // (its target is unchanged, `capture_was_ready` is true, and it goes `(0,0)`).
+        if self.single_active_app_capture {
+            let active_target = self.capture_ctx.active_capture_app().map(|s| s.to_string());
+            if active_target.is_none() {
+                self.capture_loss_since = None;
+                self.capture_was_ready = false;
+                self.last_alive_target = None;
+                return;
+            }
+            if active_target != self.last_alive_target {
+                self.last_alive_target = active_target;
+                self.capture_loss_since = None;
+                self.capture_was_ready = false;
+                return;
+            }
+        }
+
+        // Assume alive on a query error (never false-stop on a transient query failure).
+        let ready = self.capture_ctx.active_source_is_ready().unwrap_or(true);
+        if ready {
+            self.capture_was_ready = true;
+            self.capture_loss_since = None;
+            return;
+        }
+        // Not ready, but only a *loss* if this source had become ready — otherwise it's a
+        // fresh source still warming up (Wayland sources report 0x0 until the portal
+        // negotiates), which must not be misread as a teardown.
+        if !self.capture_was_ready {
+            return;
+        }
+        let since = *self.capture_loss_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < CAPTURE_LOSS_DEBOUNCE {
+            return;
+        }
+
+        // Confirmed: a previously-live capture source is now dead (portal session closed).
+        warn!("Capture source died (screen-share session closed) — stopping and invalidating");
+        self.capture_lost = true;
+        self.capture_loss_since = None;
+        self.capture_was_ready = false;
+        self.stop_recording().await.ok();
+        write_recording_state(PersistedRecordingState::Stopped);
+        self.send_status_force(EngineStatus::Error(
+            "Screen capture was stopped — recording ended.".to_string(),
+        ));
+        // Invalidate the dead source so it can never be silently reused; the next start must
+        // re-establish it (and is refused by the `capture_lost` gate until setup is re-run).
+        self.capture_ctx.teardown_capture();
+        crate::ui::notify_linux::notify(
+            "crowd-cast: recording stopped",
+            "The screen capture session was closed, so recording has ended. Re-run setup \
+             (crowd-cast --setup) to choose what to capture again.",
+        )
+        .await;
+    }
+
     /// Reinitialize capture after a display change (in-place, no process restart).
     ///
     /// Uses in-place source recreation to avoid SIGSEGV crashes that occur when
@@ -2737,6 +3032,12 @@ unintended app video."
         let desired_target =
             self.desired_video_target_for_frontmost(frontmost_app.as_deref(), should_capture);
         if self.single_active_app_capture && self.current_session.is_some() {
+            // GNOME Wayland follow-focus: re-point the focused target app's capture to the
+            // window the user is actually on (a within-app window switch, a window created
+            // after capture started, or an app launched after startup) before any scene
+            // switch. No-op off GNOME dynamic capture.
+            #[cfg(target_os = "linux")]
+            self.gnome_follow_focus(frontmost_app.as_deref(), should_capture);
             self.schedule_app_switch(desired_target.clone());
             self.apply_due_app_switch().await;
             self.rearm_capture_recovery_if_needed(should_capture, desired_target.as_deref());

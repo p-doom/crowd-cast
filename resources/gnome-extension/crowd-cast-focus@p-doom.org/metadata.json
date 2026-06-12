@@ -2,6 +2,6 @@
   "uuid": "crowd-cast-focus@p-doom.org",
   "name": "crowd-cast focus provider",
   "description": "Exposes the focused window's PID, wm_class and title over a private D-Bus name for crowd-cast's follow-focus input gating. Read-only: it reports the focused window and nothing else, performs no actions on windows, opens no network connections, and adds no UI. Installed and removed by crowd-cast.",
-  "shell-version": ["45", "46", "47", "48"],
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
   "url": "https://github.com/crowd-cast/crowd-cast"
 }

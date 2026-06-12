@@ -12,6 +12,7 @@ CACHE="$HERE/.cache"; OUT="$HERE/out"; mkdir -p "$CACHE" "$OUT"
 "$ENGINE" run --rm \
   -v "$CACHE:/build:z" \
   -v "$HERE/build-bundle.sh:/build-bundle.sh:ro,z" \
+  -v "$HERE/patches:/patches:ro,z" \
   -v "$OUT:/out:z" \
   -e OBS_TAG="${OBS_TAG:-32.0.2}" -e JOBS="${JOBS:-$(nproc)}" \
   "$IMG" /build-bundle.sh

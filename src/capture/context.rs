@@ -37,6 +37,13 @@ use super::frontmost::get_frontmost_app;
 use super::recording::{calculate_output_dimensions, RecordingConfig, RecordingOutput};
 use super::sources::{get_main_display_resolution, get_main_display_uuid, ScreenCaptureSource};
 use super::CaptureState;
+
+/// Wayland-only: how long to wait for one per-app PipeWire source to start streaming
+/// (its xdg-desktop-portal session to settle) before creating the next. Per-app sources
+/// are created one at a time because concurrent portal sessions abort the OBS pipewire
+/// plugin; this bounds the wait so a dismissed picker can't hang setup forever.
+#[cfg(target_os = "linux")]
+const PORTAL_SERIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 // Only used by the macOS/Windows bootstrap path below.
 #[cfg(not(target_os = "linux"))]
 use crate::ui::{is_running_in_app_bundle, show_obs_download_started_notification};
@@ -65,6 +72,17 @@ pub struct CaptureContext {
     app_scenes: HashMap<String, (ObsSceneRef, ScreenCaptureSource)>,
     /// Empty scene activated when no tracked app is frontmost
     blank_scene: Option<ObsSceneRef>,
+    /// GNOME Wayland: owns the Mutter ScreenCast sessions that back the per-app PipeWire
+    /// nodes (picker-free capture). Must outlive `app_scenes` — dropping it closes the
+    /// sessions and kills the nodes. `None` off GNOME Wayland (portal / XComposite paths).
+    #[cfg(target_os = "linux")]
+    gnome_screencast: Option<super::gnome_screencast::GnomeScreenCast>,
+    /// GNOME Wayland follow-focus: which Mutter window-id each app's scene is currently bound
+    /// to (bundle_id → window-id). The node source is re-pointed at the focused window as
+    /// focus moves between an app's windows; this tracks the live binding so we only re-point
+    /// on an actual change. Empty off GNOME Wayland.
+    #[cfg(target_os = "linux")]
+    gnome_bound_window: HashMap<String, u64>,
     /// Recording output
     recording: Option<RecordingOutput>,
     /// Current recording session info
@@ -153,6 +171,10 @@ impl CaptureContext {
             capture_sources: Vec::new(),
             app_scenes: HashMap::new(),
             blank_scene: None,
+            #[cfg(target_os = "linux")]
+            gnome_screencast: None,
+            #[cfg(target_os = "linux")]
+            gnome_bound_window: HashMap::new(),
             recording: None,
             current_session: None,
             state: Arc::new(RwLock::new(CaptureState::default())),
@@ -341,6 +363,13 @@ impl CaptureContext {
         // leaks when switching between single-active and display/multi modes.
         self.app_scenes.clear();
         self.blank_scene = None;
+        // Drop any prior Mutter ScreenCast manager (closes its sessions / frees the old
+        // nodes) before we rebuild.
+        #[cfg(target_os = "linux")]
+        {
+            self.gnome_screencast = None;
+            self.gnome_bound_window.clear();
+        }
         self.capture_sources.clear();
         self.scene = None;
 
@@ -352,10 +381,26 @@ impl CaptureContext {
         }
         self.blank_scene = Some(blank_scene);
 
+        // GNOME Wayland: bring up the Mutter ScreenCast manager that produces picker-free
+        // PipeWire nodes per target app. Held in `self` so its sessions (hence the nodes
+        // backing the sources) outlive the scenes. If it can't start, leave it unset and the
+        // loop falls back to the portal path.
+        #[cfg(target_os = "linux")]
+        if crate::capture::is_gnome_wayland() {
+            match super::gnome_screencast::GnomeScreenCast::new() {
+                Ok(g) => {
+                    info!("GNOME Wayland: using Mutter ScreenCast (picker-free) for per-app capture");
+                    self.gnome_screencast = Some(g);
+                }
+                Err(e) => warn!("GNOME ScreenCast manager init failed: {e}; using portal path"),
+            }
+        }
+
         let display_uuid = get_main_display_uuid()
             .context("Failed to get main display UUID for application capture")?;
         let capture_audio = self.recording_config.enable_audio;
         let target_apps = self.target_apps.clone();
+        let restore_tokens = self.restore_tokens.clone();
 
         let context = self
             .context
@@ -410,10 +455,43 @@ impl CaptureContext {
                 continue;
             }
 
+            // GNOME Wayland (Mutter ScreenCast): per-app scenes are created lazily on first
+            // focus, and the node source is re-pointed to the *focused* window as focus moves
+            // between an app's windows (see `gnome_ensure_focused_window`). We deliberately
+            // create nothing at setup: the app generally isn't focused yet, so there is no
+            // "focused window" to bind — picking one here is exactly the multi-window bug. The
+            // app blanks until focused, then binds its focused window (and tracks it after).
+            // This also means a target app launched *after* setup needs no process restart:
+            // it has no scene, and gets one lazily the moment it's focused.
+            #[cfg(target_os = "linux")]
+            if self.gnome_screencast.is_some() {
+                continue;
+            }
+
             let scene_name = Self::build_scene_name(&format!("scene_{}", bundle_id));
             let mut scene = context
                 .scene(scene_name.as_str())
                 .context("Failed to create scene")?;
+
+            // Wayland: the portal "Select a window" dialog is about to pop (on create) and it
+            // can't be labeled by app, so cue the user which app to pick. Only when a picker
+            // is actually expected — i.e. no saved restore token for this app (a valid token
+            // restores silently). Synchronous + best-effort so the cue lands before the dialog.
+            #[cfg(target_os = "linux")]
+            if super::sources::is_wayland_session()
+                && restore_tokens
+                    .get(bundle_id)
+                    .map(|t| t.is_empty())
+                    .unwrap_or(true)
+            {
+                crate::ui::notify_linux::notify_blocking(
+                    "crowd-cast — choose a window",
+                    &format!(
+                        "Pick the window for “{bundle_id}” in the dialog that appears next."
+                    ),
+                );
+                info!("Prompting portal window pick for '{}'", bundle_id);
+            }
 
             let source_name = format!("app_capture_{}", bundle_id);
             match ScreenCaptureSource::new_application_capture(
@@ -423,11 +501,32 @@ impl CaptureContext {
                 bundle_id,
                 &display_uuid,
                 capture_audio,
-                None,
+                restore_tokens.get(bundle_id).map(|s| s.as_str()),
             ) {
                 Ok(source) => {
-                    if initial_active_app == Some(bundle_id.as_str()) {
+                    // Wayland: each per-app source runs its own xdg-desktop-portal handshake
+                    // at create time; negotiating two concurrently aborts the OBS pipewire
+                    // plugin. Serialize by making this scene the program scene (so the
+                    // source's `.show` fires and frames flow) and blocking until it streams
+                    // before creating the next app's source. Later focus switches only
+                    // `.hide`/`.show` (pause/resume) — the portal session stays alive — so
+                    // this one-time prompt cost is paid here, once, at setup. No-op on
+                    // X11/macOS (no portal handshake; `wait_until_capturing` returns true).
+                    #[cfg(target_os = "linux")]
+                    if super::sources::is_wayland_session() {
                         Self::activate_scene(&mut scene)?;
+                        if !source.wait_until_capturing(PORTAL_SERIALIZE_TIMEOUT) {
+                            warn!(
+                                "Per-app capture for '{}' didn't start streaming within {:?} \
+                                 (portal picker dismissed?). Skipping the remaining target \
+                                 apps to avoid a concurrent portal-session crash; re-open \
+                                 Settings to try again.",
+                                bundle_id, PORTAL_SERIALIZE_TIMEOUT
+                            );
+                            break;
+                        }
+                    }
+                    if initial_active_app == Some(bundle_id.as_str()) {
                         self.active_capture_app = Some(bundle_id.clone());
                     }
                     info!("Created app scene for '{}'", bundle_id);
@@ -438,6 +537,26 @@ impl CaptureContext {
                         "Failed to create capture source for '{}': {}. Skipping.",
                         bundle_id, e
                     );
+                }
+            }
+        }
+
+        // Assert the intended program scene. On Wayland we activated each scene transiently
+        // above to serialize portal handshakes, so the last-created scene is currently live;
+        // set the correct one now. On macOS/X11 this asserts the initial active app's scene
+        // (or the blank scene) that the loop no longer activates inline.
+        match self.active_capture_app.clone() {
+            Some(app) => {
+                if let Some((scene, _)) = self.app_scenes.get_mut(app.as_str()) {
+                    Self::activate_scene(scene)?;
+                } else if let Some(blank) = self.blank_scene.as_mut() {
+                    Self::activate_scene(blank)?;
+                    self.active_capture_app = None;
+                }
+            }
+            None => {
+                if let Some(blank) = self.blank_scene.as_mut() {
+                    Self::activate_scene(blank)?;
                 }
             }
         }
@@ -463,6 +582,11 @@ impl CaptureContext {
         self.scene = None;
         self.app_scenes.clear();
         self.blank_scene = None;
+        // Leaving per-app mode: drop the Mutter ScreenCast manager (closes its sessions).
+        #[cfg(target_os = "linux")]
+        {
+            self.gnome_screencast = None;
+        }
 
         let scene_name = Self::build_scene_name("main_scene");
         let mut scene = self.create_scene(&scene_name)?;
@@ -504,6 +628,32 @@ impl CaptureContext {
                     Ok(source) => {
                         debug!("Created capture source '{}' for '{}'", source_name, bundle_id);
                         capture_sources.push(source);
+
+                        // Wayland: each per-app source opens its own xdg-desktop-portal
+                        // ScreenCast session. Negotiating two at once aborts the OBS
+                        // pipewire plugin (free(): invalid pointer), so create them one at
+                        // a time — activate the scene so the just-added source starts its
+                        // portal handshake alone, then block until it's actually streaming
+                        // before moving to the next app. (Returns immediately on X11, which
+                        // has no portal handshake.) Only needed between sources: the last
+                        // app has no successor to race with, so don't block on it here — the
+                        // post-loop activate_scene brings it up.
+                        #[cfg(target_os = "linux")]
+                        if super::sources::is_wayland_session() && i + 1 < target_apps.len() {
+                            Self::activate_scene(&mut scene)?;
+                            let just_added =
+                                capture_sources.last().expect("source pushed above");
+                            if !just_added.wait_until_capturing(PORTAL_SERIALIZE_TIMEOUT) {
+                                warn!(
+                                    "Per-app capture for '{}' didn't start streaming within \
+                                     {:?} (portal picker dismissed?). Skipping the remaining \
+                                     target apps to avoid a concurrent portal-session crash; \
+                                     re-open Settings to try again.",
+                                    bundle_id, PORTAL_SERIALIZE_TIMEOUT
+                                );
+                                break;
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(
@@ -897,6 +1047,99 @@ impl CaptureContext {
             && !self.app_scenes.contains_key(bundle_id)
     }
 
+    /// True on a GNOME-Wayland session driving picker-free per-window capture via Mutter
+    /// ScreenCast. In this mode capture follows the *focused window* dynamically (scenes are
+    /// created lazily and the node source is re-pointed on focus changes), so the engine must
+    /// NOT process-restart for an app that appears after startup — it binds lazily instead.
+    /// Always false off Linux, so macOS/Windows behaviour is unchanged.
+    pub fn is_gnome_dynamic(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.gnome_screencast.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// GNOME Wayland follow-focus: ensure the capture for `bundle_id` is bound to the exact
+    /// window the user currently has focused (`window_id`, the Mutter id reported by the focus
+    /// extension). Creates the app's scene+source on first focus (lazy) and re-points the node
+    /// source to the focused window as focus moves between the app's windows (and to brand-new
+    /// windows). The re-point is **in place**: a fresh Mutter session/node is brought up, the
+    /// existing source's `ConnectNode` is updated (`obs_source_update` → patched obs-pipewire
+    /// reconnects the stream, no source/scene-item churn), then the old Mutter session is
+    /// stopped (make-before-break). Idempotent: a no-op (returns `Ok(false)`) when already bound
+    /// to `window_id` or when not in GNOME dynamic mode. Returns `Ok(true)` when it created or
+    /// re-pointed a source.
+    #[cfg(target_os = "linux")]
+    pub fn gnome_ensure_focused_window(&mut self, bundle_id: &str, window_id: u64) -> Result<bool> {
+        if self.gnome_screencast.is_none() {
+            return Ok(false);
+        }
+        let prev_window = self.gnome_bound_window.get(bundle_id).copied();
+        if prev_window == Some(window_id) {
+            return Ok(false); // already showing the focused window
+        }
+
+        // Fresh Mutter node for the focused window, brought up before the old session is
+        // stopped (make-before-break — the old node stays alive until the re-point lands).
+        let node = self
+            .gnome_screencast
+            .as_ref()
+            .unwrap()
+            .record_window(window_id)
+            .map_err(|e| anyhow::anyhow!("Mutter RecordWindow(id={window_id}) for '{bundle_id}': {e}"))?;
+
+        if self.app_scenes.contains_key(bundle_id) {
+            // Re-point IN PLACE: update the existing source's ConnectNode. The patched
+            // obs-pipewire reconnects the stream to the new node without recreating the source
+            // or its scene item (preserves z-order/transform; matches the update-in-place
+            // convention used on macOS/X11).
+            let (_, source) = self.app_scenes.get_mut(bundle_id).expect("app scene present");
+            source.update_connect_node(node)?;
+            if let Some(old_window) = prev_window {
+                self.gnome_screencast.as_ref().unwrap().stop_window(old_window);
+            }
+            info!(
+                "GNOME follow-focus: re-pointed '{}' to window {} (node {})",
+                bundle_id, window_id, node
+            );
+        } else {
+            // Lazy create: a fresh scene with the focused window's node source.
+            let scene_name = Self::build_scene_name(&format!("scene_{}", bundle_id));
+            let mut scene = self.create_scene(&scene_name)?;
+            let context = self
+                .context
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
+            let source_name = format!("app_capture_{}", bundle_id);
+            let source = ScreenCaptureSource::new_window_node_capture(
+                context,
+                &mut scene,
+                &source_name,
+                bundle_id,
+                node,
+            )?;
+            // If this app is already the active capture target (e.g. a start-path switch put
+            // it active while it had no scene), activate the freshly-created scene now so it
+            // doesn't stay blank — the app-switch machinery would short-circuit otherwise.
+            if self.active_capture_app.as_deref() == Some(bundle_id) {
+                Self::activate_scene(&mut scene)?;
+            }
+            self.app_scenes.insert(bundle_id.to_string(), (scene, source));
+            info!(
+                "GNOME follow-focus: created scene for '{}' bound to focused window {} (node {})",
+                bundle_id, window_id, node
+            );
+        }
+
+        self.gnome_bound_window.insert(bundle_id.to_string(), window_id);
+        self.update_capture_state_flags();
+        Ok(true)
+    }
+
     /// Switch to a different app's pre-created scene.
     /// Instant — just activates the target scene on channel 0.
     pub fn switch_active_app_capture(&mut self, active_app: Option<&str>) -> Result<bool> {
@@ -1073,6 +1316,24 @@ impl CaptureContext {
         }
     }
 
+    /// Tear down all capture scenes/sources so `is_capture_setup()` becomes false. Used on
+    /// Linux when a capture source dies (e.g. the xdg-desktop-portal ScreenCast session is
+    /// closed): the dead source must not be silently reused, so the next `setup_capture()`
+    /// re-establishes it (new portal session / picker). Does not touch the OBS context.
+    pub fn teardown_capture(&mut self) {
+        self.capture_sources.clear();
+        self.app_scenes.clear();
+        self.scene = None;
+        self.blank_scene = None;
+        // Closes the Mutter ScreenCast sessions backing any picker-free per-app nodes.
+        #[cfg(target_os = "linux")]
+        {
+            self.gnome_screencast = None;
+        }
+        self.active_capture_app = None;
+        self.update_capture_state_flags();
+    }
+
     /// Get the number of active capture sources
     pub fn capture_source_count(&self) -> usize {
         self.capture_sources.len()
@@ -1090,6 +1351,18 @@ impl CaptureContext {
     pub fn collect_restore_tokens(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for source in &self.capture_sources {
+            if let Some(app) = source.app_id() {
+                if let Some(token) = source.restore_token() {
+                    if !token.is_empty() {
+                        out.insert(app.to_string(), token);
+                    }
+                }
+            }
+        }
+        // Single-active (scene-per-app) mode keeps its sources in `app_scenes`, not
+        // `capture_sources`. Collect their tokens too, so Wayland per-app capture persists
+        // each portal selection and restores it silently on the next launch.
+        for (_scene, source) in self.app_scenes.values() {
             if let Some(app) = source.app_id() {
                 if let Some(token) = source.restore_token() {
                     if !token.is_empty() {

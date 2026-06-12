@@ -17,9 +17,15 @@ use std::process::Command;
 pub const UUID: &str = "crowd-cast-focus@p-doom.org";
 /// Private session-bus name the extension owns once gnome-shell has loaded it.
 pub const BUS_NAME: &str = "org.crowdcast.FocusProvider";
-/// GNOME Shell majors the bundled extension declares support for (keep in sync with
-/// metadata.json `shell-version`).
-const SUPPORTED_MAJORS: &[u32] = &[45, 46, 47, 48];
+/// Minimum GNOME Shell major the extension supports: 45 is the ESM cutover (the extension
+/// is written in ESM, so it cannot load on older shells). There is intentionally **no upper
+/// bound** — the APIs it uses (`Extension`, `Gio.DBusExportedObject`, `global.display`,
+/// `Meta.Window.get_pid/get_wm_class/get_title`) are stable across 45+, so we stay
+/// forward-compatible rather than hard-failing on each new GNOME release. If a future GNOME
+/// genuinely breaks it, the liveness probe catches it (the extension just won't go live).
+/// The host's running major is injected into the installed metadata's `shell-version` (see
+/// [`render_metadata`]), so GNOME Shell's own version validation always accepts it.
+const MIN_SUPPORTED_MAJOR: u32 = 45;
 
 // Extension source, embedded so install needs no external files at runtime.
 const METADATA_JSON: &str =
@@ -178,7 +184,7 @@ pub fn state() -> State {
         return State::Blocked;
     }
     if let Some(major) = gnome_shell_major() {
-        if !SUPPORTED_MAJORS.contains(&major) {
+        if major < MIN_SUPPORTED_MAJOR {
             return State::VersionUnsupported(major);
         }
     }
@@ -190,6 +196,29 @@ pub fn state() -> State {
     }
     // Installed + enabled + supported, but the bus name isn't owned yet → not loaded.
     State::PendingRelogin
+}
+
+/// Render the extension's metadata.json, injecting the host's running GNOME major into
+/// `shell-version`. GNOME Shell refuses to load an extension whose metadata doesn't list the
+/// running major, so a fixed list would hard-fail on every new GNOME release; instead we
+/// always include the detected major (plus a base span for older shells / detection misses).
+fn render_metadata() -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(METADATA_JSON) {
+        Ok(v) => v,
+        Err(_) => return METADATA_JSON.to_string(),
+    };
+    let mut majors: Vec<u32> = (MIN_SUPPORTED_MAJOR..=50).collect();
+    if let Some(m) = gnome_shell_major() {
+        if m >= MIN_SUPPORTED_MAJOR {
+            majors.push(m);
+        }
+    }
+    majors.sort_unstable();
+    majors.dedup();
+    value["shell-version"] = serde_json::Value::Array(
+        majors.into_iter().map(|m| serde_json::Value::String(m.to_string())).collect(),
+    );
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| METADATA_JSON.to_string())
 }
 
 /// Install the bundled extension into the per-user extensions dir and enable it. Does NOT
@@ -206,7 +235,7 @@ pub fn install_and_enable() -> Result<String, String> {
     let dir = user_extensions_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-    std::fs::write(dir.join("metadata.json"), METADATA_JSON)
+    std::fs::write(dir.join("metadata.json"), render_metadata())
         .map_err(|e| format!("Could not write metadata.json: {e}"))?;
     std::fs::write(dir.join("extension.js"), EXTENSION_JS)
         .map_err(|e| format!("Could not write extension.js: {e}"))?;

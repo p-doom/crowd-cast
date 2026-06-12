@@ -124,7 +124,17 @@ fn run(state: &Arc<FocusState>) -> Result<(), Box<dyn std::error::Error>> {
             .by_id
             .values()
             .find(|t| t.activated)
-            .map(|t| FocusInfo { app_id: t.app_id.clone(), pid: None });
+            .map(|t| FocusInfo { app_id: t.app_id.clone(), pid: None, ..Default::default() });
         state.set(focused);
+        // Publish the full toplevel set for wizard enumeration — same `app_id` source as the
+        // focused identity above, so the app list and the gate agree by construction.
+        state.set_windows(
+            toplevels
+                .by_id
+                .values()
+                .map(|t| t.app_id.clone())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        );
     }
 }

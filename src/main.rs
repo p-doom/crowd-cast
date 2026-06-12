@@ -170,6 +170,34 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
+        // List the app identities the wizard offers for capture, exactly as enumeration
+        // produces them. On Wayland these are app_id/wm_class (from installed `.desktop`
+        // entries); on X11 they are `/proc/comm`. Use this to confirm enumeration agrees with
+        // what `--print-focus` reports for the same app.
+        if args.iter().any(|a| a == "--list-apps") {
+            let apps = crate::capture::list_capturable_apps();
+            println!("capturable app identities ({}):", apps.len());
+            for app in &apps {
+                println!("  {}\t({})", app.bundle_id, app.name);
+            }
+            return Ok(());
+        }
+
+        // Internal: render the tray "Settings" app-selection panel in THIS process and write
+        // the result as JSON to the given path, then exit. The agent process can't show GTK
+        // itself: libobs's Wayland support runs a glib MainLoop on the default GMainContext
+        // from a background thread, so once GTK is initialized in that process the two race
+        // inside non-thread-safe GTK and crash (NULL GdkScreen -> SIGSEGV). The agent re-execs
+        // us with this flag to get a clean, libobs-free process for the dialog; see
+        // `ui::app_selector::show_panel`. This must stay ABOVE all libobs/tray/runtime init.
+        if let Some(pos) = args.iter().position(|a| a == "--settings-panel-out") {
+            let out = args
+                .get(pos + 1)
+                .ok_or_else(|| anyhow::anyhow!("--settings-panel-out requires a file path"))?;
+            ui::app_selector::run_settings_panel_subprocess(std::path::Path::new(out))?;
+            return Ok(());
+        }
+
         // Install + enable the bundled GNOME focus extension, then exit. This is the
         // command the wizard surfaces for the GNOME follow-focus prerequisite; it writes
         // no shell state beyond the per-user extensions dir and gsettings, and takes effect
@@ -523,6 +551,8 @@ fn print_help() {
         println!("        --print-windows [APP...]");
         println!("                  Diagnostic: report X11 per-app capability and resolve each");
         println!("                  APP identity to its XComposite capture window (Linux/X11)");
+        println!("        --list-apps");
+        println!("                  Diagnostic: print the app identities offered for capture");
     }
     println!();
     println!("ENVIRONMENT:");

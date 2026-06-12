@@ -56,28 +56,60 @@ async fn run_once(state: &Arc<FocusState>) -> zbus::Result<()> {
     let proxy = zbus::Proxy::new(&conn, BUS_NAME, OBJ_PATH, IFACE).await?;
 
     // Initial fetch — also confirms the extension owns the name (else this errors → retry).
-    let (pid, wm_class, _title): (i32, String, String) =
+    // (window_id, pid, wm_class, title); title is unused now (window_id pins the window).
+    let (window_id, pid, wm_class, _title): (u64, i32, String, String) =
         proxy.call("GetFocused", &()).await?;
     state.set_live(true);
-    publish(state, pid, wm_class);
+    publish(state, window_id, pid, wm_class);
     tracing::info!("follow-focus(gnome): focus extension connected");
 
     // Event-driven updates.
     let mut signals = proxy.receive_signal("FocusChanged").await?;
     while let Some(msg) = signals.next().await {
-        let (pid, wm_class, _title): (i32, String, String) = msg.body().deserialize()?;
-        publish(state, pid, wm_class);
+        let (window_id, pid, wm_class, _title): (u64, i32, String, String) =
+            msg.body().deserialize()?;
+        publish(state, window_id, pid, wm_class);
     }
     Ok(())
 }
 
-fn publish(state: &Arc<FocusState>, pid: i32, wm_class: String) {
+/// One-shot enumeration of all open windows' `wm_class` via the extension's `ListWindows`.
+/// This is the SAME `get_wm_class()` value the focus signal (and thus the gate) reports, so
+/// the wizard's app list and runtime gating agree by construction — no `.desktop`/wm_class
+/// heuristic. Returns an empty vec if the extension isn't live (fail closed; the extension is
+/// a hard recording prerequisite anyway). Runs the async zbus call on a fresh thread so it is
+/// safe to call from either a sync context or inside an existing tokio runtime.
+pub(super) fn list_app_ids() -> Vec<String> {
+    std::thread::Builder::new()
+        .name("focus-gnome-list".into())
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            rt.block_on(async {
+                let conn = zbus::Connection::session().await.ok()?;
+                let proxy = zbus::Proxy::new(&conn, BUS_NAME, OBJ_PATH, IFACE).await.ok()?;
+                // ListWindows -> a(tiss): (window_id, pid, wm_class, title) per window.
+                let windows: Vec<(u64, i32, String, String)> =
+                    proxy.call("ListWindows", &()).await.ok()?;
+                Some(windows.into_iter().map(|(_, _, cls, _)| cls).collect::<Vec<_>>())
+            })
+        })
+        .ok()
+        .and_then(|h| h.join().ok())
+        .flatten()
+        .unwrap_or_default()
+}
+
+fn publish(state: &Arc<FocusState>, window_id: u64, pid: i32, wm_class: String) {
     if pid <= 0 && wm_class.is_empty() {
         state.set(None);
     } else {
         state.set(Some(FocusInfo {
             app_id: wm_class,
             pid: if pid > 0 { Some(pid as u32) } else { None },
+            window_id: if window_id > 0 { Some(window_id) } else { None },
         }));
     }
 }

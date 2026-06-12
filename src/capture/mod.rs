@@ -18,14 +18,28 @@ mod recording;
 mod recovery;
 mod sources;
 #[cfg(target_os = "linux")]
+pub(crate) mod gnome_screencast;
+#[cfg(target_os = "linux")]
 pub(crate) mod wayland_output;
 #[cfg(target_os = "linux")]
 pub(crate) mod x11_windows;
 
+/// Whether this is a GNOME Wayland session, where per-app capture goes through the private
+/// Mutter ScreenCast API (picker-free) rather than the portal. Cheap env check; the actual
+/// availability of the focus extension (which supplies window-ids) is gated at use.
+#[cfg(target_os = "linux")]
+pub fn is_gnome_wayland() -> bool {
+    sources::is_wayland_session() && crate::installer::gnome_focus::is_gnome()
+}
+
 /// Whether this platform/session can drive the single-active-app capture model (capture
 /// only the frontmost tracked app, switching on focus). macOS always can (ScreenCaptureKit
-/// per-app); Linux can only on a **pure X11 session** (XComposite per-window capture) — on
-/// Wayland the portal/PipeWire multi-source path owns window capture instead.
+/// per-app). Linux can on both session types: a **pure X11 session** via XComposite
+/// per-window capture, and a **Wayland session** via per-app xdg-desktop-portal window
+/// sources whose scenes are switched on focus. Switching never re-prompts because the OBS
+/// pipewire source keeps its portal/PipeWire session alive across scene changes (`.show`/
+/// `.hide` only toggle `pw_stream_set_active`); the one-time portal prompt is paid when each
+/// source is created during setup.
 pub fn is_single_active_capable() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -33,7 +47,11 @@ pub fn is_single_active_capable() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        x11_windows::is_pure_x11_session()
+        // Cheap session-type check only (env vars) — this is consulted on every focus
+        // switch. Whether per-window capture is actually available (portal WINDOW bit on
+        // Wayland / XComposite on X11) is gated separately by the wizard via
+        // `per_app_capture_available()`.
+        x11_windows::is_pure_x11_session() || sources::is_wayland_session()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
