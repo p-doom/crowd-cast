@@ -2,6 +2,8 @@
 
 pub mod app_selector;
 pub mod notifications;
+#[cfg(target_os = "linux")]
+pub mod notify_linux;
 mod platform_tray;
 mod tray;
 pub mod tray_ffi;
