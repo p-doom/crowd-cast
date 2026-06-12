@@ -37,6 +37,15 @@ typedef struct {
     bool satisfied;
 } WizardRequirement;
 
+// Must match #[repr(C)] FfiAppSelectionResult in src/ui/app_selector.rs.
+// Result of the tray "Settings" dialog (show_app_selection_panel below).
+typedef struct {
+    bool capture_all;
+    const char **selected_apps;
+    size_t selected_apps_count;
+    bool saved;
+} AppSelectionResult;
+
 // ---- available apps (owned copy) ----
 static char **g_app_ids = NULL;
 static char **g_app_names = NULL;
@@ -182,11 +191,159 @@ void wizard_set_per_app_available(bool available) {
     g_per_app_available = available ? TRUE : FALSE;
 }
 
-// Grey out the per-app list while "capture all" is active, or whenever per-app capture
-// isn't available on this host (mutually exclusive with "capture all").
-static void on_capture_all_toggled(GtkToggleButton *btn, gpointer apps_section) {
-    gtk_widget_set_sensitive(GTK_WIDGET(apps_section),
+// ---- Shared capture-mode UI: "Capture all" + a checklist of apps ----------------
+// Used by BOTH the first-run wizard and the tray "Settings" dialog. The user ticks the
+// apps to capture, mirroring the macOS panel. Each ticked app gates input recording and
+// is captured per-app: by window identity on GNOME Wayland (Mutter ScreenCast,
+// picker-free) and via XComposite on X11. The candidate list is whatever the host
+// enumerates (all installed apps on Wayland, running apps on X11 / macOS).
+
+typedef struct {
+    GtkWidget *dialog;
+    GtkWidget *capture_all;
+    GtkWidget *check_list;    // GtkBox (vertical) of one GtkCheckButton per available app
+    GtkWidget *apps_section;  // greyed out while "capture all" is active
+    // Extra precondition for enabling the dialog's accept button (the wizard sets this
+    // when a required host component is missing); ANDed with the capture selection.
+    gboolean required_unmet;
+} SettingsCtx;
+
+static guint settings_selected_count(SettingsCtx *c) {
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(c->check_list));
+    guint n = 0;
+    for (GList *l = kids; l; l = l->next) {
+        if (GTK_IS_TOGGLE_BUTTON(l->data) &&
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(l->data))) {
+            n++;
+        }
+    }
+    g_list_free(kids);
+    return n;
+}
+
+// Fail-closed accept gate: the accept button stays disabled while "capture all" is off
+// AND no app has been added (a "capture nothing" config can never be saved), and also
+// while any required host component is unmet (wizard).
+static void settings_update_save(SettingsCtx *c) {
+    gboolean all = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(c->capture_all));
+    gboolean ok = (all || settings_selected_count(c) > 0) && !c->required_unmet;
+    gtk_dialog_set_response_sensitive(GTK_DIALOG(c->dialog), GTK_RESPONSE_OK, ok);
+}
+
+// A checklist row's tick changed: re-evaluate the accept gate (capture-all OR >=1 ticked).
+static void on_settings_check_toggled(GtkToggleButton *btn, gpointer data) {
+    (void)btn;
+    settings_update_save((SettingsCtx *)data);
+}
+
+static void on_settings_capture_all(GtkToggleButton *btn, gpointer data) {
+    SettingsCtx *ctx = (SettingsCtx *)data;
+    gtk_widget_set_sensitive(ctx->apps_section,
                              !gtk_toggle_button_get_active(btn) && g_per_app_available);
+    settings_update_save(ctx);
+}
+
+// Build the "Capture all" toggle + the add/remove app list into `content`, prefilling
+// `preselected`. Fills *ctx (read by the caller on accept to collect the chosen apps)
+// and wires the accept gate. `required_unmet` keeps accept disabled until host
+// requirements are met (wizard); pass FALSE from the Settings dialog. Centralizes the
+// g_per_app_available gate so both callers share one correct codepath.
+static void build_addremove_section(GtkWidget *content, GtkWidget *dialog,
+                                    gboolean initial_capture_all,
+                                    const char **preselected, size_t preselected_count,
+                                    gboolean required_unmet, SettingsCtx *ctx) {
+    ctx->dialog = dialog;
+    ctx->required_unmet = required_unmet;
+
+    ctx->capture_all = gtk_check_button_new_with_label("Capture all applications");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->capture_all), initial_capture_all);
+    gtk_box_pack_start(GTK_BOX(content), ctx->capture_all, FALSE, FALSE, 0);
+
+    ctx->apps_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_vexpand(ctx->apps_section, TRUE);
+    gtk_box_pack_start(GTK_BOX(content), ctx->apps_section, TRUE, TRUE, 0);
+
+    GtkWidget *apps_label = gtk_label_new("Applications to capture:");
+    gtk_label_set_xalign(GTK_LABEL(apps_label), 0.0);
+    gtk_box_pack_start(GTK_BOX(ctx->apps_section), apps_label, FALSE, FALSE, 0);
+
+    // Scrollable checklist: one tickable row per available app (ticked = captured),
+    // mirroring the macOS panel. Apps already in the saved selection start ticked.
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroll, TRUE);
+    ctx->check_list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_container_add(GTK_CONTAINER(scroll), ctx->check_list);
+    gtk_box_pack_start(GTK_BOX(ctx->apps_section), scroll, TRUE, TRUE, 0);
+
+    for (size_t i = 0; i < g_app_count; i++) {
+        if (!g_app_ids[i] || !g_app_ids[i][0]) {
+            continue;
+        }
+        const char *label =
+            (g_app_names[i] && g_app_names[i][0]) ? g_app_names[i] : g_app_ids[i];
+        GtkWidget *chk = gtk_check_button_new_with_label(label);
+        g_object_set_data_full(G_OBJECT(chk), "app-id", g_strdup(g_app_ids[i]), g_free);
+        for (size_t j = 0; j < preselected_count; j++) {
+            if (preselected[j] && strcmp(preselected[j], g_app_ids[i]) == 0) {
+                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(chk), TRUE);
+                break;
+            }
+        }
+        g_signal_connect(chk, "toggled", G_CALLBACK(on_settings_check_toggled), ctx);
+        gtk_box_pack_start(GTK_BOX(ctx->check_list), chk, FALSE, FALSE, 0);
+    }
+
+    g_signal_connect(ctx->capture_all, "toggled", G_CALLBACK(on_settings_capture_all), ctx);
+
+    if (!g_per_app_available) {
+        // Per-app capture isn't available on this host -- force full-screen capture.
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ctx->capture_all), TRUE);
+        gtk_widget_set_sensitive(ctx->capture_all, FALSE);
+        GtkWidget *cap_note = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(cap_note),
+            "<i>Per-app capture isn't supported by your compositor (it only allows "
+            "full-screen capture); the full screen will be captured.</i>");
+        gtk_label_set_xalign(GTK_LABEL(cap_note), 0.0);
+        gtk_label_set_line_wrap(GTK_LABEL(cap_note), TRUE);
+        gtk_box_pack_start(GTK_BOX(content), cap_note, FALSE, FALSE, 0);
+    }
+    gtk_widget_set_sensitive(ctx->apps_section,
+        !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctx->capture_all)) && g_per_app_available);
+
+    settings_update_save(ctx);
+}
+
+// Collect the chosen apps from the add/remove list into a freshly-allocated
+// (strdup'd) array. Stores nothing when "capture all" is active. Shared by both
+// dialogs' accept paths; the array + entries are freed by *_free_result().
+static void settings_collect_selection(SettingsCtx *ctx, bool capture_all,
+                                       const char ***out_apps, size_t *out_count) {
+    *out_apps = NULL;
+    *out_count = 0;
+    if (capture_all) {
+        return;
+    }
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(ctx->check_list));
+    guint n = g_list_length(kids);
+    if (n > 0) {
+        const char **sel = (const char **)calloc(n, sizeof(char *));
+        size_t j = 0;
+        for (GList *l = kids; l; l = l->next) {
+            if (!GTK_IS_TOGGLE_BUTTON(l->data) ||
+                !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(l->data))) {
+                continue; // only ticked apps are captured
+            }
+            const char *id = (const char *)g_object_get_data(G_OBJECT(l->data), "app-id");
+            if (id && id[0]) {
+                sel[j++] = strdup(id);
+            }
+        }
+        *out_apps = sel;
+        *out_count = j;
+    }
+    g_list_free(kids);
 }
 
 int wizard_run(WizardConfig *out) {
@@ -247,8 +404,10 @@ int wizard_run(WizardConfig *out) {
         if (required_unmet) {
             GtkWidget *note = gtk_label_new(NULL);
             gtk_label_set_markup(GTK_LABEL(note),
-                "<span foreground='#c62828'>A required component is missing. Install the package each "
-                "item names above, then re-run setup. Setup cannot continue until it is resolved.</span>");
+                "<span foreground='#c62828'>A required component isn't ready. Follow the instructions "
+                "shown for each flagged item above, then re-run setup. Some changes (such as installing "
+                "the GNOME focus extension or joining the input group) only take effect after you log "
+                "out and back in. Setup cannot continue until they are resolved.</span>");
             gtk_label_set_xalign(GTK_LABEL(note), 0.0);
             gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
             gtk_box_pack_start(GTK_BOX(content), note, FALSE, FALSE, 0);
@@ -257,63 +416,15 @@ int wizard_run(WizardConfig *out) {
         }
     }
 
-    // ---- Capture options ----
-    GtkWidget *capture_all = gtk_check_button_new_with_label(
-        "Capture all applications");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(capture_all), TRUE);
-    gtk_box_pack_start(GTK_BOX(content), capture_all, FALSE, FALSE, 0);
-
-    // Per-app selection lives in its own section that is disabled (greyed out) while
-    // "capture all" is active, enforcing mutual exclusivity.
-    GtkWidget *apps_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    gtk_widget_set_vexpand(apps_section, TRUE);
-    gtk_box_pack_start(GTK_BOX(content), apps_section, TRUE, TRUE, 0);
-
-    GtkWidget *apps_label = gtk_label_new("Or select specific applications:");
-    gtk_label_set_xalign(GTK_LABEL(apps_label), 0.0);
-    gtk_box_pack_start(GTK_BOX(apps_section), apps_label, FALSE, FALSE, 0);
-
-    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
-        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_vexpand(scroll, TRUE);
-    GtkWidget *apps_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    gtk_container_add(GTK_CONTAINER(scroll), apps_box);
-    gtk_box_pack_start(GTK_BOX(apps_section), scroll, TRUE, TRUE, 0);
-
-    g_signal_connect(capture_all, "toggled", G_CALLBACK(on_capture_all_toggled), apps_section);
-    gtk_widget_set_sensitive(apps_section,
-        !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(capture_all)) && g_per_app_available);
-
-    if (!g_per_app_available) {
-        // Per-app capture isn't available on this host -- force full-screen capture and
-        // grey out the per-app picker so an unusable config can't be created.
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(capture_all), TRUE);
-        gtk_widget_set_sensitive(capture_all, FALSE);
-        gtk_widget_set_sensitive(apps_section, FALSE);
-        GtkWidget *cap_note = gtk_label_new(NULL);
-        gtk_label_set_markup(GTK_LABEL(cap_note),
-            "<i>Per-app capture isn't supported by your compositor (it only allows "
-            "full-screen capture); the full screen will be captured.</i>");
-        gtk_label_set_xalign(GTK_LABEL(cap_note), 0.0);
-        gtk_label_set_line_wrap(GTK_LABEL(cap_note), TRUE);
-        gtk_box_pack_start(GTK_BOX(content), cap_note, FALSE, FALSE, 0);
-    }
-
-    GtkWidget **app_checks = NULL;
-    if (g_app_count > 0) {
-        app_checks = (GtkWidget **)calloc(g_app_count, sizeof(GtkWidget *));
-        for (size_t i = 0; i < g_app_count; i++) {
-            const char *label =
-                (g_app_names[i] && g_app_names[i][0]) ? g_app_names[i] : g_app_ids[i];
-            app_checks[i] = gtk_check_button_new_with_label(label);
-            gtk_box_pack_start(GTK_BOX(apps_box), app_checks[i], FALSE, FALSE, 0);
-        }
-    } else {
-        GtkWidget *none = gtk_label_new("(no capturable applications detected)");
-        gtk_label_set_xalign(GTK_LABEL(none), 0.0);
-        gtk_box_pack_start(GTK_BOX(apps_box), none, FALSE, FALSE, 0);
-    }
+    // ---- Capture options (shared add/remove UI with the tray "Settings" dialog) ----
+    // Start with NO capture mode selected: "capture all" defaults off and the app list
+    // is empty, so settings_update_save() keeps Finish disabled until the user makes an
+    // explicit choice (tick "capture all" or add an app). We must never silently default
+    // to recording the whole screen. (When per-app capture is unavailable on the host,
+    // build_addremove_section forces "capture all" on with a visible note -- that's an
+    // explicit, gated choice, not a silent default.)
+    SettingsCtx ctx;
+    build_addremove_section(content, dialog, FALSE, NULL, 0, required_unmet, &ctx);
 
     GtkWidget *autostart = gtk_check_button_new_with_label("Start crowd-cast on login");
     gtk_box_pack_start(GTK_BOX(content), autostart, FALSE, FALSE, 0);
@@ -324,29 +435,12 @@ int wizard_run(WizardConfig *out) {
     if (resp == GTK_RESPONSE_OK) {
         out->completed = true;
         out->cancelled = false;
-        out->capture_all = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(capture_all));
+        out->capture_all = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctx.capture_all));
         out->enable_autostart = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(autostart));
-
-        if (!out->capture_all && g_app_count > 0 && app_checks) {
-            size_t n = 0;
-            for (size_t i = 0; i < g_app_count; i++) {
-                if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app_checks[i]))) n++;
-            }
-            if (n > 0) {
-                const char **sel = (const char **)calloc(n, sizeof(char *));
-                size_t j = 0;
-                for (size_t i = 0; i < g_app_count && j < n; i++) {
-                    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app_checks[i]))) {
-                        sel[j++] = strdup(g_app_ids[i]);
-                    }
-                }
-                out->selected_apps = sel;
-                out->selected_apps_count = n;
-            }
-        }
+        settings_collect_selection(&ctx, out->capture_all,
+                                   &out->selected_apps, &out->selected_apps_count);
     }
 
-    free(app_checks);
     gtk_widget_destroy(dialog);
     while (gtk_events_pending()) gtk_main_iteration();
     return 0;
@@ -360,4 +454,77 @@ void wizard_free_result(WizardConfig *cfg) {
     free((void *)cfg->selected_apps);
     cfg->selected_apps = NULL;
     cfg->selected_apps_count = 0;
+}
+
+// ---- Tray "Settings" dialog -------------------------------------------------
+// The Linux analog of the macOS Cocoa app-selection panel. Uses the shared add/remove
+// capture-mode UI (build_addremove_section, above) -- the same UI the first-run wizard
+// uses. Consumed via show_panel() in src/ui/app_selector.rs; the SAME C ABI
+// (show_app_selection_panel / AppSelectionResult) is implemented by
+// src/ui/wizard_darwin.m on macOS.
+void show_app_selection_panel(const char **current_apps, size_t current_count,
+                              bool capture_all, AppSelectionResult *out) {
+    if (!out) return;
+    out->capture_all = capture_all;
+    out->selected_apps = NULL;
+    out->selected_apps_count = 0;
+    out->saved = false;
+
+    // Idempotent: a no-op if the setup wizard already initialized GTK earlier in this
+    // process, and the first init if the agent launched straight into the tray.
+    if (!gtk_init_check(NULL, NULL)) {
+        return;
+    }
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "crowd-cast settings", NULL, GTK_DIALOG_MODAL,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Save", GTK_RESPONSE_OK,
+        NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 520, 480);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 16);
+    gtk_box_set_spacing(GTK_BOX(content), 10);
+
+    GtkWidget *title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title),
+        "<span size='x-large' weight='bold'>Applications to capture</span>");
+    gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+    gtk_box_pack_start(GTK_BOX(content), title, FALSE, FALSE, 0);
+
+    GtkWidget *intro = gtk_label_new(
+        "Add the applications crowd-cast should record. On Save, crowd-cast restarts and "
+        "asks you (through the desktop portal) to pick each newly added app's window. "
+        "Input is recorded only while one of these apps is focused.");
+    gtk_label_set_xalign(GTK_LABEL(intro), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(intro), TRUE);
+    gtk_box_pack_start(GTK_BOX(content), intro, FALSE, FALSE, 0);
+
+    SettingsCtx ctx;
+    build_addremove_section(content, dialog, capture_all ? TRUE : FALSE,
+                            current_apps, current_count, FALSE, &ctx);
+
+    gtk_widget_show_all(dialog);
+    gint resp = gtk_dialog_run(GTK_DIALOG(dialog));
+
+    if (resp == GTK_RESPONSE_OK) {
+        out->saved = true;
+        out->capture_all = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ctx.capture_all));
+        settings_collect_selection(&ctx, out->capture_all,
+                                   &out->selected_apps, &out->selected_apps_count);
+    }
+
+    gtk_widget_destroy(dialog);
+    while (gtk_events_pending()) gtk_main_iteration();
+}
+
+void app_selection_free_result(AppSelectionResult *out) {
+    if (!out || !out->selected_apps) return;
+    for (size_t i = 0; i < out->selected_apps_count; i++) {
+        free((void *)out->selected_apps[i]);
+    }
+    free((void *)out->selected_apps);
+    out->selected_apps = NULL;
+    out->selected_apps_count = 0;
 }

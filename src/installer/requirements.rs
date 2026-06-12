@@ -563,8 +563,9 @@ fn focus_provider_requirement() -> Requirement {
             State::VersionUnsupported(v) => (
                 false,
                 format!(
-                    "This GNOME Shell version ({v}) isn't supported by the bundled focus \
-                     extension yet. Please update crowd-cast."
+                    "crowd-cast's GNOME focus extension requires GNOME Shell 45 or newer \
+                     (this session is GNOME {v}). Newer GNOME versions are supported \
+                     automatically."
                 ),
                 String::new(),
             ),
