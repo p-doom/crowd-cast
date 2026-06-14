@@ -21,8 +21,9 @@ use libobs_wrapper::data::ObsObjectUpdater;
 
 #[cfg(target_os = "linux")]
 use libobs_simple::sources::linux::{
-    PipeWireDesktopCaptureSourceBuilder, PipeWireWindowCaptureSourceBuilder,
-    X11CaptureSourceBuilder, XCompositeInputSourceBuilder, XCompositeInputSourceUpdater,
+    PipeWireDesktopCaptureSourceBuilder, PipeWireScreenCaptureSourceBuilder,
+    PipeWireWindowCaptureSourceBuilder, X11CaptureSourceBuilder, XCompositeInputSourceBuilder,
+    XCompositeInputSourceUpdater,
 };
 #[cfg(target_os = "linux")]
 use libobs_wrapper::data::{ObsData, ObsObjectUpdater};
@@ -36,6 +37,14 @@ pub(crate) fn is_wayland_session() -> bool {
         .unwrap_or(false)
         || std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
+
+/// Reserved `restore_tokens` map key for the full-screen display capture source on Wayland.
+/// Display capture has no app/window identity, so its xdg-desktop-portal restore token is
+/// persisted under this sentinel (kept distinct from any real bundle id) so the monitor pick
+/// happens once and then restores silently on later launches. The leading underscores make a
+/// collision with a real macOS bundle id or Linux process name impossible.
+#[cfg(target_os = "linux")]
+pub const DISPLAY_CAPTURE_KEY: &str = "__display__";
 
 /// Wrapper around a screen capture source
 pub struct ScreenCaptureSource {
@@ -61,6 +70,7 @@ impl ScreenCaptureSource {
         scene: &mut ObsSceneRef,
         name: &str,
         capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
         // Get the current main display UUID - this is refreshed each time,
         // so it will be correct even after display reconnection
@@ -93,9 +103,12 @@ impl ScreenCaptureSource {
     /// Create a new display (full-screen) capture source on Linux.
     ///
     /// - **Wayland**: captures via xdg-desktop-portal ScreenCast + PipeWire (the GPU /
-    ///   zero-copy path). The first run shows the portal picker; a restore token can be
-    ///   persisted later to avoid re-prompting (see docs/LINUX_LIBOBS_PROVISIONING.md).
-    /// - **X11**: captures the whole primary screen via XSHM (`xshm_input`).
+    ///   zero-copy path). The first run shows the portal picker (on wlroots/sway this is a
+    ///   bare `slurp` crosshair); the restore token read back afterwards is persisted under
+    ///   [`DISPLAY_CAPTURE_KEY`] so the monitor pick happens once and later launches restore
+    ///   the same output silently.
+    /// - **X11**: captures the whole primary screen via XSHM (`xshm_input`) — no portal, no
+    ///   picker, so `restore_token` is ignored.
     ///
     /// Audio is configured at the output level, so `_capture_audio` is unused here.
     #[cfg(target_os = "linux")]
@@ -104,15 +117,29 @@ impl ScreenCaptureSource {
         scene: &mut ObsSceneRef,
         name: &str,
         _capture_audio: bool,
+        restore_token: Option<&str>,
     ) -> Result<Self> {
-        let source = if is_wayland_session() {
+        let wayland = is_wayland_session();
+        let source = if wayland {
             info!(
-                "Creating Linux PipeWire (Wayland) display capture source: {}",
-                name
+                "Creating Linux PipeWire (Wayland) display capture source: {} (has_token: {})",
+                name,
+                restore_token.map(|t| !t.is_empty()).unwrap_or(false)
             );
-            context
+            // First launch (no token): the portal asks the user to pick a monitor and the
+            // token is read back afterwards (see CaptureContext::collect_restore_tokens).
+            // Later launches pass the saved token so the same output is restored silently.
+            // Mirrors the per-window path: OBS requests persist mode itself, so an empty
+            // token is simply not set rather than seeded.
+            let mut builder = context
                 .source_builder::<PipeWireDesktopCaptureSourceBuilder, _>(name)?
-                .set_show_cursor(true)
+                .set_show_cursor(true);
+            if let Some(token) = restore_token {
+                if !token.is_empty() {
+                    builder = builder.set_restore_token(token.to_string());
+                }
+            }
+            builder
                 .add_to_scene(scene)
                 .context("Failed to add PipeWire desktop capture source to scene")?
         } else {
@@ -130,7 +157,9 @@ impl ScreenCaptureSource {
             source,
             name: name.to_string(),
             is_active: true,
-            app_id: None,
+            // Wayland display capture persists its portal token under the reserved key;
+            // X11 has no token, so it stays identity-less.
+            app_id: wayland.then(|| DISPLAY_CAPTURE_KEY.to_string()),
         })
     }
 
@@ -147,6 +176,7 @@ impl ScreenCaptureSource {
         _scene: &mut ObsSceneRef,
         _name: &str,
         _capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
         anyhow::bail!("Display capture not yet implemented for Windows (use monitor_capture)")
     }
@@ -158,6 +188,7 @@ impl ScreenCaptureSource {
         _scene: &mut ObsSceneRef,
         _name: &str,
         _capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
         anyhow::bail!("Screen capture not supported on this platform");
     }
@@ -229,7 +260,7 @@ impl ScreenCaptureSource {
     ///
     /// NOTE: the end-to-end per-app / follow-focus flow on Linux (portal session lifecycle,
     /// restore-token persistence, window-id resolution) requires validation on a Linux
-    /// machine. See docs/LINUX_PORTING_PLAN.md.
+    /// machine.
     #[cfg(target_os = "linux")]
     pub fn new_application_capture(
         context: &mut ObsContext,
@@ -297,6 +328,15 @@ impl ScreenCaptureSource {
     /// `gnome_screencast` via Mutter `RecordWindow`; OBS connects to it through the
     /// obs-pipewire `ConnectNode` setting (bundled-OBS patch). The node must stay alive (its
     /// Mutter session is held by the `GnomeScreenCast` manager) for this source's lifetime.
+    ///
+    /// Uses the **unified** `pipewire-screen-capture-source` as the container, NOT the
+    /// window-capture source. obs-pipewire only registers the window-capture source when the
+    /// xdg-desktop-portal advertises WINDOW capture — but we never touch the portal here (the
+    /// node comes from Mutter, and `ConnectNode` binds it on the default PipeWire daemon). The
+    /// screen-capture source is registered whenever *any* screencast type is available, so this
+    /// path no longer breaks when a non-GNOME portal backend (e.g. a stale xdg-desktop-portal-wlr
+    /// serving the session) advertises monitor-only. `ConnectNode` behaves identically across
+    /// the three obs-pipewire source types (see the bundled-OBS patch).
     #[cfg(target_os = "linux")]
     pub fn new_window_node_capture(
         context: &mut ObsContext,
@@ -310,7 +350,7 @@ impl ScreenCaptureSource {
             name, app_id, node_id
         );
         let source = context
-            .source_builder::<PipeWireWindowCaptureSourceBuilder, _>(name)?
+            .source_builder::<PipeWireScreenCaptureSourceBuilder, _>(name)?
             .set_connect_node(node_id as i64)
             .set_show_cursor(true)
             .add_to_scene(scene)

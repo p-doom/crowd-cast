@@ -7,7 +7,7 @@ set -euo pipefail
 # Modern toolchain (gcc-toolset-13). NOTE on libstdc++: binaries built here need GCC13-level
 # GLIBCXX. We do NOT bundle libstdc++ yet (the build/test host, Manjaro, has a newer one, so it
 # resolves). Cross-distro to OLD-libstdc++ hosts needs the "checkrt newer-wins" launcher shim
-# (docs/LINUX_LIBOBS_PROVISIONING.md §1) — tracked as a follow-up.
+# — tracked as a follow-up.
 source /opt/rh/gcc-toolset-13/enable 2>/dev/null || true
 echo "::: toolchain: $(gcc --version | head -1)"
 

@@ -2,7 +2,7 @@
 
 use crate::data::InputEvent;
 use crate::input::secure::SecureInputState;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -27,19 +27,18 @@ pub trait InputBackend: Send + Sync {
 /// Linux uses evdev for both X11 and Wayland: raw pre-acceleration deltas, reaches the
 /// same input layer raw-input consumers read, and works regardless of display server.
 /// rdev is not linked on Linux (see Cargo.toml). macOS/Windows use rdev.
-pub fn create_input_backend(secure: Arc<SecureInputState>) -> Box<dyn InputBackend> {
+pub fn create_input_backend(secure: Arc<SecureInputState>) -> Result<Box<dyn InputBackend>> {
     #[cfg(target_os = "linux")]
     {
-        match super::evdev_backend::EvdevBackend::new(secure) {
-            Ok(backend) => {
-                tracing::info!("Using evdev backend for input capture");
-                return Box::new(backend);
-            }
-            Err(e) => {
-                tracing::error!("evdev backend init failed ({e}); input capture disabled -- ensure the user is in the 'input' group. Screen capture is unaffected.");
-                return Box::new(NoOpBackend);
-            }
-        }
+        // No fallback by design: crowd-cast exists to record input, so a backend that can't
+        // read the input devices is worse than useless -- it would keep recording video while
+        // silently dropping every keystroke. Startup gates on 'input' group membership (see
+        // installer::requirements), so evdev should succeed by the time we get here; if it
+        // still fails, fail closed and loud rather than degrade to recording no input.
+        let backend = super::evdev_backend::EvdevBackend::new(secure)
+            .context("evdev input backend init failed -- ensure the user is in the 'input' group")?;
+        tracing::info!("Using evdev backend for input capture");
+        Ok(Box::new(backend))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -48,22 +47,6 @@ pub fn create_input_backend(secure: Arc<SecureInputState>) -> Box<dyn InputBacke
         // (e.g. macOS Secure Event Input), so the shared gate is inert here.
         let _ = secure;
         tracing::info!("Using rdev backend for input capture");
-        Box::new(super::rdev_backend::RdevBackend::new())
-    }
-}
-
-/// No-op input backend used on Linux only when evdev initialization fails, so the rest of
-/// the app (screen capture) keeps running without input capture.
-#[cfg(target_os = "linux")]
-struct NoOpBackend;
-
-#[cfg(target_os = "linux")]
-impl InputBackend for NoOpBackend {
-    fn start(&mut self, _tx: mpsc::UnboundedSender<InputEvent>) -> Result<()> {
-        Ok(())
-    }
-    fn stop(&mut self) {}
-    fn current_timestamp(&self) -> Option<u64> {
-        None
+        Ok(Box::new(super::rdev_backend::RdevBackend::new()))
     }
 }

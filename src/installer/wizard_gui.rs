@@ -74,16 +74,18 @@ fn run_wizard_native(config: &mut Config) -> Result<WizardResult> {
     // VAAPI) and hand them to the wizard to display + gate Finish on.
     #[cfg(target_os = "linux")]
     {
-        let reqs = crate::installer::requirements::collect();
+        let reqs = crate::installer::requirements::collect(config.capture.start_on_login);
         wizard_ffi::set_requirements(&reqs);
         wizard_ffi::set_per_app_available(
             crate::installer::requirements::per_app_capture_available(),
         );
     }
 
-    // Run the native wizard (blocks until closed)
+    // Run the native wizard (blocks until closed). Seed the autostart checkbox with the
+    // saved preference so a re-opened wizard reflects the user's actual state rather than
+    // silently defaulting it off.
     info!("Launching native wizard window...");
-    let native_result = wizard_ffi::run_native_wizard();
+    let native_result = wizard_ffi::run_native_wizard(config.capture.start_on_login);
 
     // Convert result
     let result = WizardResult {

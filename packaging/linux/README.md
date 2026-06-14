@@ -23,7 +23,7 @@ matching OBS tag.
 
 ## What we bundle vs leave to the host
 
-See `docs/LINUX_LIBOBS_PROVISIONING.md §1`. Short version: BUNDLE libobs + our plugins +
+Short version: BUNDLE libobs + our plugins +
 FFmpeg/x264 (+ output/TLS leaf libs). NEVER bundle glibc, libstdc++/libgcc, GL/EGL/glvnd/
 Mesa DRI, libdrm, libva + VA drivers, libpipewire, libdbus, X11/Wayland client libs —
 those are the host's (bundling them drops the host to swrast or breaks capture IPC).

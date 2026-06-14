@@ -128,8 +128,11 @@ pub fn set_available_apps(apps: &[AppInfoWrapper]) {
 
 /// Run the native wizard and return the result
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn run_native_wizard() -> NativeWizardResult {
+pub fn run_native_wizard(autostart_default: bool) -> NativeWizardResult {
     let mut config = WizardConfig::default();
+    // Seed the "Start on login" checkbox with the saved preference so a re-opened wizard
+    // shows the user's actual state (the native side reads this as the initial value).
+    config.enable_autostart = autostart_default;
 
     let _result = unsafe { wizard_run(&mut config) };
 
@@ -218,7 +221,7 @@ pub fn open_notifications_settings() {
 pub fn set_available_apps(_apps: &[AppInfoWrapper]) {}
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn run_native_wizard() -> NativeWizardResult {
+pub fn run_native_wizard(_autostart_default: bool) -> NativeWizardResult {
     NativeWizardResult {
         completed: false,
         cancelled: true,

@@ -99,12 +99,16 @@ fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         if args.iter().any(|a| a == "--check-requirements") {
-            for r in installer::requirements::collect() {
+            let autostart_desired = Config::load()
+                .map(|c| c.capture.start_on_login)
+                .unwrap_or(false);
+            for r in installer::requirements::collect(autostart_desired) {
                 let mark = if r.satisfied {
                     "OK"
                 } else {
                     match r.severity {
                         installer::requirements::Severity::Required => "MISSING",
+                        installer::requirements::Severity::Blocking => "MISSING",
                         installer::requirements::Severity::Recommended => "WARN",
                         installer::requirements::Severity::Optional => "OPTIONAL",
                     }
@@ -249,13 +253,34 @@ fn main() -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let config_incompatible = false;
 
+    // start_on_login is a preference, but once set it becomes a precondition: on wlroots
+    // compositors (sway/Hyprland/...) autostart needs a manual `exec` line the agent cannot
+    // write itself. If the user opted into autostart but that line isn't present, the agent
+    // must not silently run in a state that won't actually start on login -- gate on the
+    // wizard until the line is pasted (detected on the post-wizard re-exec) or the user
+    // disables start-on-login. No fallback, fail closed. (Other sessions either honor XDG
+    // autostart or have no manual step, so `linux_manual_autostart()` is None there.)
+    #[cfg(target_os = "linux")]
+    let autostart_unsatisfied = config.capture.start_on_login
+        && installer::autostart::linux_manual_autostart().is_some()
+        && !installer::autostart::is_autostart_enabled();
+    #[cfg(not(target_os = "linux"))]
+    let autostart_unsatisfied = false;
+
     // Run setup wizard if needed
     if force_setup
         || needs_setup(&config)
         || missing_permissions
         || requirements_unmet
         || config_incompatible
+        || autostart_unsatisfied
     {
+        if autostart_unsatisfied {
+            info!(
+                "start_on_login is set but the autostart line is not in the compositor config \
+                 -- opening setup until it is pasted or start-on-login is disabled"
+            );
+        }
         info!("Running setup wizard...");
         let result = run_wizard_gui(&mut config)?;
 
@@ -387,6 +412,41 @@ fn main() -> Result<()> {
                 }
                 if Instant::now() >= deadline {
                     warn!("Timed out waiting for some window selections; they will be requested again next launch.");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+
+    // Linux/Wayland display capture: the first launch shows the portal monitor picker (a bare
+    // slurp crosshair on wlroots/sway). Read back and persist its restore token under the
+    // reserved display key so later launches restore the same output silently — no picker.
+    // No-op once a token exists, and skipped on X11 (no portal, so the token never appears).
+    #[cfg(target_os = "linux")]
+    if target_apps.is_empty() && capture::is_wayland_session() {
+        use std::time::{Duration, Instant};
+        let key = capture::DISPLAY_CAPTURE_KEY;
+        if !config.capture.restore_tokens.contains_key(key) {
+            info!("Display capture: waiting for monitor selection to persist its restore token...");
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let tokens = capture_ctx.collect_restore_tokens();
+                if let Some(token) = tokens.get(key) {
+                    if !token.is_empty() {
+                        config
+                            .capture
+                            .restore_tokens
+                            .insert(key.to_string(), token.clone());
+                        match config.save() {
+                            Ok(()) => info!("Persisted display capture restore token"),
+                            Err(e) => warn!("Failed to save display restore token: {}", e),
+                        }
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    warn!("Timed out waiting for monitor selection; it will be requested again next launch.");
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(500));

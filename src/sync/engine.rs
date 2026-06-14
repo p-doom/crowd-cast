@@ -557,7 +557,7 @@ unintended app video."
             config,
             capture_ctx,
             secure_state: secure_state.clone(),
-            input_backend: create_input_backend(secure_state),
+            input_backend: create_input_backend(secure_state)?,
             cmd_rx,
             status_tx,
             event_buffer: InputEventBuffer::new(),
@@ -1198,7 +1198,10 @@ unintended app video."
             .capture_ctx
             .gnome_ensure_focused_window(bundle, window_id)
         {
-            debug!("GNOME follow-focus bind for '{}' failed: {}", bundle, e);
+            // Surfaced at WARN (not DEBUG): a bind failure means this app won't be captured.
+            // gnome_ensure_focused_window de-duplicates by window-id, so this fires at most once
+            // per focused window rather than every poll.
+            warn!("GNOME follow-focus bind for '{}' failed: {}", bundle, e);
         }
     }
 
@@ -1739,8 +1742,9 @@ unintended app video."
         }
 
         // Start the follow-focus provider (Linux): a background thread that tracks which
-        // window is focused (wlr-foreign-toplevel on wlroots / the GNOME focus extension /
-        // EWMH on X11), consumed by get_frontmost_app() to gate input capture by app.
+        // window is focused (the GNOME focus extension / EWMH on X11), consumed by
+        // get_frontmost_app() to gate input capture by app. wlroots has no provider: it
+        // records full-screen (capture-all), with no app gating.
         #[cfg(target_os = "linux")]
         crate::capture::focus::ensure_started();
 

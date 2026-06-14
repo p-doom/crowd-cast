@@ -20,7 +20,7 @@ libobs-simple = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-s
 # at runtime (macOS/Windows) and hard-`compile_error!`s on Linux. On Linux, libobs is
 # provided by a system install or a relocatable bundle located via CROWD_CAST_OBS_* env
 # vars, so the crate is excluded from the Linux build. See the cfg(not(linux)) target deps
-# below and docs/LINUX_LIBOBS_PROVISIONING.md.
+# below.
 
 # Input capture: rdev is declared per-platform below (non-Linux only). Linux uses evdev
 # directly (src/input/evdev_backend.rs) -- rdev's X11 listen path cannot emit true mouse
@@ -77,7 +77,7 @@ libc = "0.2"
 
 # Runtime OBS binary bootstrapper. Excluded on Linux: the crate hard-`compile_error!`s
 # there, and Linux provisions libobs via a system install or relocatable bundle instead
-# (see src/capture/context.rs + docs/LINUX_LIBOBS_PROVISIONING.md).
+# (see src/capture/context.rs).
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
 # Input capture for macOS/Windows (Linux uses evdev instead).
@@ -96,12 +96,9 @@ atspi = { version = "0.30", default-features = false, features = ["connection", 
 # Only the XWayland/X11 focus path uses it; the Wayland-native focus signal is separate.
 # See src/capture/frontmost.rs::get_frontmost_app_x11.
 x11rb = "0.13"
-# Wayland follow-focus provider for wlroots compositors (sway/Hyprland/river/...):
-# binds zwlr_foreign_toplevel_manager_v1 and reports the `activated` toplevel's app_id.
-# Complete coverage (all apps, no a11y dependency). zbus (via atspi) carries the GNOME
-# provider; these carry the wlroots one. See src/capture/focus/.
+# Wayland client used to enumerate outputs/monitors for full-screen capture
+# (src/capture/wayland_output.rs).
 wayland-client = "0.31"
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # Ed25519 verification for the in-app auto-updater (src/ui/updater_linux.rs). Verifies the
 # signed update manifest with the SAME raw-Ed25519 key as macOS Sparkle's SUPublicEDKey, so the
 # existing keypair is reused. Pure-Rust, no C linkage.
@@ -135,7 +132,29 @@ cargo-obs-build = { git = "https://github.com/p-doom/libobs-rs", branch = "linux
 [target.'cfg(target_os = "linux")'.build-dependencies]
 pkg-config = "0.3"
 
+# `cargo build --release` is BOTH the everyday iteration build and the shippable
+# artifact (install.sh ships target/release/crowd-cast-agent).
+#
+# LTO and codegen-units=1 were intentionally REMOVED. For this app they cost ~5 min
+# per incremental build but buy ~nothing: the heavy encode/capture work lives in
+# prebuilt libobs (C), not our Rust crate, so cross-crate Rust LTO has almost no hot
+# path to optimize — and once stripped the no-LTO binary is the same ~19-20M as the
+# LTO one. So we keep parallel codegen + incremental caching for ~3s incremental
+# rebuilds, plus strip=true for a small shipped binary.
 [profile.release]
-lto = true
-codegen-units = 1
+opt-level = 2
+lto = false
+codegen-units = 256
+incremental = true
 strip = true
+
+# Plain `cargo build` / `cargo run` — the fastest possible loop (even quicker than
+# --release). Our crate is built unoptimized; dependencies are optimized once and
+# cached so the debug binary stays usable at runtime.
+[profile.dev]
+opt-level = 0
+debug = 1            # line-table-only debuginfo: smaller & faster to emit than full
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

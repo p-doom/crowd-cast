@@ -98,8 +98,28 @@ CROWD_CAST_API_GATEWAY_URL="https://your-api-gateway.execute-api.region.amazonaw
 ./target/release/crowd-cast-agent --setup
 ```
 
+> **Build speed:** `cargo build --release` is tuned for fast incremental rebuilds
+> (~seconds, not minutes) — LTO is off because it costs minutes and buys nothing for
+> this libobs-backed app. For an even quicker loop use `cargo run` (debug).
+
 On macOS, `build.rs` automatically installs OBS binaries via `cargo-obs-build` during
 `cargo build`. Set `CROWD_CAST_SKIP_OBS_INSTALL=1` to skip this behavior.
+
+On **Linux** there is no automatic OBS install, so the linker has to be told where
+`libobs` lives — otherwise the build fails at link time with
+`rust-lld: error: unable to find library -lobs`. Set `LIBOBS_PATH` to a directory
+that contains `libobs.so` (the unversioned linker symlink), built for the OBS ABI in
+`CROWD_CAST_OBS_ABI` (default `32.0.2`):
+
+```bash
+# Linux build
+LIBOBS_PATH=/path/to/obs/usr/lib \
+CROWD_CAST_API_GATEWAY_URL="https://your-api-gateway.execute-api.region.amazonaws.com/prod/presign" \
+  cargo build --release
+```
+
+`cargo check` does not link, so it will not catch a missing or wrong `LIBOBS_PATH` —
+only `cargo build`/`run` will.
 
 ## Platform-Specific Setup
 

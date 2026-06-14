@@ -203,8 +203,7 @@ fn list_running_apps_x11() -> Vec<AppInfo> {
 }
 
 /// Wayland: enumerate currently-open windows' applications by the identity the compositor
-/// reports — the focus provider's `app_id`/`wm_class` (GNOME: the extension's `ListWindows`
-/// D-Bus method; wlroots: its tracked `zwlr_foreign_toplevel` set). This is the SAME
+/// reports — the GNOME focus extension's `ListWindows` D-Bus method (`wm_class`). This is the SAME
 /// `get_wm_class()`/`app_id` value the gate matches against (`should_capture_app`), so the
 /// wizard's app list and runtime gating agree **by construction** — no `.desktop`/`wm_class`
 /// heuristic that could disagree (e.g. Chrome's `StartupWMClass` `Google-chrome` vs the

@@ -83,6 +83,14 @@ pub struct CaptureContext {
     /// on an actual change. Empty off GNOME Wayland.
     #[cfg(target_os = "linux")]
     gnome_bound_window: HashMap<String, u64>,
+    /// GNOME Wayland follow-focus: the window-id whose bind last *failed* per app (bundle_id →
+    /// window-id). Without this, a failing bind (e.g. the obs-pipewire capture source is not
+    /// registered because the active portal advertises monitor-only) would be retried on every
+    /// focus poll — recreating and leaking a scene + Mutter session ~10×/s. We record the failed
+    /// window-id and skip re-attempting it; cleared on a successful bind and on capture
+    /// reconfigure. Empty off GNOME Wayland.
+    #[cfg(target_os = "linux")]
+    gnome_bind_failed: HashMap<String, u64>,
     /// Recording output
     recording: Option<RecordingOutput>,
     /// Current recording session info
@@ -111,8 +119,8 @@ impl CaptureContext {
 
         // Bootstrap OBS binaries (download if not present).
         // Linux does NOT use the bootstrapper: libobs is provided by a system OBS install
-        // or a relocatable bundle located via CROWD_CAST_OBS_* env vars (see
-        // `obs_startup_paths_from_env` and docs/LINUX_LIBOBS_PROVISIONING.md).
+        // or a relocatable bundle located via CROWD_CAST_OBS_* env vars
+        // (see `obs_startup_paths_from_env`).
         #[cfg(not(target_os = "linux"))]
         {
             let bootstrap_result = Self::bootstrap_obs().await?;
@@ -175,6 +183,8 @@ impl CaptureContext {
             gnome_screencast: None,
             #[cfg(target_os = "linux")]
             gnome_bound_window: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            gnome_bind_failed: HashMap::new(),
             recording: None,
             current_session: None,
             state: Arc::new(RwLock::new(CaptureState::default())),
@@ -369,6 +379,7 @@ impl CaptureContext {
         {
             self.gnome_screencast = None;
             self.gnome_bound_window.clear();
+            self.gnome_bind_failed.clear();
         }
         self.capture_sources.clear();
         self.scene = None;
@@ -602,11 +613,41 @@ impl CaptureContext {
             .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
 
         if target_apps.is_empty() {
+            // Wayland: the portal "choose a screen" picker pops on create — on wlroots/sway
+            // it's a bare slurp crosshair with no label — so cue the user what it's for, but
+            // only when a picker is actually expected (no saved restore token; a valid token
+            // restores the same output silently). Best-effort + synchronous so the cue lands
+            // before the crosshair; a no-op when no notification daemon is running.
+            #[cfg(target_os = "linux")]
+            let source = {
+                let display_token = restore_tokens
+                    .get(super::sources::DISPLAY_CAPTURE_KEY)
+                    .map(|s| s.as_str());
+                if super::sources::is_wayland_session()
+                    && display_token.map(|t| t.is_empty()).unwrap_or(true)
+                {
+                    crate::ui::notify_linux::notify_blocking(
+                        "crowd-cast — choose a screen",
+                        "Click the monitor you want to share in the selector that appears next.",
+                    );
+                    info!("Prompting portal monitor pick for display capture");
+                }
+                ScreenCaptureSource::new_display_capture(
+                    context,
+                    &mut scene,
+                    "screen_capture",
+                    capture_audio,
+                    display_token,
+                )
+                .context("Failed to create screen capture source")?
+            };
+            #[cfg(not(target_os = "linux"))]
             let source = ScreenCaptureSource::new_display_capture(
                 context,
                 &mut scene,
                 "screen_capture",
                 capture_audio,
+                None,
             )
             .context("Failed to create screen capture source")?;
             capture_sources.push(source);
@@ -1083,14 +1124,27 @@ impl CaptureContext {
             return Ok(false); // already showing the focused window
         }
 
+        // Don't re-attempt a window-id we already failed to bind this session. A failure is
+        // usually permanent for the session (e.g. the obs-pipewire capture source isn't
+        // registered because the active portal advertises monitor-only), so without this guard
+        // the caller — which runs every focus poll — would recreate and leak a scene + Mutter
+        // session ~10×/s. The marker is cleared on a successful bind and on capture reconfigure,
+        // and is keyed by window-id so focusing a *different* window still retries.
+        if self.gnome_bind_failed.get(bundle_id) == Some(&window_id) {
+            return Ok(false);
+        }
+
         // Fresh Mutter node for the focused window, brought up before the old session is
         // stopped (make-before-break — the old node stays alive until the re-point lands).
-        let node = self
-            .gnome_screencast
-            .as_ref()
-            .unwrap()
-            .record_window(window_id)
-            .map_err(|e| anyhow::anyhow!("Mutter RecordWindow(id={window_id}) for '{bundle_id}': {e}"))?;
+        let node = match self.gnome_screencast.as_ref().unwrap().record_window(window_id) {
+            Ok(node) => node,
+            Err(e) => {
+                self.gnome_bind_failed.insert(bundle_id.to_string(), window_id);
+                return Err(anyhow::anyhow!(
+                    "Mutter RecordWindow(id={window_id}) for '{bundle_id}': {e}"
+                ));
+            }
+        };
 
         if self.app_scenes.contains_key(bundle_id) {
             // Re-point IN PLACE: update the existing source's ConnectNode. The patched
@@ -1115,13 +1169,27 @@ impl CaptureContext {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("OBS context not initialized"))?;
             let source_name = format!("app_capture_{}", bundle_id);
-            let source = ScreenCaptureSource::new_window_node_capture(
+            let source = match ScreenCaptureSource::new_window_node_capture(
                 context,
                 &mut scene,
                 &source_name,
                 bundle_id,
                 node,
-            )?;
+            ) {
+                Ok(source) => source,
+                Err(e) => {
+                    // Bind failed: drop the just-created scene and stop the Mutter session we
+                    // brought up so a failure doesn't leak a scene + node, and remember the
+                    // window-id so the caller stops re-attempting it every poll (fail closed).
+                    drop(scene);
+                    self.gnome_screencast.as_ref().unwrap().stop_window(window_id);
+                    self.gnome_bind_failed.insert(bundle_id.to_string(), window_id);
+                    return Err(e.context(format!(
+                        "GNOME per-app capture: binding window {window_id} for '{bundle_id}' \
+                         failed (is the obs-pipewire capture source available?)"
+                    )));
+                }
+            };
             // If this app is already the active capture target (e.g. a start-path switch put
             // it active while it had no scene), activate the freshly-created scene now so it
             // doesn't stay blank — the app-switch machinery would short-circuit otherwise.
@@ -1136,6 +1204,9 @@ impl CaptureContext {
         }
 
         self.gnome_bound_window.insert(bundle_id.to_string(), window_id);
+        // Bound successfully (created or re-pointed) — clear any prior failure marker so a later
+        // genuine failure on this app isn't suppressed.
+        self.gnome_bind_failed.remove(bundle_id);
         self.update_capture_state_flags();
         Ok(true)
     }
@@ -1477,8 +1548,6 @@ fn self_provisioned_startup_paths() -> Option<StartupPaths> {
 ///      so the bare binary needs no env/wrapper.
 ///   3. `None` -> `StartupInfo::default()`, which points libobs-wrapper at a system OBS install
 ///      (`/usr/share/obs/libobs` + `/usr/lib/<arch>/obs-plugins`).
-///
-/// The relocatable-bundle layout is defined in docs/LINUX_LIBOBS_PROVISIONING.md.
 #[cfg(target_os = "linux")]
 fn obs_startup_paths_from_env() -> Option<StartupPaths> {
     if let (Ok(data), Ok(plugin_bin), Ok(plugin_data)) = (

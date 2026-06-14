@@ -20,6 +20,12 @@ pub enum Severity {
     Recommended = 1,
     /// Informational; shown but does not block.
     Optional = 2,
+    /// A must-fix problem rendered in red (the red analogue of a green "OK"), but which does
+    /// NOT disable the wizard's Finish button — it is resolved outside the wizard (run the
+    /// shown command) or avoided by toggling the related option, and the agent's own launch
+    /// gate enforces it. Used for "start-on-login is enabled but the autostart line is
+    /// missing" on wlroots compositors.
+    Blocking = 3,
 }
 
 /// A single host requirement and whether it is currently met.
@@ -120,6 +126,55 @@ fn install_cmd(pkg: Pkg, packages: &[String]) -> String {
 // ===========================================================================
 // Compositor / portal-backend detection
 // ===========================================================================
+
+/// The officially-supported session in use, if any.
+///
+/// crowd-cast currently supports exactly two Linux sessions:
+/// - **GNOME on Wayland** — picker-free per-app (application) capture via Mutter ScreenCast.
+/// - **sway** — full-screen capture only (no per-app picker on wlroots).
+///
+/// Everything else — X11, KDE, other wlroots compositors (Hyprland/river/...), or no
+/// graphical session — is unsupported. Per the "no fallbacks" design law we don't silently
+/// degrade onto those; the launch gate (see [`is_supported_session`]) fails closed instead.
+/// Returns the display name of the supported session, or `None` when unsupported.
+fn supported_session() -> Option<&'static str> {
+    let wayland = !env("WAYLAND_DISPLAY").is_empty() || env("XDG_SESSION_TYPE") == "wayland";
+    if !wayland {
+        return None;
+    }
+    // XDG_CURRENT_DESKTOP/XDG_SESSION_DESKTOP are authoritative when set; only fall back to the
+    // sway-specific socket when neither is set. sway exports SWAYSOCK into the systemd/dbus user
+    // environment, where it can persist into a *later* GNOME/KDE login, so SWAYSOCK alone must
+    // never classify a full desktop environment as sway. This mirrors the authority rule in
+    // `capture::focus::is_wlroots`, so the launch gate and the focus router agree on the session.
+    let d = format!(
+        "{} {}",
+        env("XDG_CURRENT_DESKTOP").to_lowercase(),
+        env("XDG_SESSION_DESKTOP").to_lowercase()
+    );
+    let d = d.trim();
+    if !d.is_empty() {
+        if d.contains("gnome") {
+            return Some("GNOME (Wayland)");
+        }
+        if d.contains("sway") {
+            return Some("sway");
+        }
+        return None;
+    }
+    // Neither desktop variable set (bare sway session): the sway socket is the only signal.
+    if !env("SWAYSOCK").is_empty() {
+        return Some("sway");
+    }
+    None
+}
+
+/// Whether this session is one crowd-cast officially supports (GNOME on Wayland or sway).
+/// The agent gates startup on this (fail closed) so it never runs in an environment we
+/// don't support; see [`supported_session`].
+pub fn is_supported_session() -> bool {
+    supported_session().is_some()
+}
 
 fn desktop() -> String {
     let d = env("XDG_CURRENT_DESKTOP").to_lowercase();
@@ -332,8 +387,10 @@ fn screencast_dbus_available() -> Option<bool> {
 /// Whether crowd-cast can do per-app (per-window) capture on this host.
 ///
 /// Two backends:
-/// - **Wayland**: xdg-desktop-portal ScreenCast advertising WINDOW capture (bit 2 of
-///   AvailableSourceTypes). GNOME/KDE do; wlroots/sway report MONITOR only.
+/// - **Wayland**: only GNOME, via the private Mutter ScreenCast API (picker-free per-app).
+///   This is NOT the xdg-desktop-portal WINDOW source — GNOME's portal advertises MONITOR-only
+///   `AvailableSourceTypes`, and sway/other wlroots have no per-app source at all — so the
+///   portal bit is the wrong signal here; we key on the session being GNOME Wayland instead.
 /// - **Pure X11**: XComposite per-window capture, gated on an EWMH-capable WM and the X
 ///   Composite extension (see `capture::x11_windows`).
 ///
@@ -344,8 +401,8 @@ pub fn per_app_capture_available() -> bool {
     window_capture_supported()
 }
 
-/// Whether the active session can capture individual windows — via the Wayland ScreenCast
-/// portal (WINDOW bit) or, on a pure X11 session, via XComposite.
+/// Whether the active session can capture individual windows — on GNOME Wayland via the
+/// private Mutter ScreenCast API, or on a pure X11 session via XComposite.
 pub fn window_capture_supported() -> bool {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var("XDG_SESSION_TYPE")
@@ -362,66 +419,19 @@ pub fn window_capture_supported() -> bool {
             return false;
         }
     }
-    // AvailableSourceTypes bitmask: 1=MONITOR, 2=WINDOW, 4=VIRTUAL.
-    available_source_types().map(|t| t & 2 != 0).unwrap_or(false)
-}
-
-/// Query the ScreenCast portal's `AvailableSourceTypes` property over D-Bus (busctl or
-/// gdbus). Returns None if the portal isn't reachable or neither tool is present.
-fn available_source_types() -> Option<u32> {
-    fn last_int(s: &str) -> Option<u32> {
-        s.split(|c: char| !c.is_ascii_digit())
-            .filter(|t| !t.is_empty())
-            .last()
-            .and_then(|t| t.parse().ok())
+    // Wayland: per-app (window) capture exists only on GNOME, via the private Mutter
+    // ScreenCast API (see `capture::is_gnome_wayland`). We must NOT consult the xdg portal's
+    // AvailableSourceTypes WINDOW bit here: GNOME advertises MONITOR-only there yet still does
+    // per-app via Mutter, and sway/other wlroots have no per-app source. Keying on the
+    // session keeps this in agreement with how the capture layer actually routes per-app.
+    #[cfg(target_os = "linux")]
+    {
+        crate::capture::is_gnome_wayland()
     }
-    if which_exists("busctl") {
-        if let Ok(o) = Command::new("timeout")
-            .arg("5")
-            .arg("busctl")
-            .args([
-                "--user",
-                "get-property",
-                "org.freedesktop.portal.Desktop",
-                "/org/freedesktop/portal/desktop",
-                "org.freedesktop.portal.ScreenCast",
-                "AvailableSourceTypes",
-            ])
-            .output()
-        {
-            if o.status.success() {
-                if let Some(v) = last_int(&String::from_utf8_lossy(&o.stdout)) {
-                    return Some(v);
-                }
-            }
-        }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
-    if which_exists("gdbus") {
-        if let Ok(o) = Command::new("timeout")
-            .arg("5")
-            .arg("gdbus")
-            .args([
-                "call",
-                "--session",
-                "--dest",
-                "org.freedesktop.portal.Desktop",
-                "--object-path",
-                "/org/freedesktop/portal/desktop",
-                "--method",
-                "org.freedesktop.DBus.Properties.Get",
-                "org.freedesktop.portal.ScreenCast",
-                "AvailableSourceTypes",
-            ])
-            .output()
-        {
-            if o.status.success() {
-                if let Some(v) = last_int(&String::from_utf8_lossy(&o.stdout)) {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    None
 }
 
 fn pipewire_running() -> bool {
@@ -585,13 +595,64 @@ fn focus_provider_requirement() -> Requirement {
     }
 }
 
-/// Collect the host requirements for the current Linux session.
-pub fn collect() -> Vec<Requirement> {
+/// Autostart-on-login surface for wlroots compositors (sway/Hyprland/river/...), which do
+/// not run XDG autostart entries. When `autostart_desired` (the user enabled start-on-login)
+/// and the line is missing, it's a red, must-fix `Blocking` item; otherwise it's `Optional`.
+/// The `command` is a ready-to-run, idempotent one-liner that adds the line. `None` on
+/// XDG-autostart desktops (GNOME/KDE/XFCE) and X11, where autostart is fully automatic.
+fn wlroots_autostart_requirement(autostart_desired: bool) -> Option<Requirement> {
+    let m = crate::installer::autostart::linux_manual_autostart()?;
+    let satisfied = crate::installer::autostart::is_autostart_enabled();
+    let severity = if !satisfied && autostart_desired {
+        Severity::Blocking
+    } else {
+        Severity::Optional
+    };
+    Some(Requirement {
+        label: "Autostart on login".into(),
+        detail: if satisfied {
+            String::new()
+        } else {
+            format!(
+                "For autostart on {}, run this (or untick \"Start crowd-cast on login\"):",
+                m.compositor
+            )
+        },
+        command: if satisfied { String::new() } else { m.command },
+        severity,
+        satisfied,
+    })
+}
+
+/// Collect the host requirements for the current Linux session. `autostart_desired` is the
+/// saved start-on-login preference; it only affects how prominently the (never Finish-gating)
+/// autostart item is shown — red `Blocking` when desired-but-missing, else grey `Optional`.
+pub fn collect(autostart_desired: bool) -> Vec<Requirement> {
     let pkg = detect_pkg();
     let wayland = !env("WAYLAND_DISPLAY").is_empty() || env("XDG_SESSION_TYPE") == "wayland";
     let x11 = !env("DISPLAY").is_empty();
 
     let mut reqs = Vec::new();
+
+    // 0. Supported desktop session. crowd-cast officially supports only GNOME on Wayland
+    // (application capture) and sway (full-screen capture) for now. Gate setup closed on
+    // anything else -- X11, KDE, other wlroots compositors, or no graphical session -- so the
+    // agent never runs in an environment we don't support. Required, no fallback: this is the
+    // launch gate, and it hard-blocks Finish until the user is in a supported session.
+    let session = supported_session();
+    reqs.push(Requirement {
+        label: "Supported desktop session (GNOME on Wayland, or sway)".into(),
+        detail: if session.is_some() {
+            String::new()
+        } else {
+            "crowd-cast currently supports only GNOME on Wayland (application capture) and sway \
+             (full-screen capture). Log into a GNOME (Wayland) or sway session to continue."
+                .into()
+        },
+        command: String::new(),
+        severity: Severity::Required,
+        satisfied: session.is_some(),
+    });
 
     // 1. GPU render node.
     let gpu = gpu_render_node();
@@ -669,7 +730,10 @@ pub fn collect() -> Vec<Requirement> {
     // compositors expose it natively (wlr-foreign-toplevel / KWin) or via EWMH on X11.
     reqs.push(focus_provider_requirement());
 
-    // 3. input group (evdev input capture).
+    // 3. input group (evdev input capture). Required, not optional: crowd-cast records input
+    // via evdev on X11 and Wayland alike (see input::create_input_backend), and there is no
+    // fallback when /dev/input/event* isn't readable -- gate setup on it rather than run on
+    // and silently record no input.
     let input = in_input_group();
     reqs.push(Requirement {
         label: "Input capture ('input' group)".into(),
@@ -679,7 +743,7 @@ pub fn collect() -> Vec<Requirement> {
             "Add yourself to the 'input' group, then log out and back in.".into()
         },
         command: if input { String::new() } else { "sudo usermod -aG input $USER".into() },
-        severity: Severity::Recommended,
+        severity: Severity::Required,
         satisfied: input,
     });
 
@@ -697,6 +761,12 @@ pub fn collect() -> Vec<Requirement> {
         satisfied: va,
     });
 
+    // 5. Autostart on login: on wlroots compositors this needs a manual config line (no XDG
+    // autostart support); surface the exact line. Optional, so it never gates Finish.
+    if let Some(req) = wlroots_autostart_requirement(autostart_desired) {
+        reqs.push(req);
+    }
+
     reqs
 }
 
@@ -704,7 +774,9 @@ pub fn collect() -> Vec<Requirement> {
 /// wizard on every launch (not just first run), so a later-broken/uninstalled
 /// component (e.g. the ScreenCast portal) re-surfaces the gated wizard.
 pub fn has_unmet_required() -> bool {
-    collect()
+    // The autostart item is never `Required` (it never gates Finish), so the
+    // `autostart_desired` value is irrelevant here.
+    collect(false)
         .iter()
         .any(|r| r.severity == Severity::Required && !r.satisfied)
 }

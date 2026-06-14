@@ -2,7 +2,7 @@
 # crowd-cast Linux installer — no-root, user-space install into ~/.local.
 #
 # Lays out exactly what the self-provisioning binary expects (see
-# docs/LINUX_LIBOBS_PROVISIONING.md + src/capture/context.rs):
+# src/capture/context.rs):
 #   ~/.local/bin/crowd-cast-agent                      (the binary; RUNPATH-relative to the bundle)
 #   ~/.local/share/crowd-cast/obs/<abi>/usr/...        (the relocatable libobs bundle)
 #   ~/.local/share/applications/crowd-cast.desktop     (menu entry)

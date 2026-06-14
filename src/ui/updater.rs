@@ -117,6 +117,11 @@ impl UpdaterController {
             // is_available() is true and the tray loop begins driving checks.
             self.started = true;
             info!("Linux auto-updater initialized");
+            // If a prior self-update re-exec'd into this version, tell the user (mirror of macOS
+            // calling check_post_update_notification right after a successful Sparkle init).
+            if let Some(u) = &self.linux {
+                u.check_post_update_notification();
+            }
         }
     }
 

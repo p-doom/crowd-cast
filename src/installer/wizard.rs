@@ -128,7 +128,19 @@ pub fn run_wizard(config: &mut Config) -> Result<WizardResult> {
     if autostart_enabled {
         let autostart_config = crate::installer::autostart::AutostartConfig::default();
         match crate::installer::autostart::enable_autostart(&autostart_config) {
-            Ok(_) => println!("\n[OK] Autostart enabled.\n"),
+            Ok(_) => {
+                // wlroots compositors (sway/Hyprland/...) don't run XDG autostart entries, so
+                // print the exact line the user must paste rather than claiming it's enabled.
+                #[cfg(target_os = "linux")]
+                if let Some(m) = crate::installer::autostart::linux_manual_autostart() {
+                    println!("\nFor autostart on {}, run this (or disable start-on-login):\n", m.compositor);
+                    println!("    {}\n", m.command);
+                } else {
+                    println!("\n[OK] Autostart enabled.\n");
+                }
+                #[cfg(not(target_os = "linux"))]
+                println!("\n[OK] Autostart enabled.\n");
+            }
             Err(e) => println!("\n[Warning] Failed to enable autostart: {}\n", e),
         }
     } else {

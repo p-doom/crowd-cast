@@ -5,7 +5,7 @@
 //!
 //! * **Feed**: one Ed25519-signed JSON manifest (vs. Sparkle's signed appcast). The
 //!   manifest covers BOTH artifacts — the small per-release binary and the rarely-changing
-//!   relocatable libobs bundle (see `docs/LINUX_LIBOBS_PROVISIONING.md`). Because the whole
+//!   relocatable libobs bundle. Because the whole
 //!   payload is small (~5 MB binary + ~17 MB bundle), we do NOT model separate "binary-only"
 //!   vs "bundle-wide" update channels: it's one atomic versioned release, and we simply fetch
 //!   whichever artifact's hash differs from what's installed (so "binary-only" falls out of a
@@ -194,6 +194,19 @@ fn state_path() -> Result<PathBuf> {
     Ok(data_root()?.join("update-state.json"))
 }
 
+/// Marker recording the binary version this machine last *ran*. Compared on the next launch so a
+/// self-update can fire a "you were updated" toast — the Linux analog of the macOS `last_build`
+/// marker checked in `UpdaterController::check_post_update_notification`.
+fn last_run_version_path() -> Result<PathBuf> {
+    Ok(data_root()?.join("last-run-version"))
+}
+
+/// Whether a version change between the previously-recorded run and now warrants a post-update
+/// notification. Pure (unit-tested): never notify on first run (empty marker) or when unchanged.
+fn should_notify_post_update(previous: &str, current: &str) -> bool {
+    !previous.is_empty() && previous != current
+}
+
 impl InstalledState {
     fn load() -> Self {
         match state_path().ok().and_then(|p| std::fs::read(p).ok()) {
@@ -252,7 +265,7 @@ fn extract_bundle(archive: &Path, dest: &Path) -> Result<()> {
         std::fs::remove_dir_all(dest).ok();
     }
     std::fs::create_dir_all(dest)?;
-    // GNU tar with zstd. The bundle tarball roots at `usr/` (see docs/LINUX_LIBOBS_PROVISIONING.md).
+    // GNU tar with zstd. The bundle tarball roots at `usr/`.
     let status = Command::new("tar")
         .arg("--zstd")
         .arg("-xf")
@@ -400,6 +413,40 @@ impl LinuxUpdater {
             if let Ok(mut g) = self.shared.staged.lock() {
                 *g = None;
             }
+        }
+    }
+
+    /// One-shot at startup (called from `UpdaterController::start`, the mirror of where macOS calls
+    /// `check_post_update_notification`): if the running binary's version differs from the version
+    /// recorded on the previous run, we were just self-updated and re-exec'd — fire the "you were
+    /// updated" toast. Always records the current version so the next launch has a baseline; never
+    /// notifies on first run. Mirrors the macOS `last_build` marker, keyed on the binary's own
+    /// `CARGO_PKG_VERSION` (no separate build number on Linux).
+    pub fn check_post_update_notification(&self) {
+        let marker = match last_run_version_path() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Auto-update: cannot resolve post-update marker path: {e:#}");
+                return;
+            }
+        };
+
+        let previous = std::fs::read_to_string(&marker).unwrap_or_default();
+        let previous = previous.trim().to_string();
+
+        // Always record the current version (mirrors macOS always writing the build marker), so a
+        // later launch can detect the change exactly once.
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Err(e) = std::fs::write(&marker, CURRENT_VERSION) {
+            warn!("Auto-update: failed to write post-update marker {}: {e}", marker.display());
+        }
+
+        if should_notify_post_update(&previous, CURRENT_VERSION) {
+            info!("Auto-update: detected update {previous} -> {CURRENT_VERSION}; notifying");
+            // No separate build number on Linux; the version string carries the change.
+            super::show_update_completed_notification(CURRENT_VERSION, "");
         }
     }
 
@@ -591,6 +638,16 @@ mod tests {
             plan_update(&m, "1.0.4", &bundle_only),
             Plan { binary_changed: false, bundle_changed: true }
         );
+    }
+
+    #[test]
+    fn post_update_notify_only_on_change_after_first_run() {
+        // First run (no marker yet) never notifies, even though "current" is set.
+        assert!(!should_notify_post_update("", "1.0.4"));
+        // Unchanged version: no notification.
+        assert!(!should_notify_post_update("1.0.4", "1.0.4"));
+        // A real version change (the post-self-update re-exec case): notify.
+        assert!(should_notify_post_update("1.0.3", "1.0.4"));
     }
 
     #[test]

@@ -427,10 +427,12 @@ pub fn show_update_completed_notification(version: &str, build: &str) {
 /// Show update completed notification (non-macOS).
 #[cfg(not(target_os = "macos"))]
 pub fn show_update_completed_notification(version: &str, build: &str) {
-    let body = if version.is_empty() {
-        "A new version was installed in the background.".to_string()
-    } else {
-        format!("Updated to version {version} (build {build}).")
+    // Linux has no separate build number (the version carries the change), so omit "(build …)"
+    // when it's empty rather than rendering an ugly "(build )".
+    let body = match (version.is_empty(), build.is_empty()) {
+        (true, _) => "A new version was installed in the background.".to_string(),
+        (false, true) => format!("Updated to version {version}."),
+        (false, false) => format!("Updated to version {version} (build {build})."),
     };
     emit("CrowdCast Updated", &body);
 }

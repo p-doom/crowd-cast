@@ -146,6 +146,8 @@ static GtkWidget *make_req_row(const char *label, const char *detail,
         marker = "<span foreground='#c62828' weight='bold'>X</span>"; // red x
     } else if (severity == 1) {
         marker = "<span foreground='#f9a825' weight='bold'>!</span>"; // amber warn
+    } else if (severity == 3) {
+        marker = "<span foreground='#c62828' weight='bold'>X</span>"; // red x (Blocking: red, but not Finish-gating)
     } else {
         marker = "<span foreground='#888888'>-</span>"; // grey circle
     }
@@ -348,6 +350,9 @@ static void settings_collect_selection(SettingsCtx *ctx, bool capture_all,
 
 int wizard_run(WizardConfig *out) {
     if (!out) return 1;
+    // The caller seeds enable_autostart with the saved "start on login" preference; capture
+    // it before resetting the output so the checkbox can reflect the user's actual state.
+    bool autostart_initial = out->enable_autostart;
     out->capture_all = false;
     out->enable_autostart = false;
     out->selected_apps = NULL;
@@ -427,6 +432,7 @@ int wizard_run(WizardConfig *out) {
     build_addremove_section(content, dialog, FALSE, NULL, 0, required_unmet, &ctx);
 
     GtkWidget *autostart = gtk_check_button_new_with_label("Start crowd-cast on login");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart), autostart_initial);
     gtk_box_pack_start(GTK_BOX(content), autostart, FALSE, FALSE, 0);
 
     gtk_widget_show_all(dialog);

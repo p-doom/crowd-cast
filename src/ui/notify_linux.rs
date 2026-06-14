@@ -24,6 +24,16 @@ use tracing::warn;
 /// notification can never block the engine for long.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long the daemon should display each notification before auto-dismissing it, in
+/// milliseconds. We pass this explicitly rather than the spec's `-1` ("use the server's default
+/// policy") because that default is daemon-specific and not always "auto-dismiss": GNOME Shell
+/// expires `-1` notifications after a few seconds, but mako's `default-timeout` is `0` (never
+/// expire), so on bare wlroots every crowd-cast notification would pile up and stay on screen
+/// forever. All of our notifications are transient, informational banners (the macOS side shows
+/// them via UNUserNotificationCenter, which auto-dismisses too), so we own the lifetime here and
+/// give every daemon the same behavior. 5s mirrors the typical banner duration.
+const EXPIRE_TIMEOUT_MS: i32 = 5000;
+
 /// Caches a positive daemon probe so the common case costs one bus round-trip per process, not
 /// one per notification. Only ever flips false->true: a daemon that later dies just makes
 /// notifications best-effort no-ops, which is already how this module behaves.
@@ -140,7 +150,7 @@ async fn try_notify(summary: &str, body: &str) -> zbus::Result<()> {
                 body,
                 Vec::<&str>::new(),
                 hints,
-                -1i32,
+                EXPIRE_TIMEOUT_MS,
             ),
         )
         .await?;

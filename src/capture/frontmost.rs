@@ -155,13 +155,14 @@ fn is_wayland_session() -> bool {
 
 #[cfg(target_os = "linux")]
 fn get_frontmost_app_linux() -> Option<AppInfo> {
-    // Wayland: a complete-coverage focus provider (wlr-foreign-toplevel on wlroots, or the
-    // GNOME extension) maintains the focused app on its own thread. We deliberately do NOT
-    // use the X11 path here — under XWayland it would only ever see XWayland windows.
+    // Wayland: the GNOME focus extension maintains the focused app on its own thread. We
+    // deliberately do NOT use the X11 path here — under XWayland it would only ever see
+    // XWayland windows. (wlroots has no focus provider: it records full-screen, so the
+    // snapshot is empty there, which is correct for its capture-all mode.)
     if is_wayland_session() {
         crate::capture::focus::ensure_started();
-        // Canonical Wayland identity is the focus provider's `app_id` (wlroots) / `wm_class`
-        // (GNOME) — the SAME key the wizard stores in `target_apps` (resolved from each app's
+        // Canonical Wayland identity is the focus provider's `wm_class` (GNOME) — the SAME
+        // key the wizard stores in `target_apps` (resolved from each app's
         // `.desktop` `StartupWMClass`/id; see `apps.rs::list_installed_apps_wayland`), and what
         // `should_capture_app` compares against to gate input.
         //
