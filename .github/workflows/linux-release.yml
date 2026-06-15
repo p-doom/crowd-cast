@@ -116,6 +116,7 @@ jobs:
       - name: Generate + sign the appcast manifest
         env:
           ED_PRIVATE_KEY: ${{ secrets.CROWD_CAST_ED_PRIVATE_KEY }}
+          ED_PUBLIC_KEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
         run: |
           keyfile="$RUNNER_TEMP/ed25519.key"
           # shellcheck disable=SC2064
@@ -133,6 +134,17 @@ jobs:
             --signer "dist/cc-sign-manifest" \
             --key-file "$keyfile" \
             --out-dir dist
+          python3 - "${{ steps.ver.outputs.feed_url }}" "$ED_PUBLIC_KEY" \
+            packaging/linux/install.sh dist/install-linux.sh <<'PY'
+import pathlib, sys
+feed_url, pubkey, src, dest = sys.argv[1:]
+text = pathlib.Path(src).read_text(encoding="utf-8")
+text = text.replace("__CROWD_CAST_DEFAULT_FEED_URL__", feed_url)
+text = text.replace("__CROWD_CAST_UPDATE_PUBKEY__", pubkey)
+pathlib.Path(dest).write_text(text, encoding="utf-8")
+PY
+          chmod 0755 dist/install-linux.sh
+          cp assets/logo.png dist/logo.png
 
       # Prod only: re-attach the latest signed macOS (.dmg) and Windows (.exe) downloads so this
       # release — which becomes "Latest" — keeps working /releases/latest/download/ buttons for ALL
@@ -175,6 +187,8 @@ jobs:
           fail_on_unmatched_files: false
           files: |
             dist/crowd-cast-agent-x86_64
+            dist/install-linux.sh
+            dist/logo.png
             dist/CrowdCast.dmg
             dist/crowd-cast-setup.exe
 
