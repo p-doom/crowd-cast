@@ -1,0 +1,194 @@
+name: Linux Release
+
+# Manual trigger (Actions tab → "Run workflow", or `gh workflow run linux-release.yml`).
+# Mirrors windows-release.yml: marketing version comes from Cargo.toml, the AUTO build number
+# (github.run_number) makes every release strictly newer to the in-app updater (is_newer in
+# src/ui/updater_linux.rs compares version, then build number), so no manual version bump is needed.
+#
+# The Linux updater fetches a SIGNED JSON manifest ("appcast-linux.json" + .sig) — the Linux analog
+# of the mac/win Sparkle appcast. It is published to the SAME S3 bucket as appcast.xml/appcast-win.xml
+# and signed with the SAME Ed25519 key (CROWD_CAST_ED_PRIVATE_KEY); the public half is baked into the
+# binary as CROWD_CAST_UPDATE_PUBKEY. See docs and scripts/release-linux.sh.
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel (dev = isolated feed + pre-release + test upload prefix)"
+        type: choice
+        options: [dev, prod]
+        default: dev          # safe default: an accidental dispatch goes to dev, never prod
+      version_base:
+        description: "Marketing version (blank = Cargo.toml version)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # create the GitHub Release
+
+env:
+  OBS_ABI: "32.0.2"
+  S3_BUCKET: "crowd-cast-bucket"
+  # The feed is computed per channel in "Resolve versions": prod → appcast-linux.json (next to the
+  # mac/win appcasts), dev → appcast-linux-dev.json (isolated, mirrors mac's appcast-dev.xml). Both
+  # are fixed, mutable URLs clients poll; the matching URL is baked into the binary below.
+  # The libobs bundle is an ARTIFACT hosted in its own per-ABI Release `obs-bundle-<abi>` (NOT S3,
+  # NOT re-uploaded per release). TODO(ops): publish it once:
+  #   gh release create obs-bundle-32.0.2 packaging/linux/out/obs-bundle-32.0.2-x86_64.tar.zst
+  # The libobs bundle is an ARTIFACT, so it lives in GitHub Releases (like the mac DMG / win .exe),
+  # NOT S3 — S3 only holds the feed. It's published once per ABI as its own Release `obs-bundle-<abi>`
+  # (the from-source build is 30-60 min and changes only on an ABI bump), so binary-only releases
+  # neither rebuild nor re-upload it; the manifest just points users at that stable per-ABI URL.
+  # TODO(ops): publish it once with `packaging/linux/run-build.sh` then
+  #   gh release create obs-bundle-32.0.2 packaging/linux/out/obs-bundle-32.0.2-x86_64.tar.zst
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # No host Rust toolchain: both the agent and the signer are built inside the AlmaLinux 9
+      # container (glibc floor + GTK3 + baked env), so the runner needs only Docker + awscli + python3.
+
+      - name: Resolve versions
+        id: ver
+        run: |
+          cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          base="${{ github.event.inputs.version_base }}"
+          [ -z "$base" ] && base="$cargo_ver"
+          build="${{ github.run_number }}"
+          channel="${{ github.event.inputs.channel }}"
+          bundle_url="https://github.com/${{ github.repository }}/releases/download/obs-bundle-${OBS_ABI}/obs-bundle-${OBS_ABI}-x86_64.tar.zst"
+          if [ "$channel" = "prod" ]; then
+            feed_key="appcast-linux.json"; tag="linux-v$base+$build"; prerelease="false"; upload_test=""
+          else
+            # dev: isolated feed + pre-release + clips routed to uploads/TEST_VERSION/ (CROWD_CAST_UPLOAD_TEST)
+            feed_key="appcast-linux-dev.json"; tag="linux-dev-v$base+$build"; prerelease="true"; upload_test="1"
+          fi
+          {
+            echo "marketing=$base"
+            echo "build=$build"
+            echo "channel=$channel"
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+            echo "feed_key=$feed_key"
+            echo "feed_url=https://${S3_BUCKET}.s3.amazonaws.com/${feed_key}"
+            echo "upload_test=$upload_test"
+            echo "bundle_url=$bundle_url"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the per-ABI libobs bundle (from its GitHub Release)
+        run: |
+          # Pull the already-published bundle for $OBS_ABI (Release `obs-bundle-<abi>`) — NOT rebuilt
+          # here. Staged in packaging/linux/out/ (the layout build-binary.sh reads) so the container
+          # build links against it for -lobs. The SAME file is hashed into the manifest, so the
+          # manifest's bundle.sha256 matches exactly what users download from this Release URL.
+          mkdir -p packaging/linux/out
+          curl -fSL "${{ steps.ver.outputs.bundle_url }}" \
+               -o "packaging/linux/out/obs-bundle-${OBS_ABI}-x86_64.tar.zst"
+
+      - name: Build agent + signer on the glibc floor (AlmaLinux 9 container)
+        env:
+          ENGINE: docker
+          CROWD_CAST_OBS_ABI: ${{ env.OBS_ABI }}
+          CROWD_CAST_BUILD_NUMBER: ${{ steps.ver.outputs.build }}
+          CROWD_CAST_API_GATEWAY_URL: ${{ secrets.CROWD_CAST_API_GATEWAY_URL }}
+          CROWD_CAST_GOOGLE_CLIENT_ID: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_ID }}
+          CROWD_CAST_GOOGLE_CLIENT_SECRET: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_SECRET }}
+          CROWD_CAST_UPDATE_FEED_URL: ${{ steps.ver.outputs.feed_url }}
+          # Reuses the SAME Ed25519 public key as mac/win (base64 of the 32-byte raw key).
+          CROWD_CAST_UPDATE_PUBKEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
+          # Empty on prod (build.rs ignores empty); "1" on dev → clips upload to uploads/TEST_VERSION/.
+          CROWD_CAST_UPLOAD_TEST: ${{ steps.ver.outputs.upload_test }}
+        run: |
+          # Builds in the same AlmaLinux 9 / glibc-2.34 image as the libobs bundle (run-build-binary.sh
+          # builds the image + runs build-binary.sh), so the shipped ELF runs cross-distro. Emits the
+          # agent AND the manifest signer to packaging/linux/out/. Clean CI checkout has no dev
+          # .cargo/config.toml, so the mold-linker overlay is skipped automatically.
+          packaging/linux/run-build-binary.sh
+          mkdir -p dist
+          cp "packaging/linux/out/crowd-cast-agent-x86_64"             "dist/crowd-cast-agent-x86_64"
+          cp "packaging/linux/out/cc-sign-manifest"                    "dist/cc-sign-manifest"
+          # Keep the bundle locally only to hash it into the manifest — it is NOT re-uploaded (it's
+          # already hosted in its per-ABI Release; the manifest points users there).
+          cp "packaging/linux/out/obs-bundle-${OBS_ABI}-x86_64.tar.zst" "dist/obs-bundle-${OBS_ABI}-x86_64.tar.zst"
+
+      - name: Generate + sign the appcast manifest
+        env:
+          ED_PRIVATE_KEY: ${{ secrets.CROWD_CAST_ED_PRIVATE_KEY }}
+        run: |
+          keyfile="$RUNNER_TEMP/ed25519.key"
+          # shellcheck disable=SC2064
+          trap "rm -f '$keyfile'" EXIT
+          printf '%s' "$ED_PRIVATE_KEY" > "$keyfile"
+          tag="${{ steps.ver.outputs.tag }}"
+          scripts/release-linux.sh \
+            --version "${{ steps.ver.outputs.marketing }}" \
+            --build "${{ steps.ver.outputs.build }}" \
+            --abi "$OBS_ABI" \
+            --binary "dist/crowd-cast-agent-x86_64" \
+            --bundle "dist/obs-bundle-${OBS_ABI}-x86_64.tar.zst" \
+            --download-base "https://github.com/${{ github.repository }}/releases/download/$tag" \
+            --bundle-url "${{ steps.ver.outputs.bundle_url }}" \
+            --signer "dist/cc-sign-manifest" \
+            --key-file "$keyfile" \
+            --out-dir dist
+
+      # Prod only: re-attach the latest signed macOS (.dmg) and Windows (.exe) downloads so this
+      # release — which becomes "Latest" — keeps working /releases/latest/download/ buttons for ALL
+      # platforms (mirrors windows-release.yml's carry-forward). It re-downloads already-signed
+      # artifacts; no Mac, no re-signing. Purely the human-download surface — every platform's
+      # auto-update feed points at its own immutable asset, so updates are untouched. Best-effort:
+      # never fail the Linux release over a carried download. Dev pre-releases skip this (never "Latest").
+      - name: Carry forward macOS + Windows downloads
+        if: steps.ver.outputs.channel == 'prod'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 30 --json tagName --jq '.[].tagName')
+          for spec in "CrowdCast.dmg" "crowd-cast-setup.exe"; do
+            found=""
+            for t in $tags; do
+              names=$(gh release view "$t" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null)
+              echo "$names" | grep -qx "$spec" && { found="$t"; break; }
+            done
+            if [ -n "$found" ]; then
+              gh release download "$found" --repo "$GITHUB_REPOSITORY" --pattern "$spec" --dir dist \
+                && echo "carried forward $spec from $found" || echo "skip: download failed for $spec"
+            else
+              echo "skip: no prior release has $spec yet (its button stays 404 until that platform ships)"
+            fi
+          done
+          set -e
+
+      - name: Create GitHub Release (linux binary + carried mac/win downloads)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          prerelease: ${{ steps.ver.outputs.prerelease }}
+          name: "crowd-cast (Linux ${{ steps.ver.outputs.channel }}) ${{ steps.ver.outputs.marketing }} build ${{ steps.ver.outputs.build }}"
+          # The Linux binary is built here; the libobs bundle stays in its per-ABI Release (the
+          # manifest points there, no re-upload); the dmg/exe are carried forward on prod only.
+          # fail_on_unmatched_files=false so dev (no carried dmg/exe) uploads just the binary.
+          fail_on_unmatched_files: false
+          files: |
+            dist/crowd-cast-agent-x86_64
+            dist/CrowdCast.dmg
+            dist/crowd-cast-setup.exe
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # Publish the feed LAST — once it's live, clients start updating, so the release asset
+      # (previous step) must already exist at its download URL. Key is per-channel (prod:
+      # appcast-linux.json, dev: appcast-linux-dev.json) so a dev run never overwrites the prod feed.
+      - name: Publish appcast manifest to S3
+        run: |
+          key="${{ steps.ver.outputs.feed_key }}"
+          aws s3 cp dist/appcast-linux.json     "s3://$S3_BUCKET/$key"
+          aws s3 cp dist/appcast-linux.json.sig "s3://$S3_BUCKET/$key.sig"
