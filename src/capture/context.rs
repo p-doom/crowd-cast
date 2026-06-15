@@ -91,6 +91,11 @@ pub struct CaptureContext {
     /// reconfigure. Empty off GNOME Wayland.
     #[cfg(target_os = "linux")]
     gnome_bind_failed: HashMap<String, u64>,
+    /// Multi-monitor per-app placement: the last MonitorFit applied to the active app's scene
+    /// item, keyed (app, scale.to_bits, pos_x.to_bits, pos_y.to_bits) so an unchanged transform
+    /// is a no-op rather than re-applied every focus poll. Linux only.
+    #[cfg(target_os = "linux")]
+    last_monitor_fit: Option<(String, u32, u32, u32)>,
     /// Recording output
     recording: Option<RecordingOutput>,
     /// Current recording session info
@@ -185,6 +190,8 @@ impl CaptureContext {
             gnome_bound_window: HashMap::new(),
             #[cfg(target_os = "linux")]
             gnome_bind_failed: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            last_monitor_fit: None,
             recording: None,
             current_session: None,
             state: Arc::new(RwLock::new(CaptureState::default())),
@@ -232,6 +239,28 @@ impl CaptureContext {
         .context("Failed to bootstrap OBS binaries")
     }
 
+    /// Pre-populate the target app list before [`initialize`](Self::initialize) so the capture
+    /// canvas can pick the multi-monitor per-app envelope vs the display-capture canvas (the
+    /// mode depends on whether any app is targeted). [`setup_capture`](Self::setup_capture) sets
+    /// the authoritative list later; this is idempotent with it.
+    pub fn set_target_apps(&mut self, target_apps: &[String]) {
+        self.target_apps = target_apps.to_vec();
+    }
+
+    /// Recording-canvas size. In single-active per-app mode on Linux this is the multi-monitor
+    /// 1080-short-edge envelope (so a window on any monitor fits its normalized slot — see
+    /// [`super::monitor_layout`]); otherwise (display / capture-all, and macOS) it's the main
+    /// display resolution. Fails closed on either path — never a guessed canvas.
+    fn canvas_size(&self) -> Result<(u32, u32)> {
+        #[cfg(target_os = "linux")]
+        if self.use_single_active_app_capture() {
+            return super::monitor_layout::capture_canvas_size()
+                .context("could not enumerate any monitor for the multi-monitor capture canvas");
+        }
+        get_main_display_resolution()
+            .context("could not detect display resolution; refusing to guess a canvas size")
+    }
+
     /// Initialize the libobs context (must be called from main thread on some platforms)
     ///
     /// This configures the video output based on `recording_config`:
@@ -245,11 +274,10 @@ impl CaptureContext {
 
         info!("Initializing libobs context...");
 
-        // Detect the real display resolution and fail closed — never initialize the capture
-        // canvas at a guessed size (no fallback; the canvas must reflect the real display).
-        let (base_width, base_height) = get_main_display_resolution()
-            .context("could not detect display resolution; refusing to initialize capture at a guessed canvas size")?;
-        debug!("Detected display resolution: {}x{}", base_width, base_height);
+        // Capture canvas: the multi-monitor 1080-short-edge envelope in single-active per-app
+        // mode on Linux, else the main display resolution. Fail closed — never a guessed size.
+        let (base_width, base_height) = self.canvas_size()?;
+        debug!("Capture canvas: {}x{}", base_width, base_height);
 
         // Calculate output dimensions (aspect-preserving, max height from config)
         let (output_width, output_height) = calculate_output_dimensions(
@@ -380,6 +408,7 @@ impl CaptureContext {
             self.gnome_screencast = None;
             self.gnome_bound_window.clear();
             self.gnome_bind_failed.clear();
+            self.last_monitor_fit = None;
         }
         self.capture_sources.clear();
         self.scene = None;
@@ -805,10 +834,9 @@ impl CaptureContext {
                 .context("Failed to stop recording before video reset")?;
         }
 
-        // Detect the new display resolution and fail closed (no guessed default).
-        let (base_width, base_height) = get_main_display_resolution()
-            .context("could not detect display resolution after video reset")?;
-        info!("New display resolution: {}x{}", base_width, base_height);
+        // Recompute the capture canvas (multi-monitor envelope in per-app mode) and fail closed.
+        let (base_width, base_height) = self.canvas_size()?;
+        info!("New capture canvas: {}x{}", base_width, base_height);
 
         // Calculate output dimensions
         let (output_width, output_height) = calculate_output_dimensions(
@@ -1207,8 +1235,104 @@ impl CaptureContext {
         // Bound successfully (created or re-pointed) — clear any prior failure marker so a later
         // genuine failure on this app isn't suppressed.
         self.gnome_bind_failed.remove(bundle_id);
+        // Re-point changes which window (and possibly which monitor) is captured, so the prior
+        // fit no longer applies; force a recompute on the next apply.
+        self.last_monitor_fit = None;
         self.update_capture_state_flags();
         Ok(true)
+    }
+
+    /// Multi-monitor per-app placement: draw the active app's captured window at its real
+    /// on-monitor position, scaled by its monitor's 1080-short-edge normalization (4K window
+    /// 0.5×, FHD 1.0×, ultrawide 0.75×, …), matching the Windows behaviour. Window + monitor
+    /// geometry comes from the GNOME focus extension (logical coords) or X11/RandR (physical);
+    /// the scene scale is derived from the captured buffer size, so HiDPI / fractional scaling
+    /// needs no trusted scale factor. De-duped via `last_monitor_fit`; a no-op until the source
+    /// has non-zero dimensions, and off single-active per-app mode. Safe to call every poll.
+    #[cfg(target_os = "linux")]
+    pub fn apply_monitor_fit_to_active(&mut self) {
+        use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
+        use libobs_wrapper::graphics::Vec2;
+        use libobs_wrapper::scenes::ObsTransformInfoBuilder;
+
+        if !self.use_single_active_app_capture() {
+            return;
+        }
+        let Some(app) = self.active_capture_app.clone() else {
+            return;
+        };
+        let Some((win, mon, monitor_scale)) = self.active_window_monitor_rects(&app) else {
+            return;
+        };
+        let Some(fit) = super::monitor_layout::fit_for_window(win, mon, monitor_scale) else {
+            return;
+        };
+
+        let key = (
+            app.clone(),
+            fit.scale.to_bits(),
+            fit.pos_x.to_bits(),
+            fit.pos_y.to_bits(),
+        );
+        if self.last_monitor_fit.as_ref() == Some(&key) {
+            return;
+        }
+
+        // Explicit transform: scaled by the monitor factor, positioned at the window's real
+        // on-monitor offset (canvas px), top-left aligned, no bounds.
+        let info = ObsTransformInfoBuilder::new()
+            .set_pos(Vec2::new(fit.pos_x, fit.pos_y))
+            .set_scale(Vec2::new(fit.scale, fit.scale))
+            .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
+            .set_bounds_type(ObsBoundsType::None)
+            .build(0, 0);
+
+        let applied = match self.app_scenes.get(&app) {
+            Some((scene, source)) => scene.set_transform_info(source.source(), &info).is_ok(),
+            None => false,
+        };
+        if applied {
+            debug!(
+                "monitor-fit '{}': scale {:.3} pos ({:.0},{:.0}) [mon {}x{} @{}x]",
+                app, fit.scale, fit.pos_x, fit.pos_y, mon.w, mon.h, monitor_scale
+            );
+            self.last_monitor_fit = Some(key);
+        }
+    }
+
+    /// The focused window's frame rect + its monitor's rect for `app`, in one coordinate space
+    /// (GNOME logical via the focus extension; X11 physical via RandR + window geometry). `None`
+    /// if geometry isn't resolvable right now — caller skips the fit and retries next poll.
+    #[cfg(target_os = "linux")]
+    fn active_window_monitor_rects(
+        &self,
+        app: &str,
+    ) -> Option<(super::monitor_layout::Rect, super::monitor_layout::Rect, f64)> {
+        use super::monitor_layout::Rect;
+        if let Some(gsc) = self.gnome_screencast.as_ref() {
+            let window_id = *self.gnome_bound_window.get(app)?;
+            let g = gsc.window_geometry(window_id)?;
+            if !g.found {
+                return None;
+            }
+            let win = Rect::new(g.win.0, g.win.1, g.win.2, g.win.3);
+            let mon = Rect::new(g.mon.0, g.mon.1, g.mon.2, g.mon.3);
+            return (mon.w > 0 && mon.h > 0).then_some((win, mon, g.scale));
+        }
+        // Pure X11: resolve the app's focused window and the RandR monitor it sits on. X11 has
+        // no per-monitor scaling, so the scale factor is 1.0 (logical == physical pixels).
+        if super::x11_windows::is_pure_x11_session() {
+            let wid: u32 = super::x11_windows::resolve_capture_window(app)?.parse().ok()?;
+            let (wx, wy, ww, wh) = super::x11_windows::x11_window_rect(wid)?;
+            let win = Rect::new(wx, wy, ww, wh);
+            let monitors: Vec<Rect> = super::x11_windows::x11_monitor_rects()?
+                .into_iter()
+                .map(|(x, y, w, h)| Rect::new(x, y, w, h))
+                .collect();
+            let mon = super::monitor_layout::monitor_containing(win, &monitors)?;
+            return Some((win, mon, 1.0));
+        }
+        None
     }
 
     /// Switch to a different app's pre-created scene.

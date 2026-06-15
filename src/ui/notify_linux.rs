@@ -7,15 +7,30 @@
 //! Requires a running notification daemon (GNOME/KDE provide one; on bare wlroots the user
 //! needs e.g. mako/dunst) — `service_available()` reports whether one is present.
 //!
-//! Delivery waits for the D-Bus call to flush (bounded by a timeout) rather than firing and
-//! forgetting: the agent restarts often (start, record, shut down, relaunch), and a detached
-//! send would be killed by process exit before the message reached the daemon, which is why
-//! notifications appeared to silently never show.
+//! ## One long-lived connection (do NOT make this per-notification)
+//! GNOME Shell's notification server destroys a notification the instant the *sending D-Bus
+//! connection* disconnects — but only when the notification resolved to an installed application
+//! (`FdoNotificationDaemonSource._onNameVanished`: `if (this.app) this.destroy()`; the carve-out
+//! exists so short-lived `notify-send` invocations don't linger). Our notifications carry
+//! `app_name = "crowd-cast"`, which the shell resolves to the installed `crowd-cast.desktop`, so a
+//! throwaway connection per send (open → Notify → drop) gets the notification torn down within
+//! milliseconds, before it is ever shown. We therefore send every notification over ONE connection
+//! that lives for the whole process (owned by a dedicated notifier thread): its bus name never
+//! vanishes while the agent runs, so the shell leaves the notification alone and it expires
+//! normally (see `EXPIRE_TIMEOUT_MS`). Confirmed against GNOME Shell 50.1 by reading the running
+//! `_onNameVanished` source and reproducing: a sender that holds its connection open displays and
+//! keeps the toast; a throwaway sender's toast is destroyed on disconnect.
+//!
+//! Edge case: a notification emitted in the last few seconds before the agent itself exits can
+//! still be torn down when the process — and thus this connection — goes away. Acceptable: the
+//! common case (start/stop/etc. while the agent keeps running) now works, which it never did.
 #![cfg(target_os = "linux")]
 
 use atspi::zbus;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::warn;
 
@@ -39,43 +54,105 @@ const EXPIRE_TIMEOUT_MS: i32 = 5000;
 /// notifications best-effort no-ops, which is already how this module behaves.
 static SERVICE_SEEN: AtomicBool = AtomicBool::new(false);
 
-/// Show a desktop notification (best-effort, async). Used directly by the async engine paths,
-/// which `.await` it so the send completes before they move on.
-pub async fn notify(summary: &str, body: &str) {
-    if let Err(e) = try_notify(summary, body).await {
-        // WARN, not DEBUG: the default log filter is `info`, so a debug line would be invisible
-        // and a silently-failing notification would be undiagnosable.
-        warn!("desktop notification failed (is a notification daemon running?): {e}");
+/// A notification handed to the notifier thread, plus a one-shot ack the caller waits on so it
+/// knows the D-Bus call has flushed (preserving the "delivered before process exit" guarantee).
+struct NotifyRequest {
+    summary: String,
+    body: String,
+    done: SyncSender<()>,
+}
+
+/// Channel to the long-lived notifier thread, started on first use. The thread owns the single
+/// persistent `zbus::Connection` (see the module docs) for the life of the process, so the sender
+/// bus name never vanishes mid-run.
+static NOTIFIER: OnceLock<Sender<NotifyRequest>> = OnceLock::new();
+
+fn notifier() -> &'static Sender<NotifyRequest> {
+    NOTIFIER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<NotifyRequest>();
+        if std::thread::Builder::new()
+            .name("cc-notify".into())
+            .spawn(move || notifier_loop(rx))
+            .is_err()
+        {
+            warn!("failed to spawn desktop-notification thread");
+        }
+        tx
+    })
+}
+
+/// Owns the persistent connection and services notification requests one at a time for the life of
+/// the process. Reusing the same connection is the whole point: its bus name stays registered, so
+/// GNOME Shell does not tear our notifications down on sender disconnect (see module docs). The
+/// connection object being held open keeps the socket — and thus the name — alive even between
+/// sends; the runtime only needs to be driven (via `block_on`) for the duration of each call.
+fn notifier_loop(rx: Receiver<NotifyRequest>) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            warn!("notify runtime build failed: {e}");
+            drain(rx);
+            return;
+        }
+    };
+
+    let conn = match rt.block_on(zbus::Connection::session()) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("desktop notifications unavailable (cannot open session bus): {e}");
+            drain(rx);
+            return;
+        }
+    };
+
+    for req in rx {
+        rt.block_on(async {
+            if let Err(e) = send(&conn, &req.summary, &req.body).await {
+                // WARN, not DEBUG: the default log filter is `info`, so a debug line would be
+                // invisible and a silently-failing notification would be undiagnosable.
+                warn!("desktop notification failed (is a notification daemon running?): {e}");
+            }
+        });
+        let _ = req.done.send(());
     }
 }
 
-/// Synchronous notification for the (sync) `notifications.rs` facade and the portal-picker cue.
-/// Runs the async send on a dedicated thread with its own current-thread runtime (so it never
-/// nests inside a caller's runtime) and WAITS for it to flush, up to `DELIVERY_TIMEOUT`. Waiting
-/// is what makes it survive the agent's frequent restarts: by the time this returns, the D-Bus
-/// message has been handed to the daemon, so an imminent process exit can't drop it.
-pub fn notify_blocking(summary: &str, body: &str) {
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
+/// Ack every pending request without sending, so callers waiting on the one-shot don't block for
+/// the full `DELIVERY_TIMEOUT` when the notifier couldn't start (no runtime / no bus).
+fn drain(rx: Receiver<NotifyRequest>) {
+    for req in rx {
+        let _ = req.done.send(());
+    }
+}
+
+/// Show a desktop notification (best-effort, async). Used by the async engine paths, which
+/// `.await` it so the send has flushed before they move on. Defers to the blocking submit on
+/// tokio's blocking pool so it never stalls the caller's async workers.
+pub async fn notify(summary: &str, body: &str) {
     let (summary, body) = (summary.to_string(), body.to_string());
-    let spawned = std::thread::Builder::new()
-        .name("cc-notify".into())
-        .spawn(move || {
-            match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt.block_on(notify(&summary, &body)),
-                Err(e) => warn!("notify runtime build failed: {e}"),
-            }
-            let _ = tx.send(());
-        });
-    if spawned.is_err() {
-        warn!("failed to spawn desktop-notification thread");
+    let _ = tokio::task::spawn_blocking(move || notify_blocking(&summary, &body)).await;
+}
+
+/// Synchronous notification for the (sync) `notifications.rs` facade and the portal-picker cue.
+/// Hands the request to the long-lived notifier thread and WAITS (up to `DELIVERY_TIMEOUT`) for it
+/// to flush, so an imminent process exit can't drop an in-flight send.
+pub fn notify_blocking(summary: &str, body: &str) {
+    let (done, ack) = sync_channel::<()>(1);
+    let req = NotifyRequest {
+        summary: summary.to_string(),
+        body: body.to_string(),
+        done,
+    };
+    if notifier().send(req).is_err() {
+        warn!("desktop notification dropped: notifier thread is not running");
         return;
     }
-    // If the daemon wedges, stop waiting after the timeout; the worker thread is left to finish
-    // (or die with the process). The common path completes in well under this.
-    if rx.recv_timeout(DELIVERY_TIMEOUT).is_err() {
+    // If the daemon wedges, stop waiting after the timeout; the notifier thread keeps the request
+    // (or dies with the process). The common path completes in well under this.
+    if ack.recv_timeout(DELIVERY_TIMEOUT).is_err() {
         warn!("desktop notification did not complete within {DELIVERY_TIMEOUT:?}");
     }
 }
@@ -127,10 +204,10 @@ async fn probe_service() -> bool {
         .unwrap_or(false)
 }
 
-async fn try_notify(summary: &str, body: &str) -> zbus::Result<()> {
-    let conn = zbus::Connection::session().await?;
+/// Post one notification over the shared, long-lived connection.
+async fn send(conn: &zbus::Connection, summary: &str, body: &str) -> zbus::Result<()> {
     let proxy = zbus::Proxy::new(
-        &conn,
+        conn,
         "org.freedesktop.Notifications",
         "/org/freedesktop/Notifications",
         "org.freedesktop.Notifications",

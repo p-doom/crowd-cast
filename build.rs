@@ -162,6 +162,18 @@ fn configure_updater() {
             println!("cargo:rustc-env=CROWD_CAST_UPDATE_PUBKEY={key}");
         }
     }
+
+    // Monotonic build number (the release workflow passes github.run_number). Baked so the
+    // updater can treat a same-marketing-version rebuild as "newer" and compare for newer-than
+    // rather than mere inequality — the Linux analog of Sparkle's <sparkle:version> build number.
+    // Defaults to 0 for dev builds (so a real release, build >= 1, always supersedes a dev build).
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_BUILD_NUMBER");
+    let build_number = std::env::var("CROWD_CAST_BUILD_NUMBER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0".to_string());
+    println!("cargo:rustc-env=CROWD_CAST_BUILD_NUMBER={build_number}");
 }
 
 fn configure_upload_endpoint() {
@@ -184,6 +196,18 @@ fn configure_upload_endpoint() {
     }
 
     println!("cargo:rustc-env=CROWD_CAST_API_GATEWAY_URL={endpoint}");
+
+    // Test-only flag: when set, the binary uploads clips to a segregated `uploads/TEST_VERSION/`
+    // prefix instead of the real `uploads/<crate-version>/` (see src/upload/presigned.rs). Explicit
+    // opt-in, NOT a fallback — prod builds leave it unset. A test build is announced loudly so it
+    // can never be mistaken for a shippable one.
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_UPLOAD_TEST");
+    // Enabled only on a NON-EMPTY value (matches the FEED_URL/PUBKEY handling above), so a workflow
+    // that passes an empty string for prod releases does NOT accidentally route clips to TEST_VERSION.
+    if std::env::var("CROWD_CAST_UPLOAD_TEST").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        println!("cargo:rustc-env=CROWD_CAST_UPLOAD_TEST=1");
+        println!("cargo:warning=TEST BINARY: clips upload to uploads/TEST_VERSION/ — NOT a shippable build");
+    }
 }
 
 #[cfg(target_os = "macos")]

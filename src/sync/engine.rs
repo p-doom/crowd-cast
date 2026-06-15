@@ -1073,6 +1073,12 @@ unintended app video."
             // switch. No-op off GNOME dynamic capture.
             #[cfg(target_os = "linux")]
             self.gnome_follow_focus(frontmost_app.as_deref(), should_capture);
+            // Multi-monitor per-app placement: position + scale the active app's window for the
+            // monitor it sits on (1080-short-edge normalized), matching the Windows behaviour.
+            // Session-agnostic (GNOME extension geometry / X11 RandR); de-duped and a no-op off
+            // single-active mode or until the source has dimensions.
+            #[cfg(target_os = "linux")]
+            self.capture_ctx.apply_monitor_fit_to_active();
             self.schedule_app_switch(desired_target.clone());
             self.apply_due_app_switch().await;
             self.rearm_capture_recovery_if_needed(should_capture, desired_target.as_deref());
@@ -2641,7 +2647,13 @@ unintended app video."
 
         self.send_status_force(EngineStatus::Paused);
 
-        if self.config.recording.notify_on_start_stop && notifications_authorized() {
+        // When the pause is idle-initiated, `handle_idle_timeout` shows the more specific
+        // "Recording paused (idle)" toast itself, so skip the generic one to avoid a double.
+        // (`idle_paused` is set true before `pause_recording()` runs; it's false for a user pause.)
+        if self.config.recording.notify_on_start_stop
+            && notifications_authorized()
+            && !self.idle_paused
+        {
             show_recording_paused_notification();
         }
 
@@ -2701,7 +2713,13 @@ unintended app video."
             self.send_status_force(EngineStatus::RecordingBlocked);
         }
 
-        if self.config.recording.notify_on_start_stop && notifications_authorized() {
+        // Same dedup as pause: on idle-resume, `resume_from_idle` shows "Recording resumed" itself
+        // (after this returns), so skip the generic one here. `idle_paused` is still true during
+        // this call — it's cleared only once `resume_recording()` returns.
+        if self.config.recording.notify_on_start_stop
+            && notifications_authorized()
+            && !self.idle_paused
+        {
             show_recording_resumed_notification();
         }
 
@@ -3042,6 +3060,12 @@ unintended app video."
             // switch. No-op off GNOME dynamic capture.
             #[cfg(target_os = "linux")]
             self.gnome_follow_focus(frontmost_app.as_deref(), should_capture);
+            // Multi-monitor per-app placement: position + scale the active app's window for the
+            // monitor it sits on (1080-short-edge normalized), matching the Windows behaviour.
+            // Session-agnostic (GNOME extension geometry / X11 RandR); de-duped and a no-op off
+            // single-active mode or until the source has dimensions.
+            #[cfg(target_os = "linux")]
+            self.capture_ctx.apply_monitor_fit_to_active();
             self.schedule_app_switch(desired_target.clone());
             self.apply_due_app_switch().await;
             self.rearm_capture_recovery_if_needed(should_capture, desired_target.as_deref());

@@ -41,9 +41,12 @@ pub fn is_pure_x11_session() -> bool {
 
 /// Whether this host can do XComposite per-window capture: a pure X11 session whose WM
 /// publishes `_NET_ACTIVE_WINDOW` (the focus hint we resolve against), with the X Composite
-/// extension present (required for the off-screen window pixmaps `xcomposite_input` reads).
-/// When false the wizard greys out the per-app picker (`requirements`), so we never enter the
-/// capture path on a host that can't satisfy it.
+/// extension present (required for the off-screen window pixmaps `xcomposite_input` reads) AND
+/// RandR ≥ 1.5 (the multi-monitor capture canvas — [`crate::capture::monitor_layout`] — is sized
+/// from `GetMonitors`, a RandR 1.5 request; without it recording init can't compute the canvas
+/// and fails). Gating all three here keeps the wizard's "capable" answer in lockstep with what
+/// the capture path actually requires. When false the wizard greys out the per-app picker
+/// (`requirements`), so we never enter the capture path on a host that can't satisfy it.
 pub fn x11_per_app_capable() -> bool {
     if !is_pure_x11_session() {
         return false;
@@ -56,10 +59,32 @@ pub fn x11_per_app_capable() -> bool {
         return false;
     }
     // X Composite extension — no extension means no redirected pixmap to capture.
-    conn.query_extension(b"Composite")
+    let composite = conn
+        .query_extension(b"Composite")
         .ok()
         .and_then(|c| c.reply().ok())
         .map(|r| r.present)
+        .unwrap_or(false);
+    if !composite {
+        return false;
+    }
+    // RandR ≥ 1.5 for `GetMonitors` (the per-monitor canvas envelope). Pre-multi-monitor the
+    // X11 canvas used `x11_screen_size` (core protocol, always present); the canvas now needs
+    // this, so the gate must require it too — else the picker lights up but init fails closed.
+    randr_at_least_1_5(&conn)
+}
+
+/// True iff the X server speaks RandR ≥ 1.5 — the version that introduced `GetMonitors`, which
+/// [`x11_monitor_rects`] (and thus the multi-monitor capture canvas) depends on. `QueryVersion`
+/// errors if the RandR extension is absent entirely, which we treat as not capable.
+fn randr_at_least_1_5(conn: &RustConnection) -> bool {
+    use x11rb::protocol::randr::ConnectionExt as _;
+    // Request the minimum we need; the server replies with min(requested, its max), so a server
+    // older than 1.5 reports < 1.5 here and a newer one reports exactly 1.5 — both correct.
+    conn.randr_query_version(1, 5)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|v| v.major_version > 1 || (v.major_version == 1 && v.minor_version >= 5))
         .unwrap_or(false)
 }
 
@@ -72,6 +97,43 @@ pub fn x11_screen_size() -> Option<(u32, u32)> {
     let screen = conn.setup().roots.get(screen_num)?;
     let (w, h) = (screen.width_in_pixels as u32, screen.height_in_pixels as u32);
     (w > 0 && h > 0).then_some((w, h))
+}
+
+/// Per-monitor rectangles (physical pixels, in root/virtual-screen coordinates) via RandR 1.5
+/// `GetMonitors` — used for the multi-monitor capture-canvas envelope and for resolving which
+/// monitor a captured window sits on (`monitor_layout`). `x11_screen_size` is the union
+/// bounding box of all monitors (one X screen spans them all), so it can't drive the per-monitor
+/// 1080-short-edge normalization; this can. `None` if RandR is unavailable or reports no active
+/// monitor, so the caller fails closed rather than guessing.
+pub fn x11_monitor_rects() -> Option<Vec<(i32, i32, i32, i32)>> {
+    use x11rb::protocol::randr::ConnectionExt as _;
+    let (conn, screen_num) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.get(screen_num)?.root;
+    let monitors = conn.randr_get_monitors(root, true).ok()?.reply().ok()?.monitors;
+    let rects: Vec<(i32, i32, i32, i32)> = monitors
+        .iter()
+        .filter(|m| m.width > 0 && m.height > 0)
+        .map(|m| (m.x as i32, m.y as i32, m.width as i32, m.height as i32))
+        .collect();
+    (!rects.is_empty()).then_some(rects)
+}
+
+/// Geometry of an X11 window (its decimal id) in root coordinates, plus its pixel size, as
+/// `(x, y, w, h)`. Translates the window origin to the root so it lines up with
+/// `x11_monitor_rects`. `None` if the window is gone or unreachable. Used to compute the
+/// per-app `MonitorFit` (which monitor + where on it).
+pub fn x11_window_rect(window_id: u32) -> Option<(i32, i32, i32, i32)> {
+    let (conn, _screen_num) = x11rb::connect(None).ok()?;
+    let geom = conn.get_geometry(window_id).ok()?.reply().ok()?;
+    // get_geometry x/y are relative to the parent; translate (0,0) of the window to the root.
+    let root = conn.setup().roots.first()?.root;
+    let trans = conn
+        .translate_coordinates(window_id, root, 0, 0)
+        .ok()?
+        .reply()
+        .ok()?;
+    let (w, h) = (geom.width as i32, geom.height as i32);
+    (w > 0 && h > 0).then_some((trans.dst_x as i32, trans.dst_y as i32, w, h))
 }
 
 /// Resolve `app_identity` (a `/proc/comm`) to the decimal window id of the **currently

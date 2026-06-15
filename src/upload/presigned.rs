@@ -145,7 +145,16 @@ impl Uploader {
             chunk.chunk_id, chunk.session_id
         );
 
-        let version = option_env!("CARGO_PKG_VERSION").unwrap_or("0.0.1");
+        // The backend keys the upload prefix off this version (`uploads/<version>/...`). Explicit
+        // binary choice, NOT a fallback: a test build (CROWD_CAST_UPLOAD_TEST set) uploads to a
+        // segregated, deletable `uploads/TEST_VERSION/` prefix; every other build uploads to the
+        // crate version, which cargo guarantees at compile time (`env!`, not `option_env!`).
+        // Independent of the auto-updater's version.
+        let version = if option_env!("CROWD_CAST_UPLOAD_TEST").is_some() {
+            "TEST_VERSION"
+        } else {
+            env!("CARGO_PKG_VERSION")
+        };
         let user_id = Self::compute_user_id();
         let auth_token = self.get_auth_token().await;
         let auth_token_ref = auth_token.as_deref();

@@ -53,10 +53,16 @@ impl Dispatch<WlOutput, ()> for Outputs {
     }
 }
 
-/// Largest connected output's current-mode pixel size, or `None` if none reported one.
-pub fn wayland_output_size() -> Option<(u32, u32)> {
-    let conn = Connection::connect_to_env().ok()?;
-    let (globals, mut queue) = registry_queue_init::<Outputs>(&conn).ok()?;
+/// Every connected output's current-mode pixel size (physical pixels). Empty if the Wayland
+/// connection fails or no output reported a current mode. Used for the multi-monitor capture
+/// canvas envelope (`monitor_layout`); `wayland_output_size` picks the largest from this.
+pub fn wayland_output_sizes() -> Vec<(u32, u32)> {
+    let Ok(conn) = Connection::connect_to_env() else {
+        return Vec::new();
+    };
+    let Ok((globals, mut queue)) = registry_queue_init::<Outputs>(&conn) else {
+        return Vec::new();
+    };
     let qh = queue.handle();
 
     // Bind every advertised wl_output so each emits its Mode events on the next roundtrip.
@@ -70,10 +76,15 @@ pub fn wayland_output_size() -> Option<(u32, u32)> {
     }
 
     let mut state = Outputs::default();
-    queue.roundtrip(&mut state).ok()?;
+    if queue.roundtrip(&mut state).is_err() {
+        return Vec::new();
+    }
+    state.current_modes
+}
 
-    state
-        .current_modes
+/// Largest connected output's current-mode pixel size, or `None` if none reported one.
+pub fn wayland_output_size() -> Option<(u32, u32)> {
+    wayland_output_sizes()
         .into_iter()
         .max_by_key(|&(w, h)| (w as u64) * (h as u64))
 }

@@ -43,5 +43,19 @@ RUN dnf -y install pciutils-devel && dnf clean all
 # links it for its bundled librtmp. EL9 EPEL ships mbedtls 2.28 (LTS).
 RUN dnf -y install mbedtls-devel && dnf clean all
 
+# Rust toolchain — builds the crowd-cast-agent BINARY on the SAME glibc-2.34 floor as the bundle, so
+# the shipped ELF runs cross-distro (host cargo on a bleeding-edge distro would stamp newer GLIBC
+# symbols). The crate's link-time deps (OpenSSL for reqwest, libwayland-client, libobs via
+# LIBOBS_PATH) are already installed above. The toolchain lives in the image; the cargo registry +
+# target CACHE is a runtime-mounted volume (see run-build-binary.sh), mirroring the bundle's cache.
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+ && rustc --version && cargo --version
+
+# Extra dev headers the crowd-cast-agent BINARY links beyond the bundle's deps: GTK 3 for the native
+# Linux setup wizard (build.rs probes gtk+-3.0 to compile src/ui/wizard_linux.c). GTK3 + its stack
+# are host-provided at runtime (GNOME ships them; supported sessions are GNOME-on-Wayland and sway).
+RUN dnf -y install gtk3-devel && dnf clean all
+
 WORKDIR /build
 ENTRYPOINT ["/bin/bash"]

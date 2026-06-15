@@ -20,6 +20,8 @@ mod sources;
 #[cfg(target_os = "linux")]
 pub(crate) mod gnome_screencast;
 #[cfg(target_os = "linux")]
+pub(crate) mod monitor_layout;
+#[cfg(target_os = "linux")]
 pub(crate) mod wayland_output;
 #[cfg(target_os = "linux")]
 pub(crate) mod x11_windows;

@@ -1,6 +1,10 @@
 //! System tray UI and notifications
 
 pub mod app_selector;
+/// Shared Ed25519 message construction for the Linux appcast manifest (also `#[path]`-included
+/// by `bin/cc-sign-manifest`). Linux-only; the signer binary compiles it standalone.
+#[cfg(target_os = "linux")]
+pub(crate) mod appcast_sig;
 pub mod notifications;
 #[cfg(target_os = "linux")]
 pub mod notify_linux;

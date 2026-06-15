@@ -54,16 +54,39 @@ const PUBKEY_B64: Option<&str> = option_env!("CROWD_CAST_UPDATE_PUBKEY");
 /// The release version this binary was built as.
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Monotonic build number baked by `build.rs` (the release workflow passes `github.run_number`;
+/// dev builds get `"0"`). Combined with `CURRENT_VERSION` it forms the comparable version the
+/// updater uses to decide "is the manifest strictly newer" — the analog of Sparkle's build number.
+fn current_build() -> u64 {
+    option_env!("CROWD_CAST_BUILD_NUMBER")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Manifest (the signed feed)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
-    /// Release version == the binary version.
+    /// Release marketing version == the binary's `CARGO_PKG_VERSION`.
     pub version: String,
+    /// Monotonic build number for this release (the workflow's `github.run_number`). Lets two
+    /// releases share a marketing `version` and still be ordered; compared as a tiebreak by
+    /// `is_newer`. Defaults to 0 for older feeds that predate the field.
+    #[serde(default)]
+    pub build: u64,
     #[serde(default)]
     pub notes: String,
+    /// Forward-compat: marks this release as critical. Parsed today (so current clients accept
+    /// future feeds that set it) but not yet acted on — the updater stays silent-by-default to
+    /// respect the `PrepareForUpdate` quiesce contract. Enforcement is a later toggle.
+    #[serde(default)]
+    pub critical: bool,
+    /// Forward-compat: the minimum version that may skip this update. Same parse-now/act-later
+    /// treatment as `critical`.
+    #[serde(default)]
+    pub minimum_version: String,
     pub binary: BinaryArtifact,
     pub bundle: BundleArtifact,
 }
@@ -117,11 +140,37 @@ impl Plan {
     }
 }
 
-/// Compare a manifest against installed state. Pure (unit-tested): "binary-only" is just the
-/// case where only the binary hash/version differs.
-fn plan_update(manifest: &Manifest, current_version: &str, installed: &InstalledState) -> Plan {
+/// Parse a `major.minor.patch` string into a comparable tuple, ignoring any pre-release/build
+/// suffix and tolerating missing components (treated as 0). Lenient by design: a feed should
+/// never fail to apply because of an unusual-but-ordered version string.
+fn parse_version(v: &str) -> (u64, u64, u64) {
+    let mut it = v.split('.').map(|part| {
+        // Take the leading digit run so "1.0.4-rc1" / "1.0.4+meta" parse as 1.0.4.
+        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().unwrap_or(0)
+    });
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// Whether `(new_version, new_build)` is strictly newer than `(cur_version, cur_build)`. Version
+/// dominates; build number is the tiebreak within the same version. This replaces a bare string
+/// inequality so (a) a same-version rebuild can still ship and (b) a feed that points at an OLDER
+/// release never triggers a downgrade.
+fn is_newer(cur_version: &str, cur_build: u64, new_version: &str, new_build: u64) -> bool {
+    let (cur, new) = (parse_version(cur_version), parse_version(new_version));
+    (new, new_build) > (cur, cur_build)
+}
+
+/// Compare a manifest against what's installed. Pure (unit-tested): the binary updates only when
+/// the manifest is strictly newer; "binary-only" is just the case where the bundle hash matches.
+fn plan_update(
+    manifest: &Manifest,
+    current_version: &str,
+    current_build: u64,
+    installed: &InstalledState,
+) -> Plan {
     Plan {
-        binary_changed: manifest.version != current_version,
+        binary_changed: is_newer(current_version, current_build, &manifest.version, manifest.build),
         bundle_changed: manifest.bundle.sha256 != installed.bundle_sha256,
     }
 }
@@ -461,13 +510,20 @@ impl LinuxUpdater {
         let manifest_bytes = http_get(feed)?;
         let sig_b64 = String::from_utf8(http_get(&format!("{feed}.sig"))?)
             .context("manifest signature file is not UTF-8")?;
-        verify_ed25519(&manifest_bytes, &sig_b64, pubkey)?;
+        // Domain-separated: verify over `prefix || manifest_bytes`, not the raw bytes, so a
+        // signature from another context that shares this key (a Sparkle enclosure) can't validate
+        // here. The offline signer (bin/cc-sign-manifest) signs the same construction.
+        verify_ed25519(
+            &super::appcast_sig::signing_message(&manifest_bytes),
+            &sig_b64,
+            pubkey,
+        )?;
 
         let manifest: Manifest =
             serde_json::from_slice(&manifest_bytes).context("failed to parse update manifest")?;
 
         let installed = InstalledState::load();
-        let plan = plan_update(&manifest, CURRENT_VERSION, &installed);
+        let plan = plan_update(&manifest, CURRENT_VERSION, current_build(), &installed);
         if plan.nothing() {
             info!("Auto-update: up to date (version {CURRENT_VERSION})");
             return Ok(());
@@ -497,11 +553,18 @@ impl LinuxUpdater {
         }
 
         info!(
-            "Auto-update: staged {} (binary_changed={}, bundle_changed={})",
-            manifest.version, plan.binary_changed, plan.bundle_changed
+            "Auto-update: staged {} (build {}, binary_changed={}, bundle_changed={})",
+            manifest.version, manifest.build, plan.binary_changed, plan.bundle_changed
         );
         if !manifest.notes.trim().is_empty() {
             info!("Auto-update: release notes for {}: {}", manifest.version, manifest.notes.trim());
+        }
+        // Forward-compat fields are parsed and surfaced, but not yet enforced (silent-by-default).
+        if manifest.critical {
+            info!(
+                "Auto-update: {} is flagged critical (minimum_version={:?}); applying via the normal idle path",
+                manifest.version, manifest.minimum_version
+            );
         }
         if let Ok(mut g) = self.shared.staged.lock() {
             *g = Some(staged);
@@ -590,6 +653,27 @@ mod tests {
         assert_eq!(m.version, "1.0.4");
         assert_eq!(m.bundle.abi, "32.0.2");
         assert_eq!(m.binary.sha256, "AABB");
+        // New/forward-compat fields default cleanly on a feed that omits them.
+        assert_eq!(m.build, 0);
+        assert!(!m.critical);
+        assert_eq!(m.minimum_version, "");
+    }
+
+    #[test]
+    fn version_ordering_and_build_tiebreak() {
+        assert_eq!(parse_version("1.0.4"), (1, 0, 4));
+        assert_eq!(parse_version("1.0.4-rc2"), (1, 0, 4));
+        assert_eq!(parse_version("2.1"), (2, 1, 0));
+
+        // Newer version wins.
+        assert!(is_newer("1.0.3", 99, "1.0.4", 0));
+        // Same version: higher build wins (a rebuild without a marketing bump).
+        assert!(is_newer("1.0.4", 10, "1.0.4", 11));
+        // Identical version+build is NOT newer (idempotent — no churn).
+        assert!(!is_newer("1.0.4", 11, "1.0.4", 11));
+        // An OLDER manifest never triggers a downgrade.
+        assert!(!is_newer("1.0.4", 0, "1.0.3", 999));
+        assert!(!is_newer("1.0.4", 11, "1.0.4", 10));
     }
 
     #[test]
@@ -613,7 +697,7 @@ mod tests {
             bundle_sha256: "deadbeef".into(),
         };
         assert_eq!(
-            plan_update(&m, "1.0.4", &same),
+            plan_update(&m, "1.0.4", 0, &same),
             Plan { binary_changed: false, bundle_changed: false }
         );
 
@@ -624,7 +708,7 @@ mod tests {
             bundle_sha256: "deadbeef".into(),
         };
         assert_eq!(
-            plan_update(&m, "1.0.3", &binary_only),
+            plan_update(&m, "1.0.3", 0, &binary_only),
             Plan { binary_changed: true, bundle_changed: false }
         );
 
@@ -635,7 +719,7 @@ mod tests {
             bundle_sha256: "0000".into(),
         };
         assert_eq!(
-            plan_update(&m, "1.0.4", &bundle_only),
+            plan_update(&m, "1.0.4", 0, &bundle_only),
             Plan { binary_changed: false, bundle_changed: true }
         );
     }
@@ -694,5 +778,32 @@ mod tests {
         // Malformed key/sig are errors, not panics.
         assert!(verify_ed25519(msg, &sig_b64, "not-base64!!").is_err());
         assert!(verify_ed25519(msg, "AAAA", &vk_b64).is_err());
+    }
+
+    /// The whole point of domain separation: a manifest signed via `signing_message` verifies as a
+    /// manifest, but a signature over the SAME key in another context (here: the raw bytes, standing
+    /// in for a Sparkle enclosure) does NOT validate as a manifest signature, and vice-versa. This
+    /// is exactly the sign/verify contract between `bin/cc-sign-manifest` and `check_and_stage`.
+    #[test]
+    fn domain_separated_signature_only_valid_as_manifest() {
+        use super::super::appcast_sig::signing_message;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let vk_b64 = STANDARD.encode(sk.verifying_key().to_bytes());
+        let manifest = MANIFEST_JSON.as_bytes();
+
+        // Signer signs the domain-separated message (what cc-sign-manifest does).
+        let manifest_sig = STANDARD.encode(sk.sign(&signing_message(manifest)).to_bytes());
+        // Verifier checks the same construction => valid.
+        assert!(verify_ed25519(&signing_message(manifest), &manifest_sig, &vk_b64).is_ok());
+        // The same signature does NOT verify over the raw (un-prefixed) bytes.
+        assert!(verify_ed25519(manifest, &manifest_sig, &vk_b64).is_err());
+
+        // Conversely, a signature minted over the raw bytes (a different context, same key) is
+        // rejected as a manifest signature.
+        let raw_sig = STANDARD.encode(sk.sign(manifest).to_bytes());
+        assert!(verify_ed25519(&signing_message(manifest), &raw_sig, &vk_b64).is_err());
     }
 }

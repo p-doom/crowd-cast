@@ -341,6 +341,12 @@ fn main() -> Result<()> {
         };
     info!("OBS binaries ready");
 
+    // Prime the capture mode + target list before initialize so the canvas can choose the
+    // multi-monitor per-app envelope vs the display-capture canvas (setup_capture re-sets these).
+    capture_ctx.set_single_active_app_capture(config.capture.single_active_app_capture);
+    let target_apps = config.capture.target_apps.clone();
+    capture_ctx.set_target_apps(&target_apps);
+
     // Initialize libobs context
     if let Err(e) = capture_ctx.initialize() {
         error!("Failed to initialize libobs: {}", e);
@@ -348,10 +354,7 @@ fn main() -> Result<()> {
     }
     info!("libobs context initialized");
 
-    capture_ctx.set_single_active_app_capture(config.capture.single_active_app_capture);
-
     // Set up capture sources (per-app window capture for target apps, or display capture).
-    let target_apps = config.capture.target_apps.clone();
     if let Err(e) = capture_ctx.setup_capture(&target_apps, &config.capture.restore_tokens) {
         error!("Failed to setup capture: {}", e);
         std::process::exit(1);

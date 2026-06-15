@@ -3,5 +3,6 @@ target/
 build/
 .venv/
 packaging/linux/.cache/
+packaging/linux/.cache-rust/
 packaging/linux/out/
 .claude/

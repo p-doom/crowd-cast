@@ -259,11 +259,85 @@ pub fn get_display_uuid(display_id: u32) -> Option<String> {
     }
 }
 
-// Non-macOS stubs
-#[cfg(not(target_os = "macos"))]
+// Linux: detect monitor-layout changes (plug/unplug, mode or arrangement change) by comparing a
+// signature of the monitor rectangles each poll, and emit SwitchedToNew so the engine reruns
+// reset_video_and_recreate_sources — which recomputes the multi-monitor envelope canvas
+// (`monitor_layout`). Without this the canvas stays sized to whatever monitors existed at
+// startup, so a window on a later-connected monitor would be placed against a stale canvas.
+// Mirrors the Windows DisplayMonitor.
+#[cfg(target_os = "linux")]
+pub struct DisplayMonitor {
+    last_signature: Vec<(i32, i32, i32, i32)>,
+}
+
+/// Stable signature of the current monitor layout (sorted per-monitor rectangles), via
+/// `monitor_layout` (wl_output on Wayland / RandR on X11). Empty if enumeration fails.
+#[cfg(target_os = "linux")]
+fn monitor_signature() -> Vec<(i32, i32, i32, i32)> {
+    let mut sig: Vec<(i32, i32, i32, i32)> = crate::capture::monitor_layout::monitor_rects()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.x, r.y, r.w, r.h))
+        .collect();
+    sig.sort_unstable();
+    sig
+}
+
+#[cfg(target_os = "linux")]
+impl DisplayMonitor {
+    pub fn new() -> Self {
+        Self {
+            last_signature: monitor_signature(),
+        }
+    }
+
+    pub fn set_original_display(&mut self, _display_id: u32, _uuid: String) {}
+
+    pub fn clear_original_display(&mut self) {}
+
+    pub fn current_display_ids(&self) -> &[u32] {
+        &[]
+    }
+
+    pub fn check_for_changes(&mut self) -> Option<DisplayChangeEvent> {
+        let current = monitor_signature();
+        // Ignore transient empty enumerations (seen mid-reconfigure) so we don't reset
+        // spuriously; act only on a settled, genuinely different layout.
+        if current.is_empty() || current == self.last_signature {
+            return None;
+        }
+        let from = self.last_signature.len();
+        let to = current.len();
+        self.last_signature = current;
+        info!("Monitor layout changed ({from} -> {to} monitor(s)); recomputing capture canvas");
+        // Names/ids are synthetic on Linux (no per-display UUID here); the handler only needs
+        // this variant to reset video + recreate sources at the new canvas size.
+        Some(DisplayChangeEvent::SwitchedToNew {
+            from_id: 0,
+            from_name: format!("{from} monitor(s)"),
+            to_id: 0,
+            to_name: format!("{to} monitor(s)"),
+            to_uuid: String::new(),
+        })
+    }
+
+    pub fn has_changes(&mut self) -> bool {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Default for DisplayMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Other non-macOS, non-Linux platforms (e.g. Windows here): no display-change detection yet.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub struct DisplayMonitor;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl DisplayMonitor {
     pub fn new() -> Self {
         Self
@@ -286,7 +360,7 @@ impl DisplayMonitor {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl Default for DisplayMonitor {
     fn default() -> Self {
         Self::new()

@@ -26,6 +26,19 @@ const IFACE = `
     <method name="ListWindows">
       <arg type="a(tiss)" name="windows" direction="out"/>
     </method>
+    <method name="GetWindowGeometry">
+      <arg type="t" name="window_id" direction="in"/>
+      <arg type="b" name="found" direction="out"/>
+      <arg type="i" name="win_x" direction="out"/>
+      <arg type="i" name="win_y" direction="out"/>
+      <arg type="i" name="win_w" direction="out"/>
+      <arg type="i" name="win_h" direction="out"/>
+      <arg type="i" name="mon_x" direction="out"/>
+      <arg type="i" name="mon_y" direction="out"/>
+      <arg type="i" name="mon_w" direction="out"/>
+      <arg type="i" name="mon_h" direction="out"/>
+      <arg type="d" name="scale" direction="out"/>
+    </method>
     <signal name="FocusChanged">
       <arg type="t" name="window_id"/>
       <arg type="i" name="pid"/>
@@ -123,6 +136,43 @@ export default class CrowdCastFocusExtension extends Extension {
             logError(e, 'crowd-cast-focus: ListWindows failed');
         }
         return out;
+    }
+
+    // D-Bus method: geometry of the window with Mutter id `window_id`, for the multi-monitor
+    // per-app capture fit (crowd-cast::capture::monitor_layout). Returns the window frame rect
+    // and the geometry of the monitor it sits on, all in GNOME *logical* (stage) coordinates,
+    // plus that monitor's scale. An external client cannot read window/monitor geometry on
+    // Wayland (no protocol exposes another client's placement), so the extension supplies it —
+    // same reason ListWindows lives here. crowd-cast derives the on-canvas scale from the actual
+    // captured PipeWire buffer size, so `scale` is advisory only. Read-only; never throws into
+    // the shell. `found` is false (and the rest zeroed) when the window is gone.
+    GetWindowGeometry(window_id) {
+        const miss = [false, 0, 0, 0, 0, 0, 0, 0, 0, 1.0];
+        try {
+            const wid = Number(window_id);
+            let target = null;
+            for (const actor of global.get_window_actors()) {
+                let w = null;
+                try { w = actor.meta_window; } catch (e) {}
+                if (w && w.get_id() === wid) {
+                    target = w;
+                    break;
+                }
+            }
+            if (!target)
+                return miss;
+            const r = target.get_frame_rect();
+            const mi = target.get_monitor();
+            if (mi < 0)
+                return [true, r.x, r.y, r.width, r.height, 0, 0, 0, 0, 1.0];
+            const mg = global.display.get_monitor_geometry(mi);
+            let scale = 1.0;
+            try { scale = global.display.get_monitor_scale(mi); } catch (e) {}
+            return [true, r.x, r.y, r.width, r.height, mg.x, mg.y, mg.width, mg.height, scale];
+        } catch (e) {
+            logError(e, 'crowd-cast-focus: GetWindowGeometry failed');
+            return miss;
+        }
     }
 
     _emit() {

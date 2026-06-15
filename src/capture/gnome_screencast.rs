@@ -47,6 +47,22 @@ pub struct WindowInfo {
     pub title: String,
 }
 
+/// A window's geometry as reported by the extension's `GetWindowGeometry`, in GNOME *logical*
+/// (stage) coordinates: the window frame rect and the geometry of the monitor it sits on, plus
+/// that monitor's scale. Used to compute the multi-monitor per-app fit (`monitor_layout`).
+#[derive(Debug, Clone, Copy)]
+pub struct WinGeom {
+    /// False (and the rest zeroed) when the window-id is no longer present.
+    pub found: bool,
+    /// Window frame rect (x, y, w, h), logical px.
+    pub win: (i32, i32, i32, i32),
+    /// Geometry of the window's monitor (x, y, w, h), logical px.
+    pub mon: (i32, i32, i32, i32),
+    /// The monitor's scale factor (advisory: the on-canvas scale is derived from the captured
+    /// buffer size, not this).
+    pub scale: f64,
+}
+
 enum Cmd {
     ListWindows(mpsc::Sender<Result<Vec<WindowInfo>, String>>),
     /// Record `window_id`; reply with the PipeWire node id. The session is retained (keyed by
@@ -57,6 +73,9 @@ enum Cmd {
     /// node). Fire-and-forget: used after a focus re-point has bound the new window
     /// (make-before-break), and when an app's window goes away.
     StopWindow(u64),
+    /// Query the extension for `window_id`'s frame rect + its monitor's geometry (for the
+    /// multi-monitor per-app fit). Reply is `None` on any D-Bus error.
+    WindowGeometry(u64, mpsc::Sender<Option<WinGeom>>),
 }
 
 /// Owns the Mutter ScreenCast D-Bus connection + sessions on a dedicated thread.
@@ -114,6 +133,14 @@ impl GnomeScreenCast {
     /// node). Best-effort / fire-and-forget; a no-op if no session is tracked for that id.
     pub fn stop_window(&self, window_id: u64) {
         let _ = self.tx.send(Cmd::StopWindow(window_id));
+    }
+
+    /// The frame rect + monitor geometry of `window_id` (via the focus extension), or `None` on
+    /// any error / if the window is gone. Used to compute the multi-monitor per-app fit.
+    pub fn window_geometry(&self, window_id: u64) -> Option<WinGeom> {
+        let (rtx, rrx) = mpsc::channel();
+        self.tx.send(Cmd::WindowGeometry(window_id, rtx)).ok()?;
+        rrx.recv_timeout(CMD_TIMEOUT).ok().flatten()
     }
 }
 
@@ -181,6 +208,9 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
                         stop_session(&conn, &path).await;
                     }
                 }
+                Cmd::WindowGeometry(id, reply) => {
+                    let _ = reply.send(window_geometry(&conn, id).await);
+                }
             }
         }
 
@@ -216,7 +246,33 @@ fn reply_err(cmd: Cmd, msg: &str) {
             let _ = r.send(Err(msg.to_string()));
         }
         Cmd::StopWindow(_) => {}
+        Cmd::WindowGeometry(_, r) => {
+            let _ = r.send(None);
+        }
     }
+}
+
+/// Query the focus extension for a window's frame rect + its monitor's geometry (logical px).
+async fn window_geometry(conn: &zbus::Connection, window_id: u64) -> Option<WinGeom> {
+    let proxy = zbus::Proxy::new(conn, FP_DEST, FP_PATH, FP_IFACE).await.ok()?;
+    let (found, wx, wy, ww, wh, mx, my, mw, mh, scale): (
+        bool,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        f64,
+    ) = proxy.call("GetWindowGeometry", &(window_id,)).await.ok()?;
+    Some(WinGeom {
+        found,
+        win: (wx, wy, ww, wh),
+        mon: (mx, my, mw, mh),
+        scale,
+    })
 }
 
 /// Stop a Mutter ScreenCast session (frees its stream/node). Best-effort.

@@ -6,6 +6,18 @@ description = "crowd-cast data collection agent - captures paired screencast and
 license = "MIT"
 repository = "https://github.com/crowd-cast/crowd-cast"
 
+[features]
+# Opt-in build of offline release tooling (the appcast manifest signer). Off by default so normal
+# app builds and `cargo test` never compile the extra binary.
+release-tools = []
+
+# Offline Ed25519 signer for the Linux appcast manifest. Gated behind `release-tools` so it's built
+# only by the release workflow (`cargo build --release --features release-tools --bin cc-sign-manifest`).
+[[bin]]
+name = "cc-sign-manifest"
+path = "src/bin/cc-sign-manifest.rs"
+required-features = ["release-tools"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -95,7 +107,9 @@ atspi = { version = "0.30", default-features = false, features = ["connection", 
 # so this needs no system library (no libX11/libxcb) and no external binary installed.
 # Only the XWayland/X11 focus path uses it; the Wayland-native focus signal is separate.
 # See src/capture/frontmost.rs::get_frontmost_app_x11.
-x11rb = "0.13"
+# `randr` feature: RandR 1.5 GetMonitors for per-monitor rects (multi-monitor capture canvas /
+# monitor_layout); core protocol only gives the union screen size.
+x11rb = { version = "0.13", features = ["randr"] }
 # Wayland client used to enumerate outputs/monitors for full-screen capture
 # (src/capture/wayland_output.rs).
 wayland-client = "0.31"
