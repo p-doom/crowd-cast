@@ -133,7 +133,10 @@ pub fn run_wizard(config: &mut Config) -> Result<WizardResult> {
                 // print the exact line the user must paste rather than claiming it's enabled.
                 #[cfg(target_os = "linux")]
                 if let Some(m) = crate::installer::autostart::linux_manual_autostart() {
-                    println!("\nFor autostart on {}, run this (or disable start-on-login):\n", m.compositor);
+                    println!(
+                        "\nFor autostart on {}, run this (or disable start-on-login):\n",
+                        m.compositor
+                    );
                     println!("    {}\n", m.command);
                 } else {
                     println!("\n[OK] Autostart enabled.\n");

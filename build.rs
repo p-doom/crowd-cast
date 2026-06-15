@@ -95,7 +95,9 @@ fn main() {
         // LD_LIBRARY_PATH), so dev runs that still set LD_LIBRARY_PATH are unaffected, and a
         // non-existent path (e.g. running from target/) is simply skipped by ld.so.
         println!("cargo:rustc-link-arg=-Wl,--enable-new-dtags");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../share/crowd-cast/obs/{obs_abi}/usr/lib");
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../share/crowd-cast/obs/{obs_abi}/usr/lib"
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -204,7 +206,10 @@ fn configure_upload_endpoint() {
     println!("cargo:rerun-if-env-changed=CROWD_CAST_UPLOAD_TEST");
     // Enabled only on a NON-EMPTY value (matches the FEED_URL/PUBKEY handling above), so a workflow
     // that passes an empty string for prod releases does NOT accidentally route clips to TEST_VERSION.
-    if std::env::var("CROWD_CAST_UPLOAD_TEST").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+    if std::env::var("CROWD_CAST_UPLOAD_TEST")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
         println!("cargo:rustc-env=CROWD_CAST_UPLOAD_TEST=1");
         println!("cargo:warning=TEST BINARY: clips upload to uploads/TEST_VERSION/ — NOT a shippable build");
     }

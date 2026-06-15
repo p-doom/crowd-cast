@@ -49,10 +49,7 @@ mod ffi {
         pub fn notifications_show_idle_paused();
         pub fn notifications_show_idle_resumed();
         pub fn notifications_show_update_installing();
-        pub fn notifications_show_update_completed(
-            version: *const c_char,
-            build: *const c_char,
-        );
+        pub fn notifications_show_update_completed(version: *const c_char, build: *const c_char);
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -215,7 +212,10 @@ pub fn show_capture_resumed_notification(display_name: &str) {
 /// Show capture resumed notification (non-macOS).
 #[cfg(not(target_os = "macos"))]
 pub fn show_capture_resumed_notification(display_name: &str) {
-    emit("Capture Resumed", &format!("Recording restarted on {display_name}"));
+    emit(
+        "Capture Resumed",
+        &format!("Recording restarted on {display_name}"),
+    );
 }
 
 /// Show notification when recording starts
@@ -324,7 +324,10 @@ pub fn show_obs_download_started_notification() {
 /// Show OBS download started notification (non-macOS).
 #[cfg(not(target_os = "macos"))]
 pub fn show_obs_download_started_notification() {
-    emit("Downloading OBS", "Preparing capture components. This may take a minute.");
+    emit(
+        "Downloading OBS",
+        "Preparing capture components. This may take a minute.",
+    );
 }
 
 /// Show notification when post-wizard setup starts
@@ -421,14 +424,17 @@ pub fn show_update_completed_notification(version: &str, build: &str) {
     unsafe {
         ffi::notifications_show_update_completed(version_c.as_ptr(), build_c.as_ptr());
     }
-    debug!("Showed update completed notification: {} ({})", version, build);
+    debug!(
+        "Showed update completed notification: {} ({})",
+        version, build
+    );
 }
 
 /// Show update completed notification (non-macOS).
 #[cfg(not(target_os = "macos"))]
 pub fn show_update_completed_notification(version: &str, build: &str) {
-    // Linux has no separate build number (the version carries the change), so omit "(build …)"
-    // when it's empty rather than rendering an ugly "(build )".
+    // Omit "(build ...)" when the caller has no platform build string, rather than rendering
+    // an ugly empty build suffix.
     let body = match (version.is_empty(), build.is_empty()) {
         (true, _) => "A new version was installed in the background.".to_string(),
         (false, true) => format!("Updated to version {version}."),

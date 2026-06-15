@@ -171,7 +171,10 @@ fn spawn_capture_thread(
                             &mut out,
                         );
                         for event in out.drain(..) {
-                            if let Err(e) = tx.send(InputEvent { timestamp_us, event }) {
+                            if let Err(e) = tx.send(InputEvent {
+                                timestamp_us,
+                                event,
+                            }) {
                                 debug!("Failed to send input event: {}", e);
                             }
                         }
@@ -191,7 +194,10 @@ fn spawn_capture_thread(
             }
         }
 
-        active.lock().unwrap_or_else(|p| p.into_inner()).remove(&path);
+        active
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&path);
         info!("Stopped evdev capture for: {}", device_name);
     });
 }
@@ -292,7 +298,11 @@ impl EventCoalescer {
                 // Buttons are never gated by secure-input (matches macOS, where clicks aren't
                 // withheld for a focused password field).
                 if let Some(button) = MouseButton::from_evdev_key(key) {
-                    let be = MouseButtonEvent { button, x: 0.0, y: 0.0 };
+                    let be = MouseButtonEvent {
+                        button,
+                        x: 0.0,
+                        y: 0.0,
+                    };
                     match value {
                         1 => out.push(EventType::MousePress(be)),
                         0 => out.push(EventType::MouseRelease(be)),
@@ -398,7 +408,6 @@ impl InputBackend for EvdevBackend {
     }
 }
 
-
 #[cfg(all(test, target_os = "linux"))]
 mod coalescer_tests {
     use super::*;
@@ -420,8 +429,12 @@ mod coalescer_tests {
     // device would be dropped and never recaptured (the watcher only adds *new* nodes).
     #[test]
     fn transient_and_non_os_errors_are_not_disconnect() {
-        assert!(!is_device_disconnected(&std::io::Error::from_raw_os_error(libc::EAGAIN)));
-        assert!(!is_device_disconnected(&std::io::Error::from_raw_os_error(libc::EINTR)));
+        assert!(!is_device_disconnected(&std::io::Error::from_raw_os_error(
+            libc::EAGAIN
+        )));
+        assert!(!is_device_disconnected(&std::io::Error::from_raw_os_error(
+            libc::EINTR
+        )));
         assert!(!is_device_disconnected(&std::io::Error::new(
             std::io::ErrorKind::Other,
             "no errno",
@@ -434,8 +447,18 @@ mod coalescer_tests {
     fn diagonal_motion_coalesces_to_one_event() {
         let mut c = EventCoalescer::default();
         let mut out = Vec::new();
-        c.feed(InputEventKind::RelAxis(RelativeAxisType::REL_X), 7, false, &mut out);
-        c.feed(InputEventKind::RelAxis(RelativeAxisType::REL_Y), 4, false, &mut out);
+        c.feed(
+            InputEventKind::RelAxis(RelativeAxisType::REL_X),
+            7,
+            false,
+            &mut out,
+        );
+        c.feed(
+            InputEventKind::RelAxis(RelativeAxisType::REL_Y),
+            4,
+            false,
+            &mut out,
+        );
         assert!(out.is_empty(), "nothing emitted before SYN_REPORT");
         c.feed(syn(), 0, false, &mut out);
         assert_eq!(out.len(), 1, "exactly one combined event per packet");
@@ -478,7 +501,12 @@ mod coalescer_tests {
     fn scroll_coalesces_on_syn() {
         let mut c = EventCoalescer::default();
         let mut out = Vec::new();
-        c.feed(InputEventKind::RelAxis(RelativeAxisType::REL_WHEEL), -1, false, &mut out);
+        c.feed(
+            InputEventKind::RelAxis(RelativeAxisType::REL_WHEEL),
+            -1,
+            false,
+            &mut out,
+        );
         assert!(out.is_empty());
         c.feed(syn(), 0, false, &mut out);
         assert_eq!(out.len(), 1);

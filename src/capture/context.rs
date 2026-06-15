@@ -429,7 +429,9 @@ impl CaptureContext {
         if crate::capture::is_gnome_wayland() {
             match super::gnome_screencast::GnomeScreenCast::new() {
                 Ok(g) => {
-                    info!("GNOME Wayland: using Mutter ScreenCast (picker-free) for per-app capture");
+                    info!(
+                        "GNOME Wayland: using Mutter ScreenCast (picker-free) for per-app capture"
+                    );
                     self.gnome_screencast = Some(g);
                 }
                 Err(e) => warn!("GNOME ScreenCast manager init failed: {e}; using portal path"),
@@ -526,9 +528,7 @@ impl CaptureContext {
             {
                 crate::ui::notify_linux::notify_blocking(
                     "crowd-cast — choose a window",
-                    &format!(
-                        "Pick the window for “{bundle_id}” in the dialog that appears next."
-                    ),
+                    &format!("Pick the window for “{bundle_id}” in the dialog that appears next."),
                 );
                 info!("Prompting portal window pick for '{}'", bundle_id);
             }
@@ -696,7 +696,10 @@ impl CaptureContext {
                     restore_tokens.get(bundle_id).map(|s| s.as_str()),
                 ) {
                     Ok(source) => {
-                        debug!("Created capture source '{}' for '{}'", source_name, bundle_id);
+                        debug!(
+                            "Created capture source '{}' for '{}'",
+                            source_name, bundle_id
+                        );
                         capture_sources.push(source);
 
                         // Wayland: each per-app source opens its own xdg-desktop-portal
@@ -711,8 +714,7 @@ impl CaptureContext {
                         #[cfg(target_os = "linux")]
                         if super::sources::is_wayland_session() && i + 1 < target_apps.len() {
                             Self::activate_scene(&mut scene)?;
-                            let just_added =
-                                capture_sources.last().expect("source pushed above");
+                            let just_added = capture_sources.last().expect("source pushed above");
                             if !just_added.wait_until_capturing(PORTAL_SERIALIZE_TIMEOUT) {
                                 warn!(
                                     "Per-app capture for '{}' didn't start streaming within \
@@ -1164,10 +1166,16 @@ impl CaptureContext {
 
         // Fresh Mutter node for the focused window, brought up before the old session is
         // stopped (make-before-break — the old node stays alive until the re-point lands).
-        let node = match self.gnome_screencast.as_ref().unwrap().record_window(window_id) {
+        let node = match self
+            .gnome_screencast
+            .as_ref()
+            .unwrap()
+            .record_window(window_id)
+        {
             Ok(node) => node,
             Err(e) => {
-                self.gnome_bind_failed.insert(bundle_id.to_string(), window_id);
+                self.gnome_bind_failed
+                    .insert(bundle_id.to_string(), window_id);
                 return Err(anyhow::anyhow!(
                     "Mutter RecordWindow(id={window_id}) for '{bundle_id}': {e}"
                 ));
@@ -1179,10 +1187,16 @@ impl CaptureContext {
             // obs-pipewire reconnects the stream to the new node without recreating the source
             // or its scene item (preserves z-order/transform; matches the update-in-place
             // convention used on macOS/X11).
-            let (_, source) = self.app_scenes.get_mut(bundle_id).expect("app scene present");
+            let (_, source) = self
+                .app_scenes
+                .get_mut(bundle_id)
+                .expect("app scene present");
             source.update_connect_node(node)?;
             if let Some(old_window) = prev_window {
-                self.gnome_screencast.as_ref().unwrap().stop_window(old_window);
+                self.gnome_screencast
+                    .as_ref()
+                    .unwrap()
+                    .stop_window(old_window);
             }
             info!(
                 "GNOME follow-focus: re-pointed '{}' to window {} (node {})",
@@ -1210,8 +1224,12 @@ impl CaptureContext {
                     // brought up so a failure doesn't leak a scene + node, and remember the
                     // window-id so the caller stops re-attempting it every poll (fail closed).
                     drop(scene);
-                    self.gnome_screencast.as_ref().unwrap().stop_window(window_id);
-                    self.gnome_bind_failed.insert(bundle_id.to_string(), window_id);
+                    self.gnome_screencast
+                        .as_ref()
+                        .unwrap()
+                        .stop_window(window_id);
+                    self.gnome_bind_failed
+                        .insert(bundle_id.to_string(), window_id);
                     return Err(e.context(format!(
                         "GNOME per-app capture: binding window {window_id} for '{bundle_id}' \
                          failed (is the obs-pipewire capture source available?)"
@@ -1224,14 +1242,16 @@ impl CaptureContext {
             if self.active_capture_app.as_deref() == Some(bundle_id) {
                 Self::activate_scene(&mut scene)?;
             }
-            self.app_scenes.insert(bundle_id.to_string(), (scene, source));
+            self.app_scenes
+                .insert(bundle_id.to_string(), (scene, source));
             info!(
                 "GNOME follow-focus: created scene for '{}' bound to focused window {} (node {})",
                 bundle_id, window_id, node
             );
         }
 
-        self.gnome_bound_window.insert(bundle_id.to_string(), window_id);
+        self.gnome_bound_window
+            .insert(bundle_id.to_string(), window_id);
         // Bound successfully (created or re-pointed) — clear any prior failure marker so a later
         // genuine failure on this app isn't suppressed.
         self.gnome_bind_failed.remove(bundle_id);
@@ -1307,7 +1327,11 @@ impl CaptureContext {
     fn active_window_monitor_rects(
         &self,
         app: &str,
-    ) -> Option<(super::monitor_layout::Rect, super::monitor_layout::Rect, f64)> {
+    ) -> Option<(
+        super::monitor_layout::Rect,
+        super::monitor_layout::Rect,
+        f64,
+    )> {
         use super::monitor_layout::Rect;
         if let Some(gsc) = self.gnome_screencast.as_ref() {
             let window_id = *self.gnome_bound_window.get(app)?;
@@ -1322,7 +1346,9 @@ impl CaptureContext {
         // Pure X11: resolve the app's focused window and the RandR monitor it sits on. X11 has
         // no per-monitor scaling, so the scale factor is 1.0 (logical == physical pixels).
         if super::x11_windows::is_pure_x11_session() {
-            let wid: u32 = super::x11_windows::resolve_capture_window(app)?.parse().ok()?;
+            let wid: u32 = super::x11_windows::resolve_capture_window(app)?
+                .parse()
+                .ok()?;
             let (wx, wy, ww, wh) = super::x11_windows::x11_window_rect(wid)?;
             let win = Rect::new(wx, wy, ww, wh);
             let monitors: Vec<Rect> = super::x11_windows::x11_monitor_rects()?
@@ -1356,7 +1382,10 @@ impl CaptureContext {
                     // sufficient there) and on Wayland.
                     #[cfg(target_os = "linux")]
                     if let Err(e) = source.update_application(bundle_id) {
-                        debug!("X11 re-resolve of capture window for '{}' failed: {}", bundle_id, e);
+                        debug!(
+                            "X11 re-resolve of capture window for '{}' failed: {}",
+                            bundle_id, e
+                        );
                     }
                     #[cfg(not(target_os = "linux"))]
                     let _ = source;
@@ -1369,10 +1398,7 @@ impl CaptureContext {
                     if let Some(blank) = self.blank_scene.as_mut() {
                         Self::activate_scene(blank)?;
                     }
-                    warn!(
-                        "No scene for '{}'; showing blank",
-                        bundle_id
-                    );
+                    warn!("No scene for '{}'; showing blank", bundle_id);
                 }
             }
             None => {

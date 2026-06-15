@@ -304,7 +304,11 @@ impl ScreenCaptureSource {
                 "Creating Linux X11 (xcomposite) window capture source: {} (app: {}, resolved: {})",
                 name,
                 bundle_id,
-                if capture_window.is_empty() { "<no window yet>" } else { &capture_window }
+                if capture_window.is_empty() {
+                    "<no window yet>"
+                } else {
+                    &capture_window
+                }
             );
             context
                 .source_builder::<XCompositeInputSourceBuilder, _>(name)?
@@ -547,7 +551,11 @@ impl ScreenCaptureSource {
         debug!(
             "Re-resolved XComposite capture for '{}' (window: {})",
             bundle_id,
-            if capture_window.is_empty() { "<none>" } else { &capture_window }
+            if capture_window.is_empty() {
+                "<none>"
+            } else {
+                &capture_window
+            }
         );
         Ok(())
     }
@@ -559,14 +567,17 @@ impl ScreenCaptureSource {
     /// transform/z-order) is preserved. Used by GNOME follow-focus to track the focused window.
     #[cfg(target_os = "linux")]
     pub fn update_connect_node(&mut self, node_id: u32) -> Result<()> {
-        let mut data =
-            ObsData::new(self.source.runtime()).context("Failed to allocate ObsData for ConnectNode")?;
+        let mut data = ObsData::new(self.source.runtime())
+            .context("Failed to allocate ObsData for ConnectNode")?;
         data.set_int("ConnectNode", node_id as i64)
             .context("Failed to set ConnectNode")?;
         self.source
             .update_raw(data)
             .context("Failed to obs_source_update ConnectNode")?;
-        debug!("Re-pointed node capture '{}' to node {}", self.name, node_id);
+        debug!(
+            "Re-pointed node capture '{}' to node {}",
+            self.name, node_id
+        );
         Ok(())
     }
 
@@ -841,7 +852,9 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
 /// back to OBS defaults.
 #[cfg(target_os = "windows")]
 pub fn get_main_display_resolution() -> Result<(u32, u32)> {
-    anyhow::bail!("Display resolution detection not yet implemented on Windows (using OBS defaults)")
+    anyhow::bail!(
+        "Display resolution detection not yet implemented on Windows (using OBS defaults)"
+    )
 }
 
 /// Get the actual resolution of the main display (unsupported-platform fallback)

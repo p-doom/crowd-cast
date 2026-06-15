@@ -1,8 +1,8 @@
 //! Standalone app selection panel — shown from the tray "Settings" menu.
 
-use anyhow::Result;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use anyhow::Context as _;
+use anyhow::Result;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -51,10 +51,7 @@ extern "C" {
 /// re-execs a clean child that calls this. macOS has no such background loop, so its
 /// [`show_panel`] calls this directly.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn show_panel_native(
-    current_apps: &[String],
-    capture_all: bool,
-) -> Result<AppSelectionResult> {
+pub fn show_panel_native(current_apps: &[String], capture_all: bool) -> Result<AppSelectionResult> {
     // Linux: the GTK dialog renders whatever candidate list we stage via the shared
     // wizard FFI (on macOS the Cocoa panel enumerates running apps itself). Stage the
     // current candidates and the per-app-capture availability gate before showing.
@@ -86,12 +83,7 @@ pub fn show_panel_native(
     };
 
     unsafe {
-        show_app_selection_panel(
-            c_ptrs.as_ptr(),
-            c_ptrs.len(),
-            capture_all,
-            &mut result,
-        );
+        show_app_selection_panel(c_ptrs.as_ptr(), c_ptrs.len(), capture_all, &mut result);
     }
 
     if !result.saved {
@@ -131,10 +123,7 @@ pub fn show_panel_native(
 
 /// macOS: the Cocoa panel is safe to run in-process on the tray's main thread.
 #[cfg(target_os = "macos")]
-pub fn show_panel(
-    current_apps: &[String],
-    capture_all: bool,
-) -> Result<AppSelectionResult> {
+pub fn show_panel(current_apps: &[String], capture_all: bool) -> Result<AppSelectionResult> {
     show_panel_native(current_apps, capture_all)
 }
 
@@ -156,18 +145,14 @@ struct PanelWire {
 }
 
 #[cfg(target_os = "linux")]
-pub fn show_panel(
-    current_apps: &[String],
-    capture_all: bool,
-) -> Result<AppSelectionResult> {
+pub fn show_panel(current_apps: &[String], capture_all: bool) -> Result<AppSelectionResult> {
     // The child re-reads the same on-disk config to render the current selection, so the
     // caller's values don't need threading through argv. Kept in the signature for parity
     // with macOS / the no-op stub, and so callers document intent.
     let _ = (current_apps, capture_all);
 
     let exe = std::env::current_exe().context("locating current executable")?;
-    let out = std::env::temp_dir()
-        .join(format!("crowd-cast-settings-{}.json", std::process::id()));
+    let out = std::env::temp_dir().join(format!("crowd-cast-settings-{}.json", std::process::id()));
     // Stale file from a previous (crashed) run would otherwise be read as this run's result.
     let _ = std::fs::remove_file(&out);
 
@@ -187,8 +172,7 @@ pub fn show_panel(
         .context("settings-panel subprocess produced no result file")?;
     let _ = std::fs::remove_file(&out);
 
-    let wire: PanelWire =
-        serde_json::from_str(&data).context("parsing settings-panel result")?;
+    let wire: PanelWire = serde_json::from_str(&data).context("parsing settings-panel result")?;
     Ok(AppSelectionResult {
         saved: wire.saved,
         capture_all: wire.capture_all,
@@ -217,10 +201,7 @@ pub fn run_settings_panel_subprocess(out_path: &std::path::Path) -> Result<()> {
 
 // Platforms without a native settings panel (e.g. Windows): no-op.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn show_panel(
-    current_apps: &[String],
-    capture_all: bool,
-) -> Result<AppSelectionResult> {
+pub fn show_panel(current_apps: &[String], capture_all: bool) -> Result<AppSelectionResult> {
     Ok(AppSelectionResult {
         saved: false,
         capture_all,

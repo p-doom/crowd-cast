@@ -84,16 +84,32 @@ fn detect_pkg() -> Pkg {
     let has = |k: &str| ids.iter().any(|i| i == k);
     if has("nixos") {
         Pkg::Nix
-    } else if has("arch") || has("manjaro") || has("endeavouros") || has("garuda")
-        || has("artix") || has("arcolinux") || has("cachyos")
+    } else if has("arch")
+        || has("manjaro")
+        || has("endeavouros")
+        || has("garuda")
+        || has("artix")
+        || has("arcolinux")
+        || has("cachyos")
     {
         Pkg::Arch
-    } else if has("debian") || has("ubuntu") || has("linuxmint") || has("pop")
-        || has("elementary") || has("raspbian") || has("kali") || has("zorin") || has("neon")
+    } else if has("debian")
+        || has("ubuntu")
+        || has("linuxmint")
+        || has("pop")
+        || has("elementary")
+        || has("raspbian")
+        || has("kali")
+        || has("zorin")
+        || has("neon")
     {
         Pkg::Debian
-    } else if has("fedora") || has("rhel") || has("centos") || has("rocky")
-        || has("almalinux") || has("nobara")
+    } else if has("fedora")
+        || has("rhel")
+        || has("centos")
+        || has("rocky")
+        || has("almalinux")
+        || has("nobara")
     {
         Pkg::Fedora
     } else if ids.iter().any(|i| i.starts_with("opensuse")) || has("suse") || has("sles") {
@@ -117,8 +133,14 @@ fn install_cmd(pkg: Pkg, packages: &[String]) -> String {
         Pkg::Suse => format!("sudo zypper install {pkgs}"),
         Pkg::Alpine => format!("sudo apk add {pkgs}"),
         Pkg::Gentoo => format!("sudo emerge {pkgs}"),
-        Pkg::Nix => format!("nix-env -iA {} (or add to configuration.nix)",
-            packages.iter().map(|p| format!("nixpkgs.{p}")).collect::<Vec<_>>().join(" ")),
+        Pkg::Nix => format!(
+            "nix-env -iA {} (or add to configuration.nix)",
+            packages
+                .iter()
+                .map(|p| format!("nixpkgs.{p}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         Pkg::Unknown => format!("install with your package manager: {pkgs}"),
     }
 }
@@ -213,7 +235,11 @@ fn portal_config_dirs() -> Vec<String> {
             h
         } else {
             let home = env("HOME");
-            if home.is_empty() { String::new() } else { format!("{home}/.config") }
+            if home.is_empty() {
+                String::new()
+            } else {
+                format!("{home}/.config")
+            }
         }
     };
     if !cfg_home.is_empty() {
@@ -237,8 +263,11 @@ fn compositor_backend_shortname() -> String {
         "kde".into()
     } else if d.contains("hyprland") {
         "hyprland".into()
-    } else if d.contains("sway") || d.contains("wlroots") || d.contains("river")
-        || d.contains("labwc") || d.contains("wayfire")
+    } else if d.contains("sway")
+        || d.contains("wlroots")
+        || d.contains("river")
+        || d.contains("labwc")
+        || d.contains("wayfire")
     {
         "wlr".into()
     } else {
@@ -256,7 +285,9 @@ fn configured_screencast_backends() -> Vec<String> {
             .collect();
         candidates.push(format!("{dir}/portals.conf"));
         for path in candidates {
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let mut in_pref = false;
             let mut screencast: Option<String> = None;
             let mut default: Option<String> = None;
@@ -271,7 +302,9 @@ fn configured_screencast_backends() -> Vec<String> {
                 }
                 if let Some((k, v)) = l.split_once('=') {
                     match k.trim() {
-                        "org.freedesktop.impl.portal.ScreenCast" => screencast = Some(v.trim().into()),
+                        "org.freedesktop.impl.portal.ScreenCast" => {
+                            screencast = Some(v.trim().into())
+                        }
                         "default" => default = Some(v.trim().into()),
                         _ => {}
                     }
@@ -294,13 +327,17 @@ fn installed_screencast_backends() -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     for dir in portal_config_dirs() {
         let portals = format!("{dir}/portals");
-        let Ok(entries) = std::fs::read_dir(&portals) else { continue };
+        let Ok(entries) = std::fs::read_dir(&portals) else {
+            continue;
+        };
         for e in entries.flatten() {
             let path = e.path();
             if path.extension().and_then(|x| x.to_str()) != Some("portal") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let declares = text.lines().any(|l| {
                 let l = l.trim_start();
                 l.starts_with("Interfaces=") && l.contains("org.freedesktop.impl.portal.ScreenCast")
@@ -308,12 +345,19 @@ fn installed_screencast_backends() -> Vec<(String, Vec<String>)> {
             if !declares {
                 continue;
             }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
             let useins: Vec<String> = text
                 .lines()
                 .find_map(|l| {
                     l.trim().strip_prefix("UseIn=").map(|v| {
-                        v.split(';').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+                        v.split(';')
+                            .map(|s| s.trim().to_lowercase())
+                            .filter(|s| !s.is_empty())
+                            .collect()
                     })
                 })
                 .unwrap_or_default();
@@ -330,7 +374,10 @@ fn screencast_status() -> (bool, Option<String>) {
     let configured = configured_screencast_backends();
 
     if !configured.is_empty() {
-        if configured.iter().any(|want| installed.iter().any(|(stem, _)| stem == want)) {
+        if configured
+            .iter()
+            .any(|want| installed.iter().any(|(stem, _)| stem == want))
+        {
             return (true, None);
         }
         return (false, Some(configured[0].clone()));
@@ -351,7 +398,11 @@ fn screencast_status() -> (bool, Option<String>) {
 // ===========================================================================
 
 fn which_exists(prog: &str) -> bool {
-    Command::new("which").arg(prog).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("which")
+        .arg(prog)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Whether the ScreenCast portal interface is actually exposed on the session bus
@@ -360,14 +411,23 @@ fn which_exists(prog: &str) -> bool {
 /// so a non-responsive portal cannot hang the preflight.
 fn screencast_dbus_available() -> Option<bool> {
     fn introspect(prog: &str, args: &[&str]) -> Option<bool> {
-        let out = Command::new("timeout").arg("5").arg(prog).args(args).output().ok()?;
+        let out = Command::new("timeout")
+            .arg("5")
+            .arg(prog)
+            .args(args)
+            .output()
+            .ok()?;
         Some(String::from_utf8_lossy(&out.stdout).contains("org.freedesktop.portal.ScreenCast"))
     }
     if which_exists("busctl") {
         if let Some(r) = introspect(
             "busctl",
-            &["--user", "introspect", "org.freedesktop.portal.Desktop",
-              "/org/freedesktop/portal/desktop"],
+            &[
+                "--user",
+                "introspect",
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+            ],
         ) {
             return Some(r);
         }
@@ -375,8 +435,14 @@ fn screencast_dbus_available() -> Option<bool> {
     if which_exists("gdbus") {
         if let Some(r) = introspect(
             "gdbus",
-            &["introspect", "--session", "--dest", "org.freedesktop.portal.Desktop",
-              "--object-path", "/org/freedesktop/portal/desktop"],
+            &[
+                "introspect",
+                "--session",
+                "--dest",
+                "org.freedesktop.portal.Desktop",
+                "--object-path",
+                "/org/freedesktop/portal/desktop",
+            ],
         ) {
             return Some(r);
         }
@@ -439,24 +505,43 @@ fn pipewire_running() -> bool {
     if !runtime.is_empty() && Path::new(&format!("{runtime}/pipewire-0")).exists() {
         return true;
     }
-    Command::new("pgrep").arg("-x").arg("pipewire").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("pgrep")
+        .arg("-x")
+        .arg("pipewire")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn in_input_group() -> bool {
     Command::new("id")
         .arg("-nG")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().any(|g| g == "input"))
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .any(|g| g == "input")
+        })
         .unwrap_or(false)
 }
 
 fn gpu_render_node() -> bool {
-    let Ok(entries) = std::fs::read_dir("/dev/dri") else { return false };
-    entries.flatten().any(|e| e.file_name().to_str().map(|n| n.starts_with("renderD")).unwrap_or(false))
+    let Ok(entries) = std::fs::read_dir("/dev/dri") else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .map(|n| n.starts_with("renderD"))
+            .unwrap_or(false)
+    })
 }
 
 fn vaapi_ok() -> bool {
-    Command::new("vainfo").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("vainfo")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// GPU vendors present, from /sys/class/drm/card*/device/vendor.
@@ -580,7 +665,13 @@ fn focus_provider_requirement() -> Requirement {
                 String::new(),
             ),
         };
-        return Requirement { label, detail, command, severity: Severity::Required, satisfied };
+        return Requirement {
+            label,
+            detail,
+            command,
+            severity: Severity::Required,
+            satisfied,
+        };
     }
 
     // wlroots (wlr-foreign-toplevel) / KDE (KWin) / X11 (_NET_ACTIVE_WINDOW) expose focus
@@ -742,7 +833,11 @@ pub fn collect(autostart_desired: bool) -> Vec<Requirement> {
         } else {
             "Add yourself to the 'input' group, then log out and back in.".into()
         },
-        command: if input { String::new() } else { "sudo usermod -aG input $USER".into() },
+        command: if input {
+            String::new()
+        } else {
+            "sudo usermod -aG input $USER".into()
+        },
         severity: Severity::Required,
         satisfied: input,
     });
@@ -756,7 +851,11 @@ pub fn collect(autostart_desired: bool) -> Vec<Requirement> {
         } else {
             "Optional — enables GPU video encoding (otherwise software x264 is used).".into()
         },
-        command: if va { String::new() } else { install_cmd(pkg, &vaapi_packages(pkg)) },
+        command: if va {
+            String::new()
+        } else {
+            install_cmd(pkg, &vaapi_packages(pkg))
+        },
         severity: Severity::Optional,
         satisfied: va,
     });

@@ -127,6 +127,22 @@ struct StagedUpdate {
     new_bundle: Option<(String, String, PathBuf)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateCheckOutcome {
+    UpToDate {
+        version: String,
+        build: u64,
+    },
+    Staged {
+        version: String,
+        build: u64,
+        notes: String,
+        binary_changed: bool,
+        bundle_changed: bool,
+        critical: bool,
+    },
+}
+
 /// Which artifacts differ from what's installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Plan {
@@ -149,7 +165,11 @@ fn parse_version(v: &str) -> (u64, u64, u64) {
         let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
         digits.parse::<u64>().unwrap_or(0)
     });
-    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
 }
 
 /// Whether `(new_version, new_build)` is strictly newer than `(cur_version, cur_build)`. Version
@@ -170,9 +190,45 @@ fn plan_update(
     installed: &InstalledState,
 ) -> Plan {
     Plan {
-        binary_changed: is_newer(current_version, current_build, &manifest.version, manifest.build),
+        binary_changed: is_newer(
+            current_version,
+            current_build,
+            &manifest.version,
+            manifest.build,
+        ),
         bundle_changed: manifest.bundle.sha256 != installed.bundle_sha256,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RunIdentity {
+    version: String,
+    #[serde(default)]
+    build: u64,
+}
+
+fn current_run_identity() -> RunIdentity {
+    RunIdentity {
+        version: CURRENT_VERSION.to_string(),
+        build: current_build(),
+    }
+}
+
+fn parse_run_identity(raw: &str) -> Option<RunIdentity> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    serde_json::from_str(raw).ok().or_else(|| {
+        Some(RunIdentity {
+            version: raw.to_string(),
+            build: 0,
+        })
+    })
+}
+
+fn should_notify_post_update(previous: Option<&RunIdentity>, current: &RunIdentity) -> bool {
+    previous.is_some_and(|p| p != current)
 }
 
 // ---------------------------------------------------------------------------
@@ -212,10 +268,12 @@ fn verify_ed25519(message: &[u8], signature_b64: &str, pubkey_b64: &str) -> Resu
     let sig_bytes = STANDARD
         .decode(signature_b64.trim())
         .context("manifest signature is not valid base64")?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("Ed25519 signature must be 64 bytes, got {}", sig_bytes.len()))?;
+    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "Ed25519 signature must be 64 bytes, got {}",
+            sig_bytes.len()
+        )
+    })?;
     let sig = Signature::from_bytes(&sig_arr);
 
     vk.verify_strict(message, &sig)
@@ -248,12 +306,6 @@ fn state_path() -> Result<PathBuf> {
 /// marker checked in `UpdaterController::check_post_update_notification`.
 fn last_run_version_path() -> Result<PathBuf> {
     Ok(data_root()?.join("last-run-version"))
-}
-
-/// Whether a version change between the previously-recorded run and now warrants a post-update
-/// notification. Pure (unit-tested): never notify on first run (empty marker) or when unchanged.
-fn should_notify_post_update(previous: &str, current: &str) -> bool {
-    !previous.is_empty() && previous != current
 }
 
 impl InstalledState {
@@ -324,7 +376,10 @@ fn extract_bundle(archive: &Path, dest: &Path) -> Result<()> {
         .status()
         .context("failed to spawn `tar` to extract the libobs bundle")?;
     if !status.success() {
-        bail!("`tar` failed to extract {} (status {status})", archive.display());
+        bail!(
+            "`tar` failed to extract {} (status {status})",
+            archive.display()
+        );
     }
     Ok(())
 }
@@ -399,7 +454,11 @@ impl LinuxUpdater {
     }
 
     fn has_staged(&self) -> bool {
-        self.shared.staged.lock().map(|g| g.is_some()).unwrap_or(false)
+        self.shared
+            .staged
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
     }
 
     fn staged_version(&self) -> Option<String> {
@@ -413,9 +472,7 @@ impl LinuxUpdater {
     /// Whether the controller may start a new check (available, nothing staged or in flight).
     /// Mirrors Sparkle's `canCheckForUpdates`.
     pub fn can_check(&self) -> bool {
-        self.available
-            && !self.shared.check_in_flight.load(Ordering::SeqCst)
-            && !self.has_staged()
+        self.available && !self.shared.check_in_flight.load(Ordering::SeqCst) && !self.has_staged()
     }
 
     /// Kick a NON-blocking background check+stage on a worker thread. The tray loop is synchronous,
@@ -430,11 +487,63 @@ impl LinuxUpdater {
         }
         let me = Arc::clone(self);
         std::thread::spawn(move || {
-            if let Err(e) = me.check_and_stage() {
-                warn!("Auto-update check failed: {e:#}");
+            match me.check_and_stage() {
+                Ok(outcome) => log_check_outcome(&outcome),
+                Err(e) => warn!("Auto-update check failed: {e:#}"),
             }
             me.shared.check_in_flight.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// Kick a user-initiated foreground check. On Linux, "foreground" means a clean GTK
+    /// subprocess shows the check result while this process still performs the signed
+    /// manifest verification, download, staging, and eventual idle apply.
+    pub fn check_manually(self: &Arc<Self>) -> Result<()> {
+        if !self.available {
+            let reason = self
+                .reason()
+                .unwrap_or("Auto-update is not available in this build.");
+            bail!("{reason}");
+        }
+        if self.has_staged() {
+            bail!("An update has already been downloaded and is waiting to install.");
+        }
+        if self.shared.check_in_flight.swap(true, Ordering::SeqCst) {
+            bail!("An update check is already running.");
+        }
+
+        let status_path = super::update_dialog::status_path();
+        if let Err(e) = super::update_dialog::write_status(
+            &status_path,
+            &super::update_dialog::UpdateDialogStatus::checking(),
+        ) {
+            self.shared.check_in_flight.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+        if let Err(e) = super::update_dialog::spawn_status_dialog(&status_path) {
+            self.shared.check_in_flight.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+
+        let me = Arc::clone(self);
+        std::thread::spawn(move || {
+            let status = match me.check_and_stage() {
+                Ok(outcome) => {
+                    log_check_outcome(&outcome);
+                    dialog_status_for_outcome(&outcome)
+                }
+                Err(e) => {
+                    warn!("Manual update check failed: {e:#}");
+                    super::update_dialog::UpdateDialogStatus::failed(&format!("{e:#}"))
+                }
+            };
+            if let Err(e) = super::update_dialog::write_status(&status_path, &status) {
+                warn!("Failed to update manual update-check dialog status: {e:#}");
+            }
+            me.shared.check_in_flight.store(false, Ordering::SeqCst);
+        });
+
+        Ok(())
     }
 
     /// Consume the "an update is staged — please quiesce capture" request. The tray turns this into
@@ -466,11 +575,11 @@ impl LinuxUpdater {
     }
 
     /// One-shot at startup (called from `UpdaterController::start`, the mirror of where macOS calls
-    /// `check_post_update_notification`): if the running binary's version differs from the version
-    /// recorded on the previous run, we were just self-updated and re-exec'd — fire the "you were
-    /// updated" toast. Always records the current version so the next launch has a baseline; never
-    /// notifies on first run. Mirrors the macOS `last_build` marker, keyed on the binary's own
-    /// `CARGO_PKG_VERSION` (no separate build number on Linux).
+    /// `check_post_update_notification`): if the running binary's version/build differs from the
+    /// identity recorded on the previous run, we were just self-updated and re-exec'd — fire the
+    /// "you were updated" toast. Always records the current identity so the next launch has a
+    /// baseline; never notifies on first run. Mirrors the macOS `last_build` marker, keyed on the
+    /// binary's own `CARGO_PKG_VERSION` plus the baked release build number.
     pub fn check_post_update_notification(&self) {
         let marker = match last_run_version_path() {
             Ok(p) => p,
@@ -480,31 +589,49 @@ impl LinuxUpdater {
             }
         };
 
-        let previous = std::fs::read_to_string(&marker).unwrap_or_default();
-        let previous = previous.trim().to_string();
+        let previous_raw = std::fs::read_to_string(&marker).unwrap_or_default();
+        let previous = parse_run_identity(&previous_raw);
+        let current = current_run_identity();
 
-        // Always record the current version (mirrors macOS always writing the build marker), so a
-        // later launch can detect the change exactly once.
+        // Always record the current identity (mirrors macOS always writing the build marker), so a
+        // later launch can detect the change exactly once. JSON replaces the older plain-version
+        // marker while still accepting it in parse_run_identity().
         if let Some(parent) = marker.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        if let Err(e) = std::fs::write(&marker, CURRENT_VERSION) {
-            warn!("Auto-update: failed to write post-update marker {}: {e}", marker.display());
+        let current_json =
+            serde_json::to_string(&current).unwrap_or_else(|_| CURRENT_VERSION.into());
+        if let Err(e) = std::fs::write(&marker, current_json) {
+            warn!(
+                "Auto-update: failed to write post-update marker {}: {e}",
+                marker.display()
+            );
         }
 
-        if should_notify_post_update(&previous, CURRENT_VERSION) {
-            info!("Auto-update: detected update {previous} -> {CURRENT_VERSION}; notifying");
-            // No separate build number on Linux; the version string carries the change.
-            super::show_update_completed_notification(CURRENT_VERSION, "");
+        if should_notify_post_update(previous.as_ref(), &current) {
+            let previous_display = previous
+                .as_ref()
+                .map(format_run_identity)
+                .unwrap_or_else(|| "<unknown>".to_string());
+            info!(
+                "Auto-update: detected update {previous_display} -> {}; notifying",
+                format_run_identity(&current)
+            );
+            let build = if current.build > 0 {
+                current.build.to_string()
+            } else {
+                String::new()
+            };
+            super::show_update_completed_notification(&current.version, &build);
         }
     }
 
     /// Fetch + verify the manifest, and if anything changed, download + verify + stage it.
     /// Does NOT apply (mirrors Sparkle staging the update before the relaunch step).
-    fn check_and_stage(&self) -> Result<()> {
+    fn check_and_stage(&self) -> Result<UpdateCheckOutcome> {
         let (feed, pubkey) = match (&self.feed_url, &self.pubkey_b64) {
             (Some(f), Some(p)) => (f, p),
-            _ => return Ok(()),
+            _ => bail!("auto-update is not configured in this build"),
         };
 
         let manifest_bytes = http_get(feed)?;
@@ -525,8 +652,10 @@ impl LinuxUpdater {
         let installed = InstalledState::load();
         let plan = plan_update(&manifest, CURRENT_VERSION, current_build(), &installed);
         if plan.nothing() {
-            info!("Auto-update: up to date (version {CURRENT_VERSION})");
-            return Ok(());
+            return Ok(UpdateCheckOutcome::UpToDate {
+                version: CURRENT_VERSION.to_string(),
+                build: current_build(),
+            });
         }
 
         let work = work_dir()?;
@@ -548,16 +677,19 @@ impl LinuxUpdater {
         if plan.bundle_changed {
             let dest = work.join("bundle.tar.zst");
             download_verify(&manifest.bundle.url, &manifest.bundle.sha256, &dest)?;
-            staged.new_bundle =
-                Some((manifest.bundle.abi.clone(), manifest.bundle.sha256.clone(), dest));
+            staged.new_bundle = Some((
+                manifest.bundle.abi.clone(),
+                manifest.bundle.sha256.clone(),
+                dest,
+            ));
         }
 
-        info!(
-            "Auto-update: staged {} (build {}, binary_changed={}, bundle_changed={})",
-            manifest.version, manifest.build, plan.binary_changed, plan.bundle_changed
-        );
         if !manifest.notes.trim().is_empty() {
-            info!("Auto-update: release notes for {}: {}", manifest.version, manifest.notes.trim());
+            info!(
+                "Auto-update: release notes for {}: {}",
+                manifest.version,
+                manifest.notes.trim()
+            );
         }
         // Forward-compat fields are parsed and surfaced, but not yet enforced (silent-by-default).
         if manifest.critical {
@@ -572,7 +704,14 @@ impl LinuxUpdater {
         // Signal the tray to quiesce capture before we apply (consumed via
         // take_prepare_for_update_request); harmless when already idle.
         self.shared.prepare_requested.store(true, Ordering::SeqCst);
-        Ok(())
+        Ok(UpdateCheckOutcome::Staged {
+            version: manifest.version,
+            build: manifest.build,
+            notes: manifest.notes,
+            binary_changed: plan.binary_changed,
+            bundle_changed: plan.bundle_changed,
+            critical: manifest.critical,
+        })
     }
 
     /// Apply the staged update: install the bundle (if changed), swap the binary in place, record
@@ -587,25 +726,38 @@ impl LinuxUpdater {
             .and_then(|mut g| g.take())
             .ok_or_else(|| anyhow!("apply() called with no staged update"))?;
 
+        let exe = std::env::current_exe().context("current_exe() failed")?;
+        ensure_executable_is_not_deleted_marker(&exe)?;
+
         let mut state = InstalledState::load();
 
         // 1. Bundle first: extract into its versioned dir. (Cross-ABI *activation* needs the
         //    self-provisioning binary; same-ABI updates touch nothing here.)
         if let Some((abi, sha, archive)) = &staged.new_bundle {
             let dest = bundle_dir(abi)?;
-            extract_bundle(archive, &dest)
-                .with_context(|| format!("failed to install libobs bundle into {}", dest.display()))?;
+            extract_bundle(archive, &dest).with_context(|| {
+                format!("failed to install libobs bundle into {}", dest.display())
+            })?;
             state.bundle_abi = abi.clone();
             state.bundle_sha256 = sha.clone();
-            info!("Auto-update: installed libobs bundle {} -> {}", abi, dest.display());
+            info!(
+                "Auto-update: installed libobs bundle {} -> {}",
+                abi,
+                dest.display()
+            );
         }
 
         // 2. Binary: write next to the running exe (same filesystem) then rename over it. On Linux
         //    you can't truncate a running binary, but you CAN rename a new file over it; the live
         //    process keeps its old inode until we re-exec.
         if let Some(new_binary) = &staged.new_binary {
-            let exe = std::env::current_exe().context("current_exe() failed")?;
-            let tmp = exe.with_extension("new");
+            let file_name = exe
+                .file_name()
+                .ok_or_else(|| anyhow!("executable path has no file name: {}", exe.display()))?;
+            let mut tmp_name = file_name.to_os_string();
+            tmp_name.push(format!(".new.{}", std::process::id()));
+            let tmp = exe.with_file_name(tmp_name);
+            let _ = std::fs::remove_file(&tmp);
             std::fs::copy(new_binary, &tmp)
                 .with_context(|| format!("failed to stage new binary at {}", tmp.display()))?;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).ok();
@@ -620,12 +772,80 @@ impl LinuxUpdater {
         }
 
         // 3. Re-exec the (now updated) binary, preserving args. Mirrors Sparkle relaunching the app.
-        let exe = std::env::current_exe().context("current_exe() failed")?;
         let args: Vec<String> = std::env::args().skip(1).collect();
-        info!("Auto-update: re-executing {} to complete update", exe.display());
+        info!(
+            "Auto-update: re-executing {} to complete update",
+            exe.display()
+        );
         let err = Command::new(&exe).args(&args).exec();
         Err(anyhow!("re-exec after update failed: {err}"))
     }
+}
+
+fn log_check_outcome(outcome: &UpdateCheckOutcome) {
+    match outcome {
+        UpdateCheckOutcome::UpToDate { version, build } => {
+            info!("Auto-update: up to date (version {version}, build {build})");
+        }
+        UpdateCheckOutcome::Staged {
+            version,
+            build,
+            binary_changed,
+            bundle_changed,
+            critical,
+            ..
+        } => {
+            info!(
+                "Auto-update: staged {version} (build {build}, binary_changed={binary_changed}, bundle_changed={bundle_changed}, critical={critical})"
+            );
+        }
+    }
+}
+
+fn dialog_status_for_outcome(
+    outcome: &UpdateCheckOutcome,
+) -> super::update_dialog::UpdateDialogStatus {
+    match outcome {
+        UpdateCheckOutcome::UpToDate { version, build } => {
+            super::update_dialog::UpdateDialogStatus::up_to_date(version, *build)
+        }
+        UpdateCheckOutcome::Staged {
+            version,
+            build,
+            notes,
+            binary_changed,
+            bundle_changed,
+            ..
+        } => super::update_dialog::UpdateDialogStatus::update_ready(
+            version,
+            *build,
+            *binary_changed,
+            *bundle_changed,
+            notes,
+        ),
+    }
+}
+
+fn format_run_identity(identity: &RunIdentity) -> String {
+    if identity.build > 0 {
+        format!("{}+{}", identity.version, identity.build)
+    } else {
+        identity.version.clone()
+    }
+}
+
+fn ensure_executable_is_not_deleted_marker(exe: &Path) -> Result<()> {
+    let marked_deleted = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(" (deleted)"));
+    if marked_deleted {
+        bail!(
+            "refusing to apply update while running from deleted executable path: {}",
+            exe.display()
+        );
+    }
+    Ok(())
 }
 
 // The update loop now lives in the shared tray loop (src/ui/tray.rs), which drives this updater
@@ -698,7 +918,10 @@ mod tests {
         };
         assert_eq!(
             plan_update(&m, "1.0.4", 0, &same),
-            Plan { binary_changed: false, bundle_changed: false }
+            Plan {
+                binary_changed: false,
+                bundle_changed: false
+            }
         );
 
         // Older binary, same bundle => binary-only (the common bugfix case).
@@ -709,7 +932,10 @@ mod tests {
         };
         assert_eq!(
             plan_update(&m, "1.0.3", 0, &binary_only),
-            Plan { binary_changed: true, bundle_changed: false }
+            Plan {
+                binary_changed: true,
+                bundle_changed: false
+            }
         );
 
         // Same version but bundle hash differs => bundle-only.
@@ -720,18 +946,93 @@ mod tests {
         };
         assert_eq!(
             plan_update(&m, "1.0.4", 0, &bundle_only),
-            Plan { binary_changed: false, bundle_changed: true }
+            Plan {
+                binary_changed: false,
+                bundle_changed: true
+            }
         );
     }
 
     #[test]
     fn post_update_notify_only_on_change_after_first_run() {
+        let current = RunIdentity {
+            version: "1.0.4".into(),
+            build: 12,
+        };
+
         // First run (no marker yet) never notifies, even though "current" is set.
-        assert!(!should_notify_post_update("", "1.0.4"));
-        // Unchanged version: no notification.
-        assert!(!should_notify_post_update("1.0.4", "1.0.4"));
-        // A real version change (the post-self-update re-exec case): notify.
-        assert!(should_notify_post_update("1.0.3", "1.0.4"));
+        assert!(!should_notify_post_update(None, &current));
+        // Unchanged version+build: no notification.
+        assert!(!should_notify_post_update(Some(&current), &current));
+        // A same-version build change is a real update and must notify.
+        assert!(should_notify_post_update(
+            Some(&RunIdentity {
+                version: "1.0.4".into(),
+                build: 11,
+            }),
+            &current
+        ));
+        // A version change still notifies.
+        assert!(should_notify_post_update(
+            Some(&RunIdentity {
+                version: "1.0.3".into(),
+                build: 99,
+            }),
+            &current
+        ));
+    }
+
+    #[test]
+    fn post_update_marker_accepts_json_and_legacy_plain_version() {
+        assert_eq!(
+            parse_run_identity(r#"{"version":"1.0.4","build":12}"#),
+            Some(RunIdentity {
+                version: "1.0.4".into(),
+                build: 12,
+            })
+        );
+        assert_eq!(
+            parse_run_identity("1.0.3"),
+            Some(RunIdentity {
+                version: "1.0.3".into(),
+                build: 0,
+            })
+        );
+        assert_eq!(parse_run_identity(""), None);
+    }
+
+    #[test]
+    fn manual_outcome_formats_dialog_status() {
+        let ready = dialog_status_for_outcome(&UpdateCheckOutcome::Staged {
+            version: "1.0.4".into(),
+            build: 12,
+            notes: "bugfixes".into(),
+            binary_changed: true,
+            bundle_changed: false,
+            critical: false,
+        });
+        assert!(ready.done);
+        assert!(!ready.error);
+        assert!(ready.message.contains("1.0.4 (build 12)"));
+        assert!(ready.message.contains("Updated components: app."));
+
+        let current = dialog_status_for_outcome(&UpdateCheckOutcome::UpToDate {
+            version: "1.0.3".into(),
+            build: 12,
+        });
+        assert_eq!(current.title, "CrowdCast Is Up to Date");
+    }
+
+    #[test]
+    fn deleted_executable_marker_is_rejected() {
+        assert!(ensure_executable_is_not_deleted_marker(Path::new(
+            "/home/franz/.local/bin/crowd-cast-agent"
+        ))
+        .is_ok());
+        assert!(ensure_executable_is_not_deleted_marker(Path::new(
+            "/home/franz/.local/bin/crowd-cast-agent (deleted)"
+        ))
+        .is_err());
     }
 
     #[test]
@@ -772,7 +1073,11 @@ mod tests {
         assert!(verify_ed25519(&tampered, &sig_b64, &vk_b64).is_err());
 
         // Wrong key is rejected.
-        let other = STANDARD.encode(SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes());
+        let other = STANDARD.encode(
+            SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         assert!(verify_ed25519(msg, &sig_b64, &other).is_err());
 
         // Malformed key/sig are errors, not panics.

@@ -92,7 +92,10 @@ impl GnomeScreenCast {
         let thread = std::thread::Builder::new()
             .name("gnome-screencast".into())
             .spawn(move || worker(rx))?;
-        Ok(Self { tx, _thread: thread })
+        Ok(Self {
+            tx,
+            _thread: thread,
+        })
     }
 
     /// All current toplevels (via the focus extension). Empty on any error.
@@ -146,7 +149,10 @@ impl GnomeScreenCast {
 
 /// Worker thread: owns a current-thread runtime + the zbus connection + every session.
 fn worker(rx: mpsc::Receiver<Cmd>) {
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!("gnome-screencast: runtime init failed: {e}");
@@ -217,7 +223,10 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
         for path in sessions.values() {
             stop_session(&conn, path).await;
         }
-        tracing::debug!("gnome-screencast: worker shut down ({} sessions closed)", sessions.len());
+        tracing::debug!(
+            "gnome-screencast: worker shut down ({} sessions closed)",
+            sessions.len()
+        );
     });
 }
 
@@ -254,7 +263,9 @@ fn reply_err(cmd: Cmd, msg: &str) {
 
 /// Query the focus extension for a window's frame rect + its monitor's geometry (logical px).
 async fn window_geometry(conn: &zbus::Connection, window_id: u64) -> Option<WinGeom> {
-    let proxy = zbus::Proxy::new(conn, FP_DEST, FP_PATH, FP_IFACE).await.ok()?;
+    let proxy = zbus::Proxy::new(conn, FP_DEST, FP_PATH, FP_IFACE)
+        .await
+        .ok()?;
     let (found, wx, wy, ww, wh, mx, my, mw, mh, scale): (
         bool,
         i32,
@@ -286,10 +297,10 @@ async fn list_windows(conn: &zbus::Connection) -> Result<Vec<WindowInfo>, String
     let proxy = zbus::Proxy::new(conn, FP_DEST, FP_PATH, FP_IFACE)
         .await
         .map_err(|e| format!("FocusProvider proxy: {e}"))?;
-    let raw: Vec<(u64, i32, String, String)> = proxy
-        .call("ListWindows", &())
-        .await
-        .map_err(|e| format!("ListWindows call: {e} (is the crowd-cast-focus extension loaded?)"))?;
+    let raw: Vec<(u64, i32, String, String)> =
+        proxy.call("ListWindows", &()).await.map_err(|e| {
+            format!("ListWindows call: {e} (is the crowd-cast-focus extension loaded?)")
+        })?;
     Ok(raw
         .into_iter()
         .map(|(id, pid, wm_class, title)| WindowInfo {

@@ -216,7 +216,12 @@ fn get_frontmost_app_x11() -> Option<AppInfo> {
         .reply()
         .ok()?
         .atom;
-    let net_wm_pid = conn.intern_atom(true, b"_NET_WM_PID").ok()?.reply().ok()?.atom;
+    let net_wm_pid = conn
+        .intern_atom(true, b"_NET_WM_PID")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
     if net_active_window == 0 || net_wm_pid == 0 {
         return None;
     }

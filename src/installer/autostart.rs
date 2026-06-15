@@ -453,7 +453,11 @@ fn linux_manual_autostart_for(config: &AutostartConfig) -> Option<ManualAutostar
             } else {
                 "your wlroots compositor".to_string()
             };
-            (name, cfg.join("sway").join("config"), format!("exec {exe}{args}"))
+            (
+                name,
+                cfg.join("sway").join("config"),
+                format!("exec {exe}{args}"),
+            )
         };
 
     // Append the line to the config. No idempotency guard needed: this is only ever surfaced
@@ -476,7 +480,10 @@ fn linux_manual_autostart_for(config: &AutostartConfig) -> Option<ManualAutostar
 /// positive of trusting an inert `~/.config/autostart/*.desktop`.
 #[cfg(target_os = "linux")]
 fn compositor_config_has_exec(m: &ManualAutostart) -> bool {
-    let exe = AutostartConfig::default().app_path.to_string_lossy().to_string();
+    let exe = AutostartConfig::default()
+        .app_path
+        .to_string_lossy()
+        .to_string();
     if exe.is_empty() {
         return false;
     }
@@ -653,5 +660,4 @@ mod tests {
         let enabled = is_autostart_enabled();
         println!("Autostart enabled: {}", enabled);
     }
-
 }

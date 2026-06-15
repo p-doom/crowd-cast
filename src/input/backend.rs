@@ -35,8 +35,9 @@ pub fn create_input_backend(secure: Arc<SecureInputState>) -> Result<Box<dyn Inp
         // silently dropping every keystroke. Startup gates on 'input' group membership (see
         // installer::requirements), so evdev should succeed by the time we get here; if it
         // still fails, fail closed and loud rather than degrade to recording no input.
-        let backend = super::evdev_backend::EvdevBackend::new(secure)
-            .context("evdev input backend init failed -- ensure the user is in the 'input' group")?;
+        let backend = super::evdev_backend::EvdevBackend::new(secure).context(
+            "evdev input backend init failed -- ensure the user is in the 'input' group",
+        )?;
         tracing::info!("Using evdev backend for input capture");
         Ok(Box::new(backend))
     }

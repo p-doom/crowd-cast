@@ -41,7 +41,13 @@ impl Dispatch<WlOutput, ()> for Outputs {
         _: &QueueHandle<Self>,
     ) {
         // `Mode` carries physical pixel dimensions; only the one flagged CURRENT is live.
-        if let wl_output::Event::Mode { flags, width, height, .. } = event {
+        if let wl_output::Event::Mode {
+            flags,
+            width,
+            height,
+            ..
+        } = event
+        {
             let is_current = matches!(
                 flags,
                 wayland_client::WEnum::Value(m) if m.contains(wl_output::Mode::Current)

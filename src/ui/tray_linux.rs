@@ -260,7 +260,10 @@ fn load_argb_icon(path: &Path) -> ksni::Icon {
     match image::open(path) {
         Ok(img) => argb_icon_from_rgba(&img.to_rgba8()),
         Err(e) => {
-            warn!("Failed to load tray icon {:?}: {} — using blank icon", path, e);
+            warn!(
+                "Failed to load tray icon {:?}: {} — using blank icon",
+                path, e
+            );
             ksni::Icon {
                 width: 1,
                 height: 1,

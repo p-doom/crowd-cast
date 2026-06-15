@@ -95,7 +95,10 @@ fn randr_at_least_1_5(conn: &RustConnection) -> bool {
 pub fn x11_screen_size() -> Option<(u32, u32)> {
     let (conn, screen_num) = x11rb::connect(None).ok()?;
     let screen = conn.setup().roots.get(screen_num)?;
-    let (w, h) = (screen.width_in_pixels as u32, screen.height_in_pixels as u32);
+    let (w, h) = (
+        screen.width_in_pixels as u32,
+        screen.height_in_pixels as u32,
+    );
     (w > 0 && h > 0).then_some((w, h))
 }
 
@@ -109,7 +112,12 @@ pub fn x11_monitor_rects() -> Option<Vec<(i32, i32, i32, i32)>> {
     use x11rb::protocol::randr::ConnectionExt as _;
     let (conn, screen_num) = x11rb::connect(None).ok()?;
     let root = conn.setup().roots.get(screen_num)?.root;
-    let monitors = conn.randr_get_monitors(root, true).ok()?.reply().ok()?.monitors;
+    let monitors = conn
+        .randr_get_monitors(root, true)
+        .ok()?
+        .reply()
+        .ok()?
+        .monitors;
     let rects: Vec<(i32, i32, i32, i32)> = monitors
         .iter()
         .filter(|m| m.width > 0 && m.height > 0)
@@ -161,7 +169,12 @@ fn focused_belongs_to(focused_comm: Option<&str>, app: &str) -> bool {
 
 /// Intern an atom only if it already exists (a WM published it); `None`/0 otherwise.
 fn intern(conn: &RustConnection, name: &str) -> Option<u32> {
-    let atom = conn.intern_atom(true, name.as_bytes()).ok()?.reply().ok()?.atom;
+    let atom = conn
+        .intern_atom(true, name.as_bytes())
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
     (atom != 0).then_some(atom)
 }
 

@@ -135,7 +135,11 @@ impl UpdaterController {
 
         // Read current version and build from the bundle
         let version = std::process::Command::new("/usr/libexec/PlistBuddy")
-            .args(["-c", "Print :CFBundleShortVersionString", &plist.to_string_lossy()])
+            .args([
+                "-c",
+                "Print :CFBundleShortVersionString",
+                &plist.to_string_lossy(),
+            ])
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -228,7 +232,7 @@ impl UpdaterController {
         #[cfg(target_os = "linux")]
         {
             if let Some(u) = &self.linux {
-                u.check_in_background();
+                u.check_manually()?;
             }
             return Ok(());
         }

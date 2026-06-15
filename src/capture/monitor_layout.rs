@@ -89,12 +89,20 @@ pub fn fit_for_window(window: Rect, monitor: Rect, monitor_scale: f64) -> Option
     if short <= 0.0 {
         return None;
     }
-    let scale_factor = if monitor_scale > 0.0 { monitor_scale } else { 1.0 };
+    let scale_factor = if monitor_scale > 0.0 {
+        monitor_scale
+    } else {
+        1.0
+    };
     let norm = TARGET_SHORT_EDGE / short;
     let scale = (norm / scale_factor) as f32;
     let pos_x = ((window.x - monitor.x) as f64 * norm) as f32;
     let pos_y = ((window.y - monitor.y) as f64 * norm) as f32;
-    Some(MonitorFit { scale, pos_x, pos_y })
+    Some(MonitorFit {
+        scale,
+        pos_x,
+        pos_y,
+    })
 }
 
 /// All monitor rectangles for the current session, or `None` if none can be enumerated. Wayland
@@ -103,13 +111,23 @@ pub fn fit_for_window(window: Rect, monitor: Rect, monitor_scale: f64) -> Option
 pub fn monitor_rects() -> Option<Vec<Rect>> {
     if super::x11_windows::is_pure_x11_session() {
         let rects = super::x11_windows::x11_monitor_rects()?;
-        return Some(rects.into_iter().map(|(x, y, w, h)| Rect::new(x, y, w, h)).collect());
+        return Some(
+            rects
+                .into_iter()
+                .map(|(x, y, w, h)| Rect::new(x, y, w, h))
+                .collect(),
+        );
     }
     let sizes = super::wayland_output::wayland_output_sizes();
     if sizes.is_empty() {
         return None;
     }
-    Some(sizes.into_iter().map(|(w, h)| Rect::new(0, 0, w as i32, h as i32)).collect())
+    Some(
+        sizes
+            .into_iter()
+            .map(|(w, h)| Rect::new(0, 0, w as i32, h as i32))
+            .collect(),
+    )
 }
 
 /// The multi-monitor recording canvas size for this session: the normalized envelope of every
@@ -159,7 +177,8 @@ mod tests {
         // 4K (8.29 MP, normalizes to 1920x1080) + 32:9 ultrawide 5120x1440 (7.37 MP, smaller
         // area but wider: short edge 1440 -> ×0.75 -> 3840x1080). Canvas must be wide enough for
         // the ultrawide AND tall enough for the 4K — per-axis max, not the largest by area.
-        let c = normalized_canvas(&[Rect::new(0, 0, 3840, 2160), Rect::new(0, 0, 5120, 1440)]).unwrap();
+        let c =
+            normalized_canvas(&[Rect::new(0, 0, 3840, 2160), Rect::new(0, 0, 5120, 1440)]).unwrap();
         assert_eq!(c, (3840, 1080));
     }
 
@@ -171,7 +190,12 @@ mod tests {
     #[test]
     fn fit_fhd_window_at_scale_1_is_identity() {
         // 1920x1080 window filling a 1920x1080 monitor at scale 1: scale 1.0, origin.
-        let fit = fit_for_window(Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1920, 1080), 1.0).unwrap();
+        let fit = fit_for_window(
+            Rect::new(0, 0, 1920, 1080),
+            Rect::new(0, 0, 1920, 1080),
+            1.0,
+        )
+        .unwrap();
         assert!((fit.scale - 1.0).abs() < 1e-4, "scale {}", fit.scale);
         assert_eq!((fit.pos_x, fit.pos_y), (0.0, 0.0));
     }
@@ -180,7 +204,12 @@ mod tests {
     fn fit_4k_monitor_at_scale_1_halves() {
         // 4K monitor at scale 1: norm = 1080/2160 = 0.5, so the captured 4K buffer is drawn at
         // 0.5 -> 1920x1080 in the canvas.
-        let fit = fit_for_window(Rect::new(0, 0, 3840, 2160), Rect::new(0, 0, 3840, 2160), 1.0).unwrap();
+        let fit = fit_for_window(
+            Rect::new(0, 0, 3840, 2160),
+            Rect::new(0, 0, 3840, 2160),
+            1.0,
+        )
+        .unwrap();
         assert!((fit.scale - 0.5).abs() < 1e-4, "scale {}", fit.scale);
     }
 
@@ -189,7 +218,12 @@ mod tests {
         // GNOME HiDPI: window logical 1280x720 on a logical 1920x1080 monitor at scale 2 (Mutter
         // buffer physical 2560x1440). norm = 1080/1080 = 1.0; scene scale = 1.0/2 = 0.5 maps the
         // physical buffer onto the 1280x720 footprint. Position is logical*norm.
-        let fit = fit_for_window(Rect::new(100, 50, 1280, 720), Rect::new(0, 0, 1920, 1080), 2.0).unwrap();
+        let fit = fit_for_window(
+            Rect::new(100, 50, 1280, 720),
+            Rect::new(0, 0, 1920, 1080),
+            2.0,
+        )
+        .unwrap();
         assert!((fit.scale - 0.5).abs() < 1e-4, "scale {}", fit.scale);
         assert!((fit.pos_x - 100.0).abs() < 1e-3, "pos_x {}", fit.pos_x);
         assert!((fit.pos_y - 50.0).abs() < 1e-3, "pos_y {}", fit.pos_y);
@@ -201,7 +235,12 @@ mod tests {
         // at scale 1. norm = 1080/1440 = 0.75; scale must be a stable 0.75 (not derived from the
         // flickering source buffer), positioned at (0, 24). Buffer 2560x1408 * 0.75 = 1920x1056,
         // fitting the 1920x1080 canvas with no crop.
-        let fit = fit_for_window(Rect::new(0, 32, 2560, 1408), Rect::new(0, 0, 2560, 1440), 1.0).unwrap();
+        let fit = fit_for_window(
+            Rect::new(0, 32, 2560, 1408),
+            Rect::new(0, 0, 2560, 1440),
+            1.0,
+        )
+        .unwrap();
         assert!((fit.scale - 0.75).abs() < 1e-4, "scale {}", fit.scale);
         assert!((fit.pos_x - 0.0).abs() < 1e-3, "pos_x {}", fit.pos_x);
         assert!((fit.pos_y - 24.0).abs() < 1e-3, "pos_y {}", fit.pos_y);
@@ -209,6 +248,9 @@ mod tests {
 
     #[test]
     fn fit_zero_monitor_is_none() {
-        assert_eq!(fit_for_window(Rect::new(0, 0, 100, 100), Rect::new(0, 0, 0, 0), 1.0), None);
+        assert_eq!(
+            fit_for_window(Rect::new(0, 0, 100, 100), Rect::new(0, 0, 0, 0), 1.0),
+            None
+        );
     }
 }

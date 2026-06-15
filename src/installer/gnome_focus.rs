@@ -56,7 +56,11 @@ fn env(name: &str) -> String {
 }
 
 fn which_exists(prog: &str) -> bool {
-    Command::new("which").arg(prog).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("which")
+        .arg(prog)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Whether the current desktop is GNOME.
@@ -83,15 +87,26 @@ fn is_installed() -> bool {
         return true;
     }
     for base in env("XDG_DATA_DIRS").split(':').filter(|s| !s.is_empty()) {
-        if PathBuf::from(base).join("gnome-shell/extensions").join(UUID).join("metadata.json").exists() {
+        if PathBuf::from(base)
+            .join("gnome-shell/extensions")
+            .join(UUID)
+            .join("metadata.json")
+            .exists()
+        {
             return true;
         }
     }
-    PathBuf::from("/usr/share/gnome-shell/extensions").join(UUID).join("metadata.json").exists()
+    PathBuf::from("/usr/share/gnome-shell/extensions")
+        .join(UUID)
+        .join("metadata.json")
+        .exists()
 }
 
 fn gsettings_get(schema: &str, key: &str) -> Option<String> {
-    let out = Command::new("gsettings").args(["get", schema, key]).output().ok()?;
+    let out = Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -145,8 +160,14 @@ fn name_has_owner(name: &str) -> bool {
             .arg("5")
             .arg("busctl")
             .args([
-                "--user", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
-                "org.freedesktop.DBus", "NameHasOwner", "s", name,
+                "--user",
+                "call",
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                "s",
+                name,
             ])
             .output()
         {
@@ -160,9 +181,15 @@ fn name_has_owner(name: &str) -> bool {
             .arg("5")
             .arg("gdbus")
             .args([
-                "call", "--session", "--dest", "org.freedesktop.DBus",
-                "--object-path", "/org/freedesktop/DBus",
-                "--method", "org.freedesktop.DBus.NameHasOwner", name,
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.DBus",
+                "--object-path",
+                "/org/freedesktop/DBus",
+                "--method",
+                "org.freedesktop.DBus.NameHasOwner",
+                name,
             ])
             .output()
         {
@@ -216,7 +243,10 @@ fn render_metadata() -> String {
     majors.sort_unstable();
     majors.dedup();
     value["shell-version"] = serde_json::Value::Array(
-        majors.into_iter().map(|m| serde_json::Value::String(m.to_string())).collect(),
+        majors
+            .into_iter()
+            .map(|m| serde_json::Value::String(m.to_string()))
+            .collect(),
     );
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| METADATA_JSON.to_string())
 }
@@ -243,7 +273,11 @@ pub fn install_and_enable() -> Result<String, String> {
     // Enable it. `gnome-extensions enable` is preferred; fall back to appending to the
     // gsettings key directly. Either way it only takes effect once gnome-shell reloads.
     let enabled = if which_exists("gnome-extensions") {
-        Command::new("gnome-extensions").args(["enable", UUID]).status().map(|s| s.success()).unwrap_or(false)
+        Command::new("gnome-extensions")
+            .args(["enable", UUID])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     } else {
         enable_via_gsettings()
     };

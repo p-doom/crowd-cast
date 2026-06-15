@@ -27,8 +27,8 @@ use crate::capture::{
 };
 use crate::config::Config;
 use crate::data::{
-    CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer, MetadataEvent, UNCAPTURED_APP_ID,
-    UNKNOWN_APP_ID,
+    CompletedChunk, ContextEvent, EventType, InputEvent, InputEventBuffer, MetadataEvent,
+    UNCAPTURED_APP_ID, UNKNOWN_APP_ID,
 };
 use crate::input::{create_input_backend, InputBackend};
 use crate::installer::permissions::describe_missing_permissions;
@@ -1191,7 +1191,9 @@ unintended app video."
             return;
         }
         let Some(bundle) = frontmost else { return };
-        let Some(focus) = crate::capture::focus::snapshot() else { return };
+        let Some(focus) = crate::capture::focus::snapshot() else {
+            return;
+        };
         // The frontmost target and the focus snapshot are both derived from the focus provider;
         // guard against a transient mismatch so we never bind one app to another's window.
         if !focus.app_id.eq_ignore_ascii_case(bundle) {
@@ -1199,7 +1201,9 @@ unintended app video."
         }
         // The focus provider gives the exact focused window-id; without it we can't bind (e.g.
         // no window focused, or the focus extension predates window-id reporting) — skip.
-        let Some(window_id) = focus.window_id else { return };
+        let Some(window_id) = focus.window_id else {
+            return;
+        };
         if let Err(e) = self
             .capture_ctx
             .gnome_ensure_focused_window(bundle, window_id)
@@ -1545,7 +1549,10 @@ unintended app video."
                                 }
                             }
                             if let Err(e) = tokio::fs::remove_file(&segment.input_path).await {
-                                warn!("Failed to delete input file {:?}: {}", segment.input_path, e);
+                                warn!(
+                                    "Failed to delete input file {:?}: {}",
+                                    segment.input_path, e
+                                );
                             } else {
                                 debug!("Deleted input file: {:?}", segment.input_path);
                             }
@@ -1723,7 +1730,12 @@ unintended app video."
 
         // Spawn background upload task (must be done inside async context)
         if let Some(upload_rx) = self.upload_rx.take() {
-            Self::spawn_upload_task(upload_rx, self.uploader.clone(), self.delete_after_upload, self.uploads_paused.clone());
+            Self::spawn_upload_task(
+                upload_rx,
+                self.uploader.clone(),
+                self.delete_after_upload,
+                self.uploads_paused.clone(),
+            );
         }
 
         // Take notification receiver for the main loop
@@ -1847,7 +1859,10 @@ unintended app video."
                     };
 
                     if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
-                        error!("Failed to re-queue recovered segment {}: {}", entry.chunk_id, e);
+                        error!(
+                            "Failed to re-queue recovered segment {}: {}",
+                            entry.chunk_id, e
+                        );
                     } else {
                         recovered += 1;
                     }
@@ -2410,8 +2425,8 @@ unintended app video."
         // extension isn't loaded yet, or a relogin is still pending).
         #[cfg(target_os = "linux")]
         {
-            let follow_focus = !self.config.capture.capture_all
-                && !self.config.capture.target_apps.is_empty();
+            let follow_focus =
+                !self.config.capture.capture_all && !self.config.capture.target_apps.is_empty();
             // Grace for the provider thread to connect on a cold start before failing closed.
             if follow_focus && !crate::capture::focus::is_live() {
                 for _ in 0..15 {
@@ -2939,13 +2954,19 @@ unintended app video."
 
                 match self.capture_ctx.fully_recreate_sources() {
                     Ok(count) => {
-                        info!("Recreated {} source(s) for display '{}'", count, display_name);
+                        info!(
+                            "Recreated {} source(s) for display '{}'",
+                            count, display_name
+                        );
                         if let Ok(res) = get_main_display_resolution() {
                             self.display_resolution = res;
                         }
                     }
                     Err(e) => {
-                        error!("Failed to recreate sources for display '{}': {}", display_name, e);
+                        error!(
+                            "Failed to recreate sources for display '{}': {}",
+                            display_name, e
+                        );
                     }
                 }
 
@@ -2975,7 +2996,10 @@ unintended app video."
 
                 match self.capture_ctx.reset_video_and_recreate_sources() {
                     Ok(()) => {
-                        info!("Reset video and recreated sources for display '{}'", to_name);
+                        info!(
+                            "Reset video and recreated sources for display '{}'",
+                            to_name
+                        );
                         if let Ok(res) = get_main_display_resolution() {
                             self.display_resolution = res;
                         }
@@ -3132,9 +3156,11 @@ unintended app video."
         // (which also requires source readiness). This way:
         // - On a tracked app with source not ready: timestamp updates, no spurious idle
         // - On an untracked app: timestamp goes stale, idle fires after timeout
-        if self.current_session.is_some() && self.config.should_capture_app(
-            self.last_frontmost_app.as_deref().unwrap_or(""),
-        ) {
+        if self.current_session.is_some()
+            && self
+                .config
+                .should_capture_app(self.last_frontmost_app.as_deref().unwrap_or(""))
+        {
             self.last_recorded_action_time = Instant::now();
         }
 
@@ -3210,7 +3236,8 @@ mod tests {
     use super::*;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("crowd-cast-test-{}-{}", name, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("crowd-cast-test-{}-{}", name, std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir
     }

@@ -15,6 +15,8 @@ pub mod tray_ffi;
 mod tray_linux;
 #[cfg(target_os = "macos")]
 mod tray_macos;
+#[cfg(target_os = "linux")]
+pub(crate) mod update_dialog;
 mod updater;
 #[cfg(target_os = "linux")]
 mod updater_linux;

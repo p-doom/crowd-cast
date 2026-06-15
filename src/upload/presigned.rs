@@ -183,7 +183,13 @@ impl Uploader {
         // 2. Get pre-signed URL for keylogs
         let keylog_file_name = format!("keylogs/input_{}.msgpack", chunk.chunk_id);
         let keylog_presign = self
-            .request_presigned_url(endpoint, &keylog_file_name, version, &user_id, auth_token_ref)
+            .request_presigned_url(
+                endpoint,
+                &keylog_file_name,
+                version,
+                &user_id,
+                auth_token_ref,
+            )
             .await?;
         debug!(
             "Got pre-signed URL for keylogs chunk {} (key: {})",

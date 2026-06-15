@@ -166,6 +166,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           prerelease: ${{ steps.ver.outputs.prerelease }}
           name: "crowd-cast (Linux ${{ steps.ver.outputs.channel }}) ${{ steps.ver.outputs.marketing }} build ${{ steps.ver.outputs.build }}"
           # The Linux binary is built here; the libobs bundle stays in its per-ABI Release (the

@@ -89,13 +89,9 @@ pub async fn run(
 /// it up dynamically (~200ms); newly launched apps activate at startup.
 async fn set_accessibility_enabled(on: bool) -> Result<()> {
     let session = atspi::zbus::Connection::session().await?;
-    let proxy = atspi::zbus::Proxy::new(
-        &session,
-        "org.a11y.Bus",
-        "/org/a11y/bus",
-        "org.a11y.Status",
-    )
-    .await?;
+    let proxy =
+        atspi::zbus::Proxy::new(&session, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Status")
+            .await?;
     proxy.set_property("IsEnabled", on).await?;
     // Best-effort; some stacks also gate activation on this.
     let _ = proxy.set_property("ScreenReaderEnabled", on).await;

@@ -14,13 +14,13 @@ mod context;
 #[cfg(target_os = "linux")]
 pub(crate) mod focus;
 mod frontmost;
-mod recording;
-mod recovery;
-mod sources;
 #[cfg(target_os = "linux")]
 pub(crate) mod gnome_screencast;
 #[cfg(target_os = "linux")]
 pub(crate) mod monitor_layout;
+mod recording;
+mod recovery;
+mod sources;
 #[cfg(target_os = "linux")]
 pub(crate) mod wayland_output;
 #[cfg(target_os = "linux")]

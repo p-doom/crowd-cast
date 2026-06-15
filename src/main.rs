@@ -36,8 +36,9 @@ pub extern "C" fn is_intentional_exit() -> bool {
 
 /// Channel for the SIGINT handler to send shutdown commands.
 #[cfg(unix)]
-static CMD_SENDER_FOR_SIGNAL: std::sync::Mutex<Option<(mpsc::Sender<EngineCommand>, Arc<tokio::runtime::Runtime>)>> =
-    std::sync::Mutex::new(None);
+static CMD_SENDER_FOR_SIGNAL: std::sync::Mutex<
+    Option<(mpsc::Sender<EngineCommand>, Arc<tokio::runtime::Runtime>)>,
+> = std::sync::Mutex::new(None);
 
 /// SIGINT handler: mark exit as intentional and trigger shutdown.
 #[cfg(unix)]
@@ -199,6 +200,18 @@ fn main() -> Result<()> {
                 .get(pos + 1)
                 .ok_or_else(|| anyhow::anyhow!("--settings-panel-out requires a file path"))?;
             ui::app_selector::run_settings_panel_subprocess(std::path::Path::new(out))?;
+            return Ok(());
+        }
+
+        // Internal: render the manual "Check for Updates" status dialog in a clean process.
+        // The parent agent writes simple status snapshots to the supplied file while the
+        // dialog polls it. This must stay above libobs/tray/runtime init for the same GTK
+        // default-GMainContext reason as `--settings-panel-out`.
+        if let Some(pos) = args.iter().position(|a| a == "--update-check-dialog") {
+            let status = args
+                .get(pos + 1)
+                .ok_or_else(|| anyhow::anyhow!("--update-check-dialog requires a file path"))?;
+            ui::update_dialog::run_update_check_dialog_subprocess(std::path::Path::new(status))?;
             return Ok(());
         }
 
@@ -391,8 +404,7 @@ fn main() -> Result<()> {
                 let tokens = capture_ctx.collect_restore_tokens();
                 let mut changed = false;
                 for (app, token) in tokens {
-                    if !token.is_empty()
-                        && config.capture.restore_tokens.get(&app) != Some(&token)
+                    if !token.is_empty() && config.capture.restore_tokens.get(&app) != Some(&token)
                     {
                         config.capture.restore_tokens.insert(app, token);
                         changed = true;
@@ -517,7 +529,12 @@ fn main() -> Result<()> {
 
         info!("Starting system tray on main thread");
 
-        match ui::TrayApp::new(tray_cmd_tx, tray_status_rx, auth_manager.clone(), Some(runtime.clone())) {
+        match ui::TrayApp::new(
+            tray_cmd_tx,
+            tray_status_rx,
+            auth_manager.clone(),
+            Some(runtime.clone()),
+        ) {
             Ok(tray) => {
                 if let Err(e) = tray.run() {
                     error!("Tray error: {}", e);
@@ -558,8 +575,7 @@ fn main() -> Result<()> {
     // (SIGTERM from macOS sleep/hibernate, NSApp termination) exit with 1
     // so KeepAlive/Crashed DOES restart on next login.
     #[cfg(not(no_tray))]
-    let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst)
-        || ui::was_quit_requested();
+    let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst) || ui::was_quit_requested();
     #[cfg(no_tray)]
     let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst);
 

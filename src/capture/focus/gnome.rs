@@ -25,7 +25,10 @@ pub fn spawn(state: Arc<FocusState>) {
     std::thread::Builder::new()
         .name("focus-gnome".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     tracing::warn!("follow-focus(gnome): runtime init failed: {e}");
@@ -89,11 +92,18 @@ pub(super) fn list_app_ids() -> Vec<String> {
                 .ok()?;
             rt.block_on(async {
                 let conn = zbus::Connection::session().await.ok()?;
-                let proxy = zbus::Proxy::new(&conn, BUS_NAME, OBJ_PATH, IFACE).await.ok()?;
+                let proxy = zbus::Proxy::new(&conn, BUS_NAME, OBJ_PATH, IFACE)
+                    .await
+                    .ok()?;
                 // ListWindows -> a(tiss): (window_id, pid, wm_class, title) per window.
                 let windows: Vec<(u64, i32, String, String)> =
                     proxy.call("ListWindows", &()).await.ok()?;
-                Some(windows.into_iter().map(|(_, _, cls, _)| cls).collect::<Vec<_>>())
+                Some(
+                    windows
+                        .into_iter()
+                        .map(|(_, _, cls, _)| cls)
+                        .collect::<Vec<_>>(),
+                )
             })
         })
         .ok()

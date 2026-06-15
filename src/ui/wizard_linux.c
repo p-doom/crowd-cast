@@ -534,3 +534,122 @@ void app_selection_free_result(AppSelectionResult *out) {
     out->selected_apps = NULL;
     out->selected_apps_count = 0;
 }
+
+// ---- Manual "Check for Updates" dialog -------------------------------------
+// Rendered only from a clean subprocess. The agent writes a tiny status file:
+//   line 1: done flag ("0" or "1")
+//   line 2: error flag ("0" or "1")
+//   line 3: title
+//   line 4+: message body
+// The dialog polls that file and updates in place. If the user closes it early, the
+// agent-side update check continues; this is only a user-facing foreground status view.
+
+typedef struct {
+    char *path;
+    GtkWidget *dialog;
+    GtkWidget *spinner;
+    GtkWidget *title;
+    GtkWidget *body;
+    guint poll_id;
+} UpdateCheckDialogCtx;
+
+static void update_check_set_title(GtkWidget *label, const char *title, gboolean error) {
+    const char *fallback = title && title[0] ? title : "Checking for Updates";
+    char *esc = g_markup_escape_text(fallback, -1);
+    char *markup = error
+        ? g_strdup_printf("<span size='large' weight='bold' foreground='#b00020'>%s</span>", esc)
+        : g_strdup_printf("<span size='large' weight='bold'>%s</span>", esc);
+    gtk_label_set_markup(GTK_LABEL(label), markup);
+    g_free(markup);
+    g_free(esc);
+}
+
+static gboolean update_check_dialog_poll(gpointer data) {
+    UpdateCheckDialogCtx *ctx = (UpdateCheckDialogCtx *)data;
+    char *contents = NULL;
+    gsize len = 0;
+    if (!g_file_get_contents(ctx->path, &contents, &len, NULL)) {
+        return TRUE;
+    }
+
+    gchar **parts = g_strsplit(contents, "\n", 4);
+    gboolean done = parts[0] && strcmp(parts[0], "1") == 0;
+    gboolean error = parts[1] && strcmp(parts[1], "1") == 0;
+    const char *title = parts[2] ? parts[2] : "";
+    const char *body = parts[3] ? parts[3] : "";
+
+    update_check_set_title(ctx->title, title, error);
+    gtk_label_set_text(GTK_LABEL(ctx->body), body);
+
+    if (done) {
+        gtk_spinner_stop(GTK_SPINNER(ctx->spinner));
+        gtk_widget_set_visible(ctx->spinner, FALSE);
+    } else {
+        gtk_widget_set_visible(ctx->spinner, TRUE);
+        gtk_spinner_start(GTK_SPINNER(ctx->spinner));
+    }
+
+    g_strfreev(parts);
+    g_free(contents);
+
+    return TRUE;
+}
+
+int show_update_check_dialog(const char *status_path) {
+    if (!status_path || !status_path[0]) return 1;
+    if (!gtk_init_check(NULL, NULL)) {
+        return 2;
+    }
+
+    UpdateCheckDialogCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.path = g_strdup(status_path);
+
+    ctx.dialog = gtk_dialog_new_with_buttons(
+        "crowd-cast updates", NULL, GTK_DIALOG_MODAL,
+        "_Close", GTK_RESPONSE_CLOSE,
+        NULL);
+    gtk_window_set_default_size(GTK_WINDOW(ctx.dialog), 460, 220);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(ctx.dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 16);
+    gtk_box_set_spacing(GTK_BOX(content), 10);
+
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_box_pack_start(GTK_BOX(content), row, FALSE, FALSE, 0);
+
+    ctx.spinner = gtk_spinner_new();
+    gtk_spinner_start(GTK_SPINNER(ctx.spinner));
+    gtk_widget_set_valign(ctx.spinner, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(row), ctx.spinner, FALSE, FALSE, 0);
+
+    GtkWidget *text_col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_box_pack_start(GTK_BOX(row), text_col, TRUE, TRUE, 0);
+
+    ctx.title = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(ctx.title), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(ctx.title), TRUE);
+    update_check_set_title(ctx.title, "Checking for Updates", FALSE);
+    gtk_box_pack_start(GTK_BOX(text_col), ctx.title, FALSE, FALSE, 0);
+
+    ctx.body = gtk_label_new("CrowdCast is checking for updates.");
+    gtk_label_set_xalign(GTK_LABEL(ctx.body), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(ctx.body), TRUE);
+    gtk_label_set_selectable(GTK_LABEL(ctx.body), TRUE);
+    gtk_box_pack_start(GTK_BOX(text_col), ctx.body, TRUE, TRUE, 0);
+
+    gtk_widget_show_all(ctx.dialog);
+    update_check_dialog_poll(&ctx);
+    ctx.poll_id = g_timeout_add(250, update_check_dialog_poll, &ctx);
+
+    gtk_dialog_run(GTK_DIALOG(ctx.dialog));
+
+    if (ctx.poll_id != 0) {
+        g_source_remove(ctx.poll_id);
+        ctx.poll_id = 0;
+    }
+    gtk_widget_destroy(ctx.dialog);
+    while (gtk_events_pending()) gtk_main_iteration();
+    g_free(ctx.path);
+    return 0;
+}
