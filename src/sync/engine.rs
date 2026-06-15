@@ -532,6 +532,10 @@ impl SyncEngine {
             Duration::ZERO // Disabled
         };
         let pause_uploads_on_idle = config.capture.pause_uploads_on_idle;
+        #[cfg(target_os = "linux")]
+        let single_active_app_capture =
+            crate::capture::is_single_active_capable() && !config.capture.target_apps.is_empty();
+        #[cfg(not(target_os = "linux"))]
         let single_active_app_capture = config.capture.single_active_app_capture
             && crate::capture::is_single_active_capable()
             && !config.capture.target_apps.is_empty();

@@ -36,12 +36,8 @@ pub fn is_gnome_wayland() -> bool {
 
 /// Whether this platform/session can drive the single-active-app capture model (capture
 /// only the frontmost tracked app, switching on focus). macOS always can (ScreenCaptureKit
-/// per-app). Linux can on both session types: a **pure X11 session** via XComposite
-/// per-window capture, and a **Wayland session** via per-app xdg-desktop-portal window
-/// sources whose scenes are switched on focus. Switching never re-prompts because the OBS
-/// pipewire source keeps its portal/PipeWire session alive across scene changes (`.show`/
-/// `.hide` only toggle `pw_stream_set_active`); the one-time portal prompt is paid when each
-/// source is created during setup.
+/// per-app). Linux can only when the current session has an explicitly supported per-app
+/// backend: GNOME Wayland through private Mutter ScreenCast, or pure X11 through XComposite.
 pub fn is_single_active_capable() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -49,11 +45,7 @@ pub fn is_single_active_capable() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        // Cheap session-type check only (env vars) — this is consulted on every focus
-        // switch. Whether per-window capture is actually available (portal WINDOW bit on
-        // Wayland / XComposite on X11) is gated separately by the wizard via
-        // `per_app_capture_available()`.
-        x11_windows::is_pure_x11_session() || sources::is_wayland_session()
+        crate::installer::requirements::per_app_capture_available()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

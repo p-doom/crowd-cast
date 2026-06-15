@@ -66,7 +66,8 @@ pub struct CaptureConfig {
     pub pause_uploads_on_idle: bool,
 
     /// On macOS, keep only the frontmost tracked application's capture source active.
-    /// This avoids running multiple ScreenCaptureKit application sources at once.
+    /// This avoids running multiple ScreenCaptureKit application sources at once. Linux
+    /// per-app capture uses the single-active path whenever it is supported.
     #[serde(default = "default_single_active_app_capture")]
     pub single_active_app_capture: bool,
 
@@ -82,9 +83,8 @@ pub struct CaptureConfig {
     #[serde(default = "default_capture_watchdog_max_retries")]
     pub capture_watchdog_max_retries: u32,
 
-    /// Per-app xdg-desktop-portal ScreenCast restore tokens for Wayland window capture,
-    /// keyed by the target-app identifier. Lets the portal restore the previously selected
-    /// window on later launches without re-prompting. Empty on macOS/Windows/X11.
+    /// xdg-desktop-portal ScreenCast restore tokens for supported Wayland display capture,
+    /// keyed by reserved identifiers such as `__display__`.
     #[serde(default)]
     pub restore_tokens: HashMap<String, String>,
 }
@@ -154,10 +154,8 @@ fn default_idle_timeout_secs() -> u64 {
 }
 
 fn default_single_active_app_capture() -> bool {
-    // On by default where follow-focus per-app capture exists: macOS (ScreenCaptureKit) and
-    // Linux — both X11 (XComposite per-window) and Wayland (per-app xdg-desktop-portal window
-    // sources with focus-driven scene switching). Whether it actually applies at runtime is
-    // gated per-session by `capture::is_single_active_capable()`.
+    // On by default where follow-focus per-app capture exists. On Linux this is mandatory
+    // for supported per-app capture rather than a portal-backed multi-source option.
     cfg!(target_os = "macos") || cfg!(target_os = "linux")
 }
 

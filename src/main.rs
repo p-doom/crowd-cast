@@ -382,58 +382,6 @@ fn main() -> Result<()> {
         );
     }
 
-    // Linux/Wayland per-app (window) capture: the first launch asks the user to pick a
-    // window per app via the xdg-desktop-portal; read back and persist the restore tokens
-    // so subsequent launches restore the same windows without prompting. No-op when tokens
-    // already exist, or on display-capture / non-window-capable sessions.
-    #[cfg(target_os = "linux")]
-    if !target_apps.is_empty() && installer::requirements::per_app_capture_available() {
-        use std::time::{Duration, Instant};
-        let pending: Vec<String> = target_apps
-            .iter()
-            .filter(|a| !config.capture.restore_tokens.contains_key(*a))
-            .cloned()
-            .collect();
-        if !pending.is_empty() {
-            info!(
-                "Per-app capture: waiting for window selection to persist restore tokens for {} app(s)...",
-                pending.len()
-            );
-            let deadline = Instant::now() + Duration::from_secs(60);
-            loop {
-                let tokens = capture_ctx.collect_restore_tokens();
-                let mut changed = false;
-                for (app, token) in tokens {
-                    if !token.is_empty() && config.capture.restore_tokens.get(&app) != Some(&token)
-                    {
-                        config.capture.restore_tokens.insert(app, token);
-                        changed = true;
-                    }
-                }
-                if changed {
-                    match config.save() {
-                        Ok(()) => info!(
-                            "Persisted {} window restore token(s)",
-                            config.capture.restore_tokens.len()
-                        ),
-                        Err(e) => warn!("Failed to save restore tokens: {}", e),
-                    }
-                }
-                let have_all = pending
-                    .iter()
-                    .all(|a| config.capture.restore_tokens.contains_key(a));
-                if have_all {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    warn!("Timed out waiting for some window selections; they will be requested again next launch.");
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    }
-
     // Linux/Wayland display capture: the first launch shows the portal monitor picker (a bare
     // slurp crosshair on wlroots/sway). Read back and persist its restore token under the
     // reserved display key so later launches restore the same output silently — no picker.

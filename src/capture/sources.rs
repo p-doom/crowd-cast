@@ -22,8 +22,7 @@ use libobs_wrapper::data::ObsObjectUpdater;
 #[cfg(target_os = "linux")]
 use libobs_simple::sources::linux::{
     PipeWireDesktopCaptureSourceBuilder, PipeWireScreenCaptureSourceBuilder,
-    PipeWireWindowCaptureSourceBuilder, X11CaptureSourceBuilder, XCompositeInputSourceBuilder,
-    XCompositeInputSourceUpdater,
+    X11CaptureSourceBuilder, XCompositeInputSourceBuilder, XCompositeInputSourceUpdater,
 };
 #[cfg(target_os = "linux")]
 use libobs_wrapper::data::{ObsData, ObsObjectUpdater};
@@ -248,19 +247,14 @@ impl ScreenCaptureSource {
     ///
     /// Privacy-preserving: only the target window's own buffer is captured, so an
     /// overlapping non-selected window cannot leak (no monitor cropping involved).
-    /// - **Wayland**: per-window capture via the xdg-desktop-portal ScreenCast WINDOW
-    ///   source (PipeWire). Selection is user-driven through the system picker — Wayland
-    ///   does not permit selecting a window by app id programmatically — so `bundle_id` is
-    ///   used only for logging; persist the restore token to avoid re-prompting.
+    /// - **Wayland**: not supported here. GNOME Wayland per-app capture binds Mutter-owned
+    ///   PipeWire nodes through [`Self::new_window_node_capture`]; sway is display capture
+    ///   only. xdg-desktop-portal WINDOW capture is not a supported crowd-cast backend.
     /// - **X11**: per-window capture via XComposite. `bundle_id` MUST be the X11 window id
     ///   (decimal string); mapping an application to its window id is the caller's job (see
     ///   the frontmost/app-enumeration code) and is intentionally not done here.
     ///
     /// `_display_uuid` is unused on Linux (kept for signature parity with macOS).
-    ///
-    /// NOTE: the end-to-end per-app / follow-focus flow on Linux (portal session lifecycle,
-    /// restore-token persistence, window-id resolution) requires validation on a Linux
-    /// machine.
     #[cfg(target_os = "linux")]
     pub fn new_application_capture(
         context: &mut ObsContext,
@@ -271,52 +265,36 @@ impl ScreenCaptureSource {
         _capture_audio: bool,
         restore_token: Option<&str>,
     ) -> Result<Self> {
-        let source = if is_wayland_session() {
-            info!(
-                "Creating Linux PipeWire (Wayland) window capture source: {} (app hint: {}, has_token: {})",
-                name,
-                bundle_id,
-                restore_token.map(|t| !t.is_empty()).unwrap_or(false)
+        if is_wayland_session() {
+            anyhow::bail!(
+                "Linux Wayland per-app capture must use GNOME Mutter ScreenCast nodes; \
+                 xdg-desktop-portal WINDOW capture is unsupported"
             );
-            // First launch (no token): the portal asks the user to pick a window, and the
-            // token is read back afterwards (see CaptureContext::collect_restore_tokens).
-            // Later launches pass the saved token so the same window is restored silently.
-            let mut builder = context
-                .source_builder::<PipeWireWindowCaptureSourceBuilder, _>(name)?
-                .set_show_cursor(true);
-            if let Some(token) = restore_token {
-                if !token.is_empty() {
-                    builder = builder.set_restore_token(token.to_string());
-                }
+        }
+        let _ = restore_token;
+        // X11: `bundle_id` is the app identity (`/proc/comm`), not a window id. Bind the
+        // app's window id *only if it is the focused window right now* (no fallback; see
+        // x11_windows). Empty otherwise (e.g. created at setup before the app is focused);
+        // the source stays blank and not-ready, so the engine's readiness gate keeps input
+        // capture off until a focus switch re-resolves it. Fail-closed, never a wrong window.
+        let capture_window =
+            crate::capture::x11_windows::resolve_capture_window(bundle_id).unwrap_or_default();
+        info!(
+            "Creating Linux X11 (xcomposite) window capture source: {} (app: {}, resolved: {})",
+            name,
+            bundle_id,
+            if capture_window.is_empty() {
+                "<no window yet>"
+            } else {
+                &capture_window
             }
-            builder
-                .add_to_scene(scene)
-                .context("Failed to add PipeWire window capture source to scene")?
-        } else {
-            // X11: `bundle_id` is the app identity (`/proc/comm`), not a window id. Bind the
-            // app's window id *only if it is the focused window right now* (no fallback — see
-            // x11_windows). Empty otherwise (e.g. created at setup before the app is focused);
-            // the source stays blank and not-ready, so the engine's readiness gate keeps input
-            // capture off until a focus switch re-resolves it. Fail-closed, never a wrong window.
-            let capture_window =
-                crate::capture::x11_windows::resolve_capture_window(bundle_id).unwrap_or_default();
-            info!(
-                "Creating Linux X11 (xcomposite) window capture source: {} (app: {}, resolved: {})",
-                name,
-                bundle_id,
-                if capture_window.is_empty() {
-                    "<no window yet>"
-                } else {
-                    &capture_window
-                }
-            );
-            context
-                .source_builder::<XCompositeInputSourceBuilder, _>(name)?
-                .set_capture_window(capture_window)
-                .set_show_cursor(true)
-                .add_to_scene(scene)
-                .context("Failed to add XComposite window capture source to scene")?
-        };
+        );
+        let source = context
+            .source_builder::<XCompositeInputSourceBuilder, _>(name)?
+            .set_capture_window(capture_window)
+            .set_show_cursor(true)
+            .add_to_scene(scene)
+            .context("Failed to add XComposite window capture source to scene")?;
 
         debug!("Linux application capture source '{}' created", name);
         Ok(Self {
@@ -386,7 +364,7 @@ impl ScreenCaptureSource {
         anyhow::bail!("Application capture not yet implemented for Windows (use window_capture)")
     }
 
-    /// Fallback for unsupported platforms.
+    /// Unsupported-platform implementation.
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     pub fn new_application_capture(
         _context: &mut ObsContext,
@@ -405,14 +383,15 @@ impl ScreenCaptureSource {
         &self.name
     }
 
-    /// The target app/window identifier this source captures (None for display capture).
+    /// The target app/window identifier this source captures. Linux Wayland display capture
+    /// uses [`DISPLAY_CAPTURE_KEY`] so its portal restore token can be persisted.
     pub fn app_id(&self) -> Option<&str> {
         self.app_id.as_deref()
     }
 
-    /// Read the xdg-desktop-portal restore token from a Wayland window-capture source.
+    /// Read the xdg-desktop-portal restore token from a Wayland PipeWire source.
     /// Returns None for other source types/platforms or before the user has selected a
-    /// window (the token only becomes available once the portal session is established).
+    /// display (the token only becomes available once the portal session is established).
     #[cfg(target_os = "linux")]
     pub fn restore_token(&self) -> Option<String> {
         use libobs_simple::sources::linux::PipeWireSourceExtTrait;
@@ -422,45 +401,6 @@ impl ScreenCaptureSource {
                 debug!("get_restore_token('{}') unavailable: {}", self.name, e);
                 None
             }
-        }
-    }
-
-    /// Wayland: block until this per-app PipeWire source is actually producing frames
-    /// (non-zero dimensions). Frames only flow once its xdg-desktop-portal ScreenCast
-    /// session is fully established — after the user picks a window on first run, or
-    /// after the silent restore handshake on later runs. We key on frame production
-    /// rather than the restore token because a token passed in up front reads as "ready"
-    /// immediately while the portal handshake is still in flight.
-    ///
-    /// This lets the caller create per-app sources ONE AT A TIME: two portal sessions
-    /// negotiating concurrently abort the OBS pipewire plugin (`free(): invalid pointer`).
-    /// On X11 (XComposite) there is no portal handshake, so this returns immediately.
-    ///
-    /// Returns `true` once the source is streaming, `false` on timeout (e.g. the user
-    /// dismissed the portal picker).
-    #[cfg(target_os = "linux")]
-    pub fn wait_until_capturing(&self, timeout: std::time::Duration) -> bool {
-        if !is_wayland_session() {
-            return true;
-        }
-        let start = std::time::Instant::now();
-        loop {
-            if let Ok((w, h)) = self.dimensions() {
-                if w > 0 && h > 0 {
-                    debug!(
-                        "Portal session for '{}' is streaming ({}x{}) after {:?}",
-                        self.name,
-                        w,
-                        h,
-                        start.elapsed()
-                    );
-                    return true;
-                }
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(150));
         }
     }
 
@@ -532,8 +472,8 @@ impl ScreenCaptureSource {
     /// via `obs_source_update()` (no source recreation). Binds empty when this app isn't the
     /// focused one, leaving the source blank/not-ready so input capture stays gated off (the
     /// engine never switches the active capture to a non-frontmost app, so in practice this
-    /// updates the just-focused app to its focused window). No-op on Wayland, where the
-    /// portal/PipeWire selection is user-driven and persisted via a restore token.
+    /// updates the just-focused app to its focused window). No-op on Wayland: GNOME uses
+    /// `update_connect_node`, and non-GNOME Wayland per-app capture is unsupported.
     #[cfg(target_os = "linux")]
     pub fn update_application(&mut self, bundle_id: &str) -> Result<()> {
         if is_wayland_session() {
