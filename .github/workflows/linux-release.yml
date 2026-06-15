@@ -136,13 +136,13 @@ jobs:
             --out-dir dist
           python3 - "${{ steps.ver.outputs.feed_url }}" "$ED_PUBLIC_KEY" \
             packaging/linux/install.sh dist/install-linux.sh <<'PY'
-import pathlib, sys
-feed_url, pubkey, src, dest = sys.argv[1:]
-text = pathlib.Path(src).read_text(encoding="utf-8")
-text = text.replace("__CROWD_CAST_DEFAULT_FEED_URL__", feed_url)
-text = text.replace("__CROWD_CAST_UPDATE_PUBKEY__", pubkey)
-pathlib.Path(dest).write_text(text, encoding="utf-8")
-PY
+          import pathlib, sys
+          feed_url, pubkey, src, dest = sys.argv[1:]
+          text = pathlib.Path(src).read_text(encoding="utf-8")
+          text = text.replace("__CROWD_CAST_DEFAULT_FEED_URL__", feed_url)
+          text = text.replace("__CROWD_CAST_UPDATE_PUBKEY__", pubkey)
+          pathlib.Path(dest).write_text(text, encoding="utf-8")
+          PY
           chmod 0755 dist/install-linux.sh
           cp assets/logo.png dist/logo.png
 
