@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Build a relocatable libobs bundle from pinned OBS source. Runs INSIDE the AlmaLinux 8
+# Build a relocatable libobs bundle from pinned OBS source. Runs INSIDE the AlmaLinux 9
 # container. Idempotent: x264/FFmpeg are skipped if already built in the cached /build/stage,
 # clones are reused, OBS rebuilds incrementally. Output -> /out (host-mounted).
 set -euo pipefail
 
-# Modern toolchain (gcc-toolset-13). NOTE on libstdc++: binaries built here need GCC13-level
-# GLIBCXX. We do NOT bundle libstdc++ yet (the build/test host, Manjaro, has a newer one, so it
-# resolves). Cross-distro to OLD-libstdc++ hosts needs the "checkrt newer-wins" launcher shim
-# — tracked as a follow-up.
+# Use the container's default GCC 11 so the libstdc++/GLIBCXX requirement stays aligned with
+# the AlmaLinux 9 floor. If a local image provides gcc-toolset-13, this keeps older cached builds
+# working, but the production Dockerfile intentionally does not install it.
 source /opt/rh/gcc-toolset-13/enable 2>/dev/null || true
 echo "::: toolchain: $(gcc --version | head -1)"
 

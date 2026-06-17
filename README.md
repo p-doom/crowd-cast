@@ -71,7 +71,7 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 
 - **Single binary**: No external OBS installation required (libobs is embedded)
 - **Privacy-aware capture**: Only records when selected applications are in the foreground
-- **Automatic updates**: Sparkle framework keeps the app up to date in the background
+- **Automatic updates**: signed background updates on macOS, Windows, and Linux
 - **Idle detection**: Automatically pauses recording when you step away, resumes on return
 - **Hardware acceleration**: Uses native encoding (VideoToolbox on macOS)
 - **Efficient uploads**: Streaming uploads via pre-signed S3 URLs with retry/backoff
@@ -81,7 +81,13 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 
 ### For users
 
-Download `CrowdCast.dmg` from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest), open it and follow the instructions in the wizard. 
+Download the installer for your platform from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest):
+
+- macOS: `CrowdCast.dmg`
+- Windows: `crowd-cast-setup.exe`
+- Linux: `curl -fsSL https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh | bash`
+
+Linux support is limited to GNOME on Wayland and sway. GNOME supports per-app capture; sway currently supports full-screen capture.
 
 ### Building from source
 
@@ -152,15 +158,27 @@ scripts/build-and-publish-macos.sh \
 
 Auto-updates are delivered via Sparkle using an appcast hosted on S3.
 
-### Linux/Windows
+### Linux
 
-Support coming soon...
+Linux installs into user space under `~/.local` and downloads the matching libobs bundle during installation. The production installer is published with each release:
+
+```bash
+curl -fsSL https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh | bash
+```
+
+Supported Linux sessions are GNOME on Wayland and sway. Other desktop sessions are blocked during setup so the agent does not run in an unvalidated capture mode. Linux auto-updates use a signed appcast hosted on S3 and install silently when recording and uploads are idle.
+
+### Windows
+
+Download `crowd-cast-setup.exe` from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest) and run the setup wizard. Windows auto-updates are delivered through the signed Windows appcast.
 
 ## Configuration
 
 Most settings are managed through the setup wizard and the tray menu. The configuration file is at:
 
 - macOS: `~/Library/Application Support/dev.crowd-cast.agent/config.toml`
+- Linux: `~/.config/agent/config.toml`
+- Windows: `%APPDATA%\agent\config.toml`
 
 Key settings:
 

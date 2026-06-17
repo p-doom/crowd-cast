@@ -9,8 +9,8 @@ like `mp4_output`).
 ## Why a container (and which one)
 
 Portability comes from the **glibc floor**, not from where the build runs. We build in
-**AlmaLinux 8 (glibc 2.28)** — the manylinux_2_28 floor — so the binaries run on any
-newer glibc (Ubuntu 20.04+, Debian 11+, RHEL 8/9, Fedora, Arch, ...). Building on the
+**AlmaLinux 9 (glibc 2.34)**, so the binaries run on newer glibc distributions
+(Ubuntu 22.04+, Debian 12+, RHEL 9, Fedora, Arch, ...). Building on the
 host (Manjaro, bleeding-edge glibc) would stamp new `GLIBC_2.xx` requirements and fail
 everywhere else. GitHub Actions would run this *same* container — so building locally
 in Podman is production-equivalent; CI just automates + signs it later.
@@ -33,7 +33,7 @@ those are the host's (bundling them drops the host to swrast or breaks capture I
     # one-time: install a container runtime (needs root)
     sudo pacman -S podman           # or: sudo pacman -S docker && enable it
 
-    # build the bundle (runs the AlmaLinux 8 container, ~30-60 min first time)
+    # build the bundle (runs the AlmaLinux 9 container, ~30-60 min first time)
     packaging/linux/run-build.sh
 
 Output: `packaging/linux/out/obs-bundle-32.0.2-x86_64.tar.zst` + `.sha256`.
