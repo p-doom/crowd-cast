@@ -50,6 +50,7 @@ mod ffi {
             version: *const c_char,
             build: *const c_char,
         );
+        pub fn notifications_show_upload_queue_warning();
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -80,6 +81,35 @@ extern "C" fn notification_action_callback(action_id: *const std::ffi::c_char, d
         if let Err(e) = sender.send(action) {
             error!("Failed to send notification action: {}", e);
         }
+    }
+}
+
+/// Raise a Windows toast notification under our own AppUserModelID so it is
+/// branded as crowd-cast. `super::register_notification_identity()` must have
+/// run at startup to register the matching Start Menu shortcut.
+#[cfg(target_os = "windows")]
+fn windows_toast(title: &str, text: &str) {
+    use tauri_winrt_notification::Toast;
+    if let Err(e) = Toast::new(super::aumid_windows::APP_AUMID)
+        .title(title)
+        .text1(text)
+        .show()
+    {
+        debug!("Failed to show toast notification: {}", e);
+    }
+}
+
+/// Show a desktop notification on platforms that have an implementation.
+/// Windows raises a toast; other non-macOS platforms are a no-op.
+#[cfg(not(target_os = "macos"))]
+fn platform_notify(text: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        windows_toast("crowd-cast", text);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        debug!("Notification not shown (unsupported platform): {}", text);
     }
 }
 
@@ -151,11 +181,11 @@ pub fn show_display_change_notification(from_display: &str, to_display: &str, to
 /// Show display change notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_display_change_notification(
-    _from_display: &str,
-    _to_display: &str,
+    from_display: &str,
+    to_display: &str,
     _to_display_id: u32,
 ) {
-    debug!("Notifications not supported on this platform");
+    platform_notify(&format!("Display changed: {} → {}", from_display, to_display));
 }
 
 /// Show notification when capture resumes on original display
@@ -178,8 +208,8 @@ pub fn show_capture_resumed_notification(display_name: &str) {
 
 /// Show capture resumed notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
-pub fn show_capture_resumed_notification(_display_name: &str) {
-    debug!("Notifications not supported on this platform");
+pub fn show_capture_resumed_notification(display_name: &str) {
+    platform_notify(&format!("Capture resumed on {}", display_name));
 }
 
 /// Show notification when recording starts
@@ -195,7 +225,7 @@ pub fn show_recording_started_notification() {
 /// Show recording started notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_recording_started_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Recording started");
 }
 
 /// Show notification when recording stops
@@ -211,7 +241,7 @@ pub fn show_recording_stopped_notification() {
 /// Show recording stopped notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_recording_stopped_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Recording stopped");
 }
 
 /// Show notification when recording is paused
@@ -227,7 +257,7 @@ pub fn show_recording_paused_notification() {
 /// Show recording paused notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_recording_paused_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Recording paused");
 }
 
 /// Show notification when recording is resumed
@@ -243,7 +273,7 @@ pub fn show_recording_resumed_notification() {
 /// Show recording resumed notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_recording_resumed_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Recording resumed");
 }
 
 /// Show notification when recording is blocked by missing permissions
@@ -266,8 +296,8 @@ pub fn show_permissions_missing_notification(message: &str) {
 
 /// Show permissions missing notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
-pub fn show_permissions_missing_notification(_message: &str) {
-    debug!("Notifications not supported on this platform");
+pub fn show_permissions_missing_notification(message: &str) {
+    platform_notify(message);
 }
 
 /// Show notification when OBS download starts
@@ -283,7 +313,23 @@ pub fn show_obs_download_started_notification() {
 /// Show OBS download started notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_obs_download_started_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Downloading capture components…");
+}
+
+/// Show notification warning that many segments are queued because uploads are paused
+#[cfg(target_os = "macos")]
+pub fn show_upload_queue_warning_notification() {
+    unsafe {
+        ffi::notifications_show_upload_queue_warning();
+    }
+
+    debug!("Showed upload queue warning notification");
+}
+
+/// Show upload queue warning notification (non-macOS stub)
+#[cfg(not(target_os = "macos"))]
+pub fn show_upload_queue_warning_notification() {
+    platform_notify("Many segments are waiting to upload — resume uploads from the tray menu");
 }
 
 /// Show notification when post-wizard setup starts
@@ -299,7 +345,7 @@ pub fn show_setup_configuring_notification() {
 /// Show setup configuring notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_setup_configuring_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Finishing setup…");
 }
 
 /// Show notification when capture sources are refreshed
@@ -315,7 +361,7 @@ pub fn show_sources_refreshed_notification() {
 /// Show sources refreshed notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_sources_refreshed_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Capture sources refreshed");
 }
 
 /// Show notification when recording is paused due to user inactivity
@@ -331,7 +377,7 @@ pub fn show_idle_paused_notification() {
 /// Show idle paused notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_idle_paused_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Paused — no recent activity");
 }
 
 /// Show notification when recording resumes after user activity detected
@@ -347,7 +393,33 @@ pub fn show_idle_resumed_notification() {
 /// Show idle resumed notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_idle_resumed_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Resumed — activity detected");
+}
+
+/// Low disk space warning. No macOS toast yet (the engine logs it regardless);
+/// add an FFI toast here if/when macOS distribution needs one.
+#[cfg(target_os = "macos")]
+pub fn show_low_disk_notification(_free_mb: u64) {}
+
+/// Low disk space warning (non-macOS).
+#[cfg(not(target_os = "macos"))]
+pub fn show_low_disk_notification(free_mb: u64) {
+    platform_notify(&format!(
+        "Low disk space: {} MB free. Recording may stop soon.",
+        free_mb
+    ));
+}
+
+/// Feedback toast for a manual "Check for Updates" (macOS uses Sparkle's own UI).
+#[cfg(target_os = "macos")]
+pub fn show_update_check_notification(_message: &str) {}
+
+/// Feedback toast for a manual "Check for Updates" (non-macOS): WinSparkle's
+/// interactive dialog does not surface for our windowless tray app, so the tray
+/// drives the silent check and we report progress/result via this toast.
+#[cfg(not(target_os = "macos"))]
+pub fn show_update_check_notification(message: &str) {
+    platform_notify(message);
 }
 
 /// Show notification when an update is being installed
@@ -363,7 +435,7 @@ pub fn show_update_installing_notification() {
 /// Show update installing notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
 pub fn show_update_installing_notification() {
-    debug!("Notifications not supported on this platform");
+    platform_notify("Installing update…");
 }
 
 /// Show notification after a background update completed
@@ -379,8 +451,8 @@ pub fn show_update_completed_notification(version: &str, build: &str) {
 
 /// Show update completed notification (non-macOS stub)
 #[cfg(not(target_os = "macos"))]
-pub fn show_update_completed_notification(_version: &str, _build: &str) {
-    debug!("Notifications not supported on this platform");
+pub fn show_update_completed_notification(version: &str, build: &str) {
+    platform_notify(&format!("Updated to {} ({})", version, build));
 }
 
 /// Check if notifications are authorized
@@ -392,8 +464,18 @@ pub fn is_authorized() -> bool {
     result == 1
 }
 
-/// Check notification authorization (non-macOS stub)
-#[cfg(not(target_os = "macos"))]
+/// Check notification authorization on Windows.
+///
+/// Windows toasts don't require runtime authorization (the user can disable them
+/// in Settings), so report authorized — otherwise the engine's notify guards
+/// would suppress every notification.
+#[cfg(target_os = "windows")]
+pub fn is_authorized() -> bool {
+    true
+}
+
+/// Check notification authorization (stub for platforms without an implementation)
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn is_authorized() -> bool {
     false
 }

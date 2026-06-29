@@ -3,6 +3,12 @@
 //! Captures paired screencast and input data for dataset collection.
 //! Uses embedded libobs for single-binary distribution.
 
+// Release builds run as a background tray agent, so use the Windows GUI
+// subsystem to avoid popping a console window (which would show libobs/log
+// output) when launched from the installer/Start Menu. Debug builds keep the
+// console for development. No-op on non-Windows targets.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod auth;
 mod capture;
 mod config;
@@ -57,12 +63,61 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
     }
 }
 
+/// Channel for the Windows console control handler to send shutdown commands.
+#[cfg(windows)]
+static WIN_CMD_SENDER: std::sync::Mutex<Option<mpsc::Sender<EngineCommand>>> =
+    std::sync::Mutex::new(None);
+
+/// Windows console control handler (Ctrl+C / Ctrl+Break / console close).
+///
+/// Windows has no SIGINT, so without this Ctrl+C hard-kills the process and the
+/// current segment's buffered input events are never flushed to disk. This marks
+/// the exit intentional and asks the engine to shut down gracefully (which runs
+/// stop_recording → writes the segment's .msgpack). Returning TRUE keeps the
+/// process alive long enough for main() to join the engine thread and flush.
+#[cfg(windows)]
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> windows::Win32::Foundation::BOOL {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+        | CTRL_SHUTDOWN_EVENT => {
+            INTENTIONAL_EXIT.store(true, Ordering::SeqCst);
+            if let Ok(guard) = WIN_CMD_SENDER.lock() {
+                if let Some(tx) = guard.as_ref() {
+                    let _ = tx.try_send(EngineCommand::Shutdown);
+                }
+            }
+            BOOL(1)
+        }
+        _ => BOOL(0),
+    }
+}
+
 use config::Config;
 use installer::{needs_setup, reconcile_autostart, run_wizard_gui, AutostartConfig};
 use sync::{create_engine_channels, EngineCommand, SyncEngine};
 
 /// Main entry point, runs tray on main thread (required for macOS)
 fn main() -> Result<()> {
+    // On Windows, declare Per-Monitor-V2 DPI awareness before any graphics or
+    // window initialization. libobs (and its window/monitor capture sources) read
+    // window rectangles in physical pixels; if the host process is DPI-unaware the
+    // system virtualizes those coordinates on scaled displays (e.g. 150%), so the
+    // captured window texture and the rect libobs uses disagree and the capture is
+    // mis-scaled/cropped. OBS itself runs Per-Monitor-V2 for this reason.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        // Best-effort: fails harmlessly if awareness was already set (e.g. via manifest).
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     // Initialize logging
     let _log_guard = logging::init_logging()?;
 
@@ -81,6 +136,11 @@ fn main() -> Result<()> {
     }
 
     info!("crowd-cast Agent starting...");
+
+    // On Windows, register our notification identity (AUMID + Start Menu
+    // shortcut) so toasts are branded as crowd-cast rather than PowerShell.
+    #[cfg(target_os = "windows")]
+    ui::register_notification_identity();
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
@@ -248,6 +308,21 @@ fn main() -> Result<()> {
         *CMD_SENDER_FOR_SIGNAL.lock().unwrap() = Some((sigint_tx, sigint_runtime));
     }
 
+    // Windows: install a console control handler so Ctrl+C (and console close)
+    // shut the engine down gracefully and flush the current segment to disk,
+    // instead of hard-killing the process and losing buffered input events.
+    #[cfg(windows)]
+    {
+        *WIN_CMD_SENDER.lock().unwrap() = Some(cmd_tx.clone());
+        unsafe {
+            use windows::Win32::Foundation::BOOL;
+            use windows::Win32::System::Console::SetConsoleCtrlHandler;
+            if let Err(e) = SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(1)) {
+                warn!("Failed to install console Ctrl+C handler: {}", e);
+            }
+        }
+    }
+
     // Run tray on main thread
     #[cfg(not(no_tray))]
     {
@@ -284,7 +359,10 @@ fn main() -> Result<()> {
         let _ = cmd_tx.send(EngineCommand::Shutdown).await;
     });
 
-    // Wait for engine thread to finish
+    // Wait for engine thread to finish.
+    // In the no_tray path above we already joined engine_handle while waiting
+    // for Ctrl+C, so only join here when the tray owned the main loop.
+    #[cfg(not(no_tray))]
     let _ = engine_handle.join();
 
     // Determine exit code: intentional exits (Quit menu, Sparkle update, Ctrl+C)

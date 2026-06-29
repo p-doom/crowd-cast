@@ -33,14 +33,79 @@ use crate::data::{
 use crate::input::{create_input_backend, InputBackend};
 use crate::installer::permissions::describe_missing_permissions;
 use crate::ui::notifications::{
-    is_authorized as notifications_authorized, show_idle_paused_notification,
-    show_idle_resumed_notification, show_permissions_missing_notification,
-    show_recording_paused_notification, show_recording_resumed_notification,
-    show_recording_started_notification, show_recording_stopped_notification, NotificationAction,
+    is_authorized as notifications_authorized, show_low_disk_notification,
+    show_permissions_missing_notification, show_recording_paused_notification,
+    show_recording_resumed_notification, show_recording_started_notification,
+    show_recording_stopped_notification, NotificationAction,
 };
 use crate::upload::Uploader;
 
 use super::{EngineCommand, EngineStatus};
+
+/// Warn when free space on the recording volume drops below this. crowd-cast's
+/// own files stay small (uploads delete them), so this mostly catches the disk
+/// filling from other things, which would otherwise silently stop recording.
+const LOW_DISK_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// How often to check free space (it's a syscall, so don't run it every poll).
+const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often to re-check the captured source resolution for changes. Resolution
+/// changes are rare (app switch / window resize), so this need not run every poll.
+const SOURCE_RES_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Aspect ratio (width / height), or 0.0 when the height is unknown.
+fn aspect_ratio(width: u32, height: u32) -> f64 {
+    if height == 0 {
+        0.0
+    } else {
+        width as f64 / height as f64
+    }
+}
+
+/// Free bytes available to the caller on the volume containing `path`, or None
+/// if it can't be determined (e.g. the path doesn't exist).
+#[cfg(target_os = "windows")]
+fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lp_directory_name: *const u16,
+            lp_free_bytes_available_to_caller: *mut u64,
+            lp_total_number_of_bytes: *mut u64,
+            lp_total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_avail: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_avail,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free_avail)
+}
+
+/// Free bytes available on the volume containing `path` (unix), or None on error.
+#[cfg(not(target_os = "windows"))]
+fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    let rc = unsafe { libc::statfs(cpath.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_bsize as u64))
+}
 
 /// Restart the current process with a clean OBS context.
 /// Uses a fresh process on macOS so AppKit/ControlCenter also get a fresh
@@ -466,6 +531,15 @@ pub struct SyncEngine {
     restart_alert_shown: bool,
     /// Native display resolution (logical points) — updated on display change
     display_resolution: (u32, u32),
+    /// Whether we've already warned about low disk space (re-armed once it recovers)
+    low_disk_warned: bool,
+    /// Last time we checked free disk space (throttles the syscall)
+    last_disk_check: Instant,
+    /// Native resolution of the captured source at the last metadata emit, used to
+    /// detect changes so a fresh metadata event is logged when it changes
+    last_logged_source_dims: Option<(u32, u32)>,
+    /// Last time the captured source resolution was checked for changes
+    last_source_res_check: Instant,
 }
 
 impl SyncEngine {
@@ -498,7 +572,7 @@ impl SyncEngine {
         };
         let pause_uploads_on_idle = config.capture.pause_uploads_on_idle;
         let single_active_app_capture = config.capture.single_active_app_capture
-            && cfg!(target_os = "macos")
+            && cfg!(any(target_os = "macos", target_os = "windows"))
             && !config.capture.target_apps.is_empty();
         let blank_video_on_untracked_app = config.capture.blank_video_on_untracked_app;
         let capture_watchdog_timeout =
@@ -553,6 +627,10 @@ unintended app video."
             any_source_ever_ready: false,
             restart_alert_shown: false,
             display_resolution: get_main_display_resolution().unwrap_or((1920, 1080)),
+            low_disk_warned: false,
+            last_disk_check: Instant::now(),
+            last_logged_source_dims: None,
+            last_source_res_check: Instant::now(),
         }
     }
 
@@ -1312,22 +1390,59 @@ unintended app video."
         self.last_emitted_context = Some(app_id);
     }
 
-    /// Emit a metadata event with the current display resolution.
-    /// Called once at the start of each segment (before the first context event).
+    /// Emit a metadata event describing the current recording geometry: the
+    /// canvas, the encoded output, and the native size of the captured source.
+    /// Emitted at the start of each segment and whenever the captured source's
+    /// resolution changes (see `log_source_resolution_changes`).
     fn emit_metadata_event(&mut self, timestamp_us: u64) {
         let (dw, dh) = self.display_resolution;
         let (ow, oh) = crate::capture::calculate_output_dimensions(dw, dh, 1080);
+        let (sw, sh) = self
+            .capture_ctx
+            .active_source_dimensions()
+            .ok()
+            .flatten()
+            .unwrap_or((0, 0));
+        self.last_logged_source_dims = Some((sw, sh));
         let utc_now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.event_buffer.push(InputEvent {
             timestamp_us,
             event: EventType::Metadata(MetadataEvent {
                 display_width: dw,
                 display_height: dh,
+                display_aspect: aspect_ratio(dw, dh),
                 output_width: ow,
                 output_height: oh,
+                output_aspect: aspect_ratio(ow, oh),
+                source_width: sw,
+                source_height: sh,
+                source_aspect: aspect_ratio(sw, sh),
                 timestamp_utc: utc_now,
             }),
         });
+    }
+
+    /// Emit a fresh metadata event when the captured source's native resolution
+    /// changes (app switch or window resize), so every resolution and aspect ratio
+    /// seen during a recording is logged, not just the one present at segment start.
+    fn log_source_resolution_changes(&mut self) {
+        if self.current_session.is_none() || self.is_paused {
+            return;
+        }
+        if self.last_source_res_check.elapsed() < SOURCE_RES_CHECK_INTERVAL {
+            return;
+        }
+        self.last_source_res_check = Instant::now();
+
+        let Some((w, h)) = self.capture_ctx.active_source_dimensions().ok().flatten() else {
+            return;
+        };
+        if w == 0 || h == 0 {
+            return;
+        }
+        if self.last_logged_source_dims != Some((w, h)) {
+            self.emit_metadata_event(self.current_capture_timestamp_us());
+        }
     }
 
     fn emit_context_snapshot(&mut self, should_capture: bool, timestamp_us: u64) {
@@ -1479,10 +1594,7 @@ unintended app video."
                                     if retry_queue.len() >= UPLOAD_PAUSE_NOTIFY_THRESHOLD && !upload_pause_notified {
                                         upload_pause_notified = true;
                                         warn!("{} segments waiting to upload. Resume uploads from the tray menu.", UPLOAD_PAUSE_NOTIFY_THRESHOLD);
-                                        extern "C" {
-                                            fn notifications_show_upload_queue_warning();
-                                        }
-                                        unsafe { notifications_show_upload_queue_warning(); }
+                                        crate::ui::notifications::show_upload_queue_warning_notification();
                                     }
                                     continue;
                                 }
@@ -1882,9 +1994,14 @@ unintended app video."
                 // Poll frontmost app and check for display changes
                 _ = poll_timer.tick() => {
                     self.poll_frontmost_app().await;
+                    // Track the active window's real on-monitor position/scale
+                    // (Windows monitor-level fit; no-op elsewhere).
+                    self.capture_ctx.apply_monitor_fit_to_active();
                     self.check_display_changes().await;
                     self.graduate_upload_buffer();
                     self.check_capture_health();
+                    self.check_low_disk_space();
+                    self.log_source_resolution_changes();
                 }
 
                 // Apply a queued app-driven capture source switch
@@ -2632,12 +2749,9 @@ unintended app video."
         );
 
         self.idle_paused = true;
+        // pause_recording() already emits the "Recording paused" toast; emitting a
+        // second idle-specific one here is what produced the duplicate notification.
         self.pause_recording();
-
-        // Show notification if enabled
-        if self.config.recording.notify_on_start_stop && notifications_authorized() {
-            show_idle_paused_notification();
-        }
     }
 
     /// Resume recording after idle-pause when user activity is detected
@@ -2651,21 +2765,68 @@ unintended app video."
 
         info!("User activity detected, resuming capture from idle...");
 
+        // resume_recording() already emits the "Recording resumed" toast; emitting a
+        // second idle-specific one here is what produced the duplicate notification.
         self.resume_recording();
         if self.is_paused {
             return;
         }
         self.idle_paused = false;
         self.last_recorded_action_time = Instant::now();
+    }
 
-        // Show notification if enabled
-        if self.config.recording.notify_on_start_stop && notifications_authorized() {
-            show_idle_resumed_notification();
+    /// Warn (once per low-disk episode) if free space on the recording volume is
+    /// running out. Recording into a full disk fails silently, so surface it.
+    fn check_low_disk_space(&mut self) {
+        if self.current_session.is_none() {
+            return;
+        }
+        if self.last_disk_check.elapsed() < DISK_CHECK_INTERVAL {
+            return;
+        }
+        self.last_disk_check = Instant::now();
+
+        let dir = self
+            .config
+            .recording
+            .output_directory
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"));
+        let Some(free) = free_space_bytes(&dir) else {
+            return;
+        };
+
+        if free < LOW_DISK_THRESHOLD_BYTES {
+            if !self.low_disk_warned {
+                self.low_disk_warned = true;
+                let free_mb = free / (1024 * 1024);
+                warn!(
+                    "Low disk space: {} MB free on the recording volume; recording may stop soon",
+                    free_mb
+                );
+                if notifications_authorized() {
+                    show_low_disk_notification(free_mb);
+                }
+            }
+        } else if self.low_disk_warned {
+            self.low_disk_warned = false;
+            info!("Disk space recovered above the low-space threshold");
         }
     }
 
     /// Poll the frontmost application and update capture state
     async fn poll_frontmost_app(&mut self) {
+        // Ignore the agent's own window being foreground (e.g. the user opened the
+        // tray menu, which on Windows makes the agent the foreground window). That
+        // isn't the user leaving their tracked app, so don't switch capture off or
+        // flip the status to "not capturing" while interacting with the tray; keep
+        // the current capture state until a real app is frontmost again.
+        if get_frontmost_app()
+            .map(|a| crate::config::is_agent_self(&a.bundle_id))
+            .unwrap_or(false)
+        {
+            return;
+        }
         // Keep app tracking fresh even while paused so state is accurate on resume.
         let (frontmost_app, should_capture) = self.frontmost_capture_state();
         let desired_target =

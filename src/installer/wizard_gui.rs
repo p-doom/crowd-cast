@@ -49,10 +49,15 @@ pub fn run_wizard_gui(config: &mut Config) -> Result<WizardResult> {
         run_wizard_macos(config)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        // For non-macOS, we could fall back to CLI wizard or return error
-        anyhow::bail!("Native GUI wizard is only available on macOS. Use --setup for CLI wizard.");
+        super::wizard_windows::run_wizard_windows(config)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = config;
+        anyhow::bail!("Native GUI wizard is not available on this platform. Edit config.toml manually.");
     }
 }
 

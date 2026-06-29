@@ -1,6 +1,6 @@
 [package]
 name = "crowd-cast-agent"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 description = "crowd-cast data collection agent - captures paired screencast and input data"
 license = "MIT"
@@ -86,7 +86,27 @@ tracing-oslog = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows-specific
-windows = { version = "0.58", features = ["Win32_Foundation"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Pure-Rust system tray + menu (Tauri ecosystem) for the Windows PlatformTray
+tray-icon = "0.19"
+muda = "0.15"
+# Windows toast notifications (Tauri ecosystem)
+tauri-winrt-notification = "0.7"
+# Native Win32 GUI for the Windows setup wizard / app picker
+native-windows-gui = "1"
+# Raw Win32 for ListView checkbox state (LVS_EX_CHECKBOXES) in the wizard
+winapi = { version = "0.3", features = ["winuser", "commctrl", "windef", "minwindef", "basetsd"] }
+# Dynamically load WinSparkle.dll for auto-updates (optional at runtime)
+libloading = "0.8"
 
 [build-dependencies]
 cc = "1"
@@ -96,6 +116,10 @@ cargo-obs-build = { git = "https://github.com/p-doom/libobs-rs", branch = "macos
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
 pkg-config = "0.3"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+# Embeds the app manifest (Common Controls v6) required by native-windows-gui
+embed-resource = "2"
 
 [profile.release]
 lto = true

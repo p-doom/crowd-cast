@@ -6,6 +6,7 @@
 fn main() {
     configure_upload_endpoint();
     configure_google_oauth();
+    configure_build_version();
 
     // Tell Cargo about the no_tray cfg
     println!("cargo::rustc-check-cfg=cfg(no_tray)");
@@ -71,9 +72,37 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
-        // On Windows, we need shell32 for the tray
-        // For now, disable tray on Windows until we add the C sources
-        println!("cargo:rustc-cfg=no_tray");
+        // The Windows tray is implemented in pure Rust via the tray-icon/muda
+        // crates (see src/ui/tray_windows.rs), so no C sources or no_tray flag.
+
+        // Embed the application manifest declaring Common Controls v6. Without
+        // it, native-windows-gui's statically-imported comctl32 v6 functions
+        // (SetWindowSubclass et al.) bind to comctl32 v5 and the process fails
+        // to start with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139).
+        embed_resource::compile("resources/windows/crowd-cast.rc", embed_resource::NONE);
+        println!("cargo:rerun-if-changed=resources/windows/crowd-cast.rc");
+        println!("cargo:rerun-if-changed=resources/windows/crowd-cast.manifest");
+        println!("cargo:rerun-if-changed=resources/windows/crowd-cast.ico");
+
+        // Bake in the auto-update feed + signing key (empty -> updater is
+        // unavailable at runtime, which is fine for dev/placeholder builds).
+        configure_windows_updater();
+
+        // Copy WinSparkle.dll next to the built exe so dev runs (and the
+        // installer's source dir) find it beside the executable. Best-effort:
+        // run scripts/fetch-winsparkle.ps1 to populate it; auto-update is
+        // optional, so a missing DLL just disables it.
+        const WINSPARKLE_DLL: &str = "build/winsparkle/0.9.3/WinSparkle.dll";
+        println!("cargo:rerun-if-changed={WINSPARKLE_DLL}");
+        if let Ok(out_dir) = std::env::var("OUT_DIR") {
+            let dll = std::path::Path::new(WINSPARKLE_DLL);
+            if dll.exists() {
+                // OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out
+                if let Some(target_dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
+                    let _ = std::fs::copy(dll, target_dir.join("WinSparkle.dll"));
+                }
+            }
+        }
     }
 
     println!("cargo:rerun-if-changed=src/ui/tray.h");
@@ -83,6 +112,29 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ui/updater_darwin.m");
     println!("cargo:rerun-if-changed=src/ui/wizard_darwin.h");
     println!("cargo:rerun-if-changed=src/ui/wizard_darwin.m");
+}
+
+// The version the Windows auto-updater compares (and that the appcast carries)
+// is `{base}.{build_number}`, mirroring macOS's CFBundleShortVersionString +
+// CFBundleVersion. The base defaults to the Cargo version; the build number is
+// an auto-incrementing value supplied at release time (run number / timestamp).
+// This is only emitted when a build number is set, so dev builds stay stable
+// (and the updater falls back to CARGO_PKG_VERSION).
+fn configure_build_version() {
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_BUILD_NUMBER");
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_VERSION_BASE");
+    if let Ok(num) = std::env::var("CROWD_CAST_BUILD_NUMBER") {
+        let num = num.trim();
+        if !num.is_empty() {
+            let base = std::env::var("CROWD_CAST_VERSION_BASE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("CARGO_PKG_VERSION").ok())
+                .unwrap_or_default();
+            println!("cargo:rustc-env=CROWD_CAST_BUILD_VERSION={base}.{num}");
+        }
+    }
 }
 
 fn configure_google_oauth() {
@@ -99,6 +151,24 @@ fn configure_google_oauth() {
         let client_secret = client_secret.trim();
         if !client_secret.is_empty() {
             println!("cargo:rustc-env=CROWD_CAST_GOOGLE_CLIENT_SECRET={client_secret}");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_updater() {
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_APPCAST_URL");
+    println!("cargo:rerun-if-env-changed=CROWD_CAST_ED_PUBLIC_KEY");
+    if let Ok(url) = std::env::var("CROWD_CAST_APPCAST_URL") {
+        let url = url.trim();
+        if !url.is_empty() {
+            println!("cargo:rustc-env=CROWD_CAST_APPCAST_URL={url}");
+        }
+    }
+    if let Ok(key) = std::env::var("CROWD_CAST_ED_PUBLIC_KEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            println!("cargo:rustc-env=CROWD_CAST_ED_PUBLIC_KEY={key}");
         }
     }
 }

@@ -70,6 +70,11 @@ pub struct CaptureContext {
     single_active_app_capture: bool,
     /// Currently active application capture target when single-active mode is enabled
     active_capture_app: Option<String>,
+    /// Windows monitor-level fit last applied to the active source, used to skip
+    /// re-applying an unchanged transform every poll: (app, scale, pos_x, pos_y)
+    /// with the floats stored as bits so it derives Eq.
+    #[cfg(target_os = "windows")]
+    last_monitor_fit: Option<(String, u32, u32, u32)>,
 }
 
 impl CaptureContext {
@@ -85,9 +90,25 @@ impl CaptureContext {
                 debug!("OBS binaries already present");
             }
             ObsBootstrapperResult::Restart => {
-                // On Windows this means we need to restart. On macOS, Done is returned instead.
-                warn!("OBS bootstrap requires restart - this shouldn't happen on macOS");
-                anyhow::bail!("OBS bootstrap requires application restart");
+                // On Windows, the bootstrapper downloads OBS and stages an updater
+                // that moves the new binaries into place and relaunches the app.
+                // We must exit cleanly so that updater can run; the relaunched
+                // process will find OBS already present and proceed normally.
+                #[cfg(target_os = "windows")]
+                {
+                    info!(
+                        "OBS binaries installed; exiting so the bootstrap updater can relaunch with OBS available"
+                    );
+                    std::process::exit(0);
+                }
+
+                // On macOS, bootstrap completes in place and returns None, so a
+                // Restart here is unexpected.
+                #[cfg(not(target_os = "windows"))]
+                {
+                    warn!("OBS bootstrap requires restart - this shouldn't happen on this platform");
+                    anyhow::bail!("OBS bootstrap requires application restart");
+                }
             }
         }
 
@@ -105,12 +126,17 @@ impl CaptureContext {
             target_apps: Vec::new(),
             single_active_app_capture: false,
             active_capture_app: None,
+            #[cfg(target_os = "windows")]
+            last_monitor_fit: None,
         })
     }
 
     /// Bootstrap OBS binaries
     async fn bootstrap_obs() -> Result<ObsBootstrapperResult> {
-        let notify_download = is_running_in_app_bundle();
+        // On Windows the release agent runs windowless (no console), so the
+        // one-time first-launch OBS download is otherwise invisible — toast a
+        // "downloading" notification so the user knows why startup is delayed.
+        let notify_download = is_running_in_app_bundle() || cfg!(target_os = "windows");
         #[cfg(target_os = "macos")]
         let options = {
             let mut options = ObsBootstrapperOptions::default().set_update(false);
@@ -142,21 +168,24 @@ impl CaptureContext {
         .context("Failed to bootstrap OBS binaries")
     }
 
-    /// Initialize the libobs context (must be called from main thread on some platforms)
+    /// Compute the recording canvas (base) and encoded output dimensions.
     ///
-    /// This configures the video output based on `recording_config`:
-    /// - Output resolution is downscaled to max_output_height while preserving aspect ratio
-    /// - FPS is set from recording_config.fps
-    pub fn initialize(&mut self) -> Result<()> {
-        if self.context.is_some() {
-            debug!("libobs context already initialized");
-            return Ok(());
+    /// On Windows the canvas is the bounding box of all monitors, each normalized
+    /// to a 1080px shortest edge (so a window's monitor-level scale renders it at a
+    /// consistent resolution regardless of orientation); the output equals the
+    /// canvas since it is already in 1080-short-edge space. On macOS (and as a
+    /// fallback) the canvas is the main display and the output is downscaled to
+    /// `max_output_height`.
+    fn canvas_and_output_dimensions(&self) -> ((u32, u32), (u32, u32)) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some((bw, bh)) = super::window_geometry::capture_canvas_size() {
+                debug!("Monitor-normalized capture canvas: {}x{}", bw, bh);
+                return ((bw, bh), (bw, bh));
+            }
+            warn!("Could not enumerate monitors for canvas sizing; falling back to primary display");
         }
 
-        info!("Initializing libobs context...");
-
-        // Get actual display resolution from CoreGraphics (handles Retina correctly)
-        // Fall back to OBS defaults if detection fails
         let (base_width, base_height) = match get_main_display_resolution() {
             Ok((w, h)) => {
                 debug!("Detected display resolution: {}x{}", w, h);
@@ -174,16 +203,34 @@ impl CaptureContext {
                 )
             }
         };
-
-        // Calculate output dimensions (aspect-preserving, max height from config)
-        let (output_width, output_height) = calculate_output_dimensions(
+        let output = calculate_output_dimensions(
             base_width,
             base_height,
             self.recording_config.max_output_height,
         );
+        ((base_width, base_height), output)
+    }
+
+    /// Initialize the libobs context (must be called from main thread on some platforms)
+    ///
+    /// This configures the video output based on `recording_config`:
+    /// - Output resolution is downscaled to max_output_height while preserving aspect ratio
+    /// - FPS is set from recording_config.fps
+    pub fn initialize(&mut self) -> Result<()> {
+        if self.context.is_some() {
+            debug!("libobs context already initialized");
+            return Ok(());
+        }
+
+        info!("Initializing libobs context...");
+
+        // Canvas + output dimensions (Windows: monitor-normalized bounding box;
+        // macOS/fallback: main display downscaled to max_output_height).
+        let ((base_width, base_height), (output_width, output_height)) =
+            self.canvas_and_output_dimensions();
 
         info!(
-            "Video config: {}x{} (native) -> {}x{} (output), {} fps",
+            "Video config: {}x{} (canvas) -> {}x{} (output), {} fps",
             base_width, base_height, output_width, output_height, self.recording_config.fps
         );
 
@@ -218,7 +265,9 @@ impl CaptureContext {
     }
 
     fn use_single_active_app_capture(&self) -> bool {
-        cfg!(target_os = "macos") && self.single_active_app_capture && !self.target_apps.is_empty()
+        cfg!(any(target_os = "macos", target_os = "windows"))
+            && self.single_active_app_capture
+            && !self.target_apps.is_empty()
     }
 
     fn build_scene_name(prefix: &str) -> String {
@@ -232,6 +281,21 @@ impl CaptureContext {
         )
     }
 
+    /// Canonical form of an application identifier for matching and as the
+    /// `app_scenes` key. Windows executable names are case-insensitive, so we
+    /// lower-case them; macOS bundle IDs and Linux process names are
+    /// case-sensitive and pass through unchanged (so macOS behavior is identical).
+    fn canonical_app_id(app: &str) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            app.to_ascii_lowercase()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            app.to_string()
+        }
+    }
+
     fn select_initial_active_app(&self) -> Option<String> {
         if !self.use_single_active_app_capture() {
             return None;
@@ -241,9 +305,9 @@ impl CaptureContext {
         if self
             .target_apps
             .iter()
-            .any(|app| app == &frontmost.bundle_id)
+            .any(|app| Self::canonical_app_id(app) == Self::canonical_app_id(&frontmost.bundle_id))
         {
-            Some(frontmost.bundle_id)
+            Some(Self::canonical_app_id(&frontmost.bundle_id))
         } else {
             None
         }
@@ -341,8 +405,14 @@ impl CaptureContext {
                 }
                 bundles
             }
+            // On Windows (and other non-macOS platforms) we don't pre-filter by
+            // running process here. We attempt to create a window_capture source
+            // for each target app below; apps without a capturable window simply
+            // fail source creation and are skipped (see the match on the result).
             #[cfg(not(target_os = "macos"))]
-            HashSet::new()
+            {
+                target_apps.iter().cloned().collect()
+            }
         };
 
         for bundle_id in &target_apps {
@@ -366,12 +436,15 @@ impl CaptureContext {
                 capture_audio,
             ) {
                 Ok(source) => {
-                    if initial_active_app == Some(bundle_id.as_str()) {
+                    // Key scenes by the canonical id so frontmost-derived lookups
+                    // (also canonical) match regardless of how target_apps is cased.
+                    let canonical_id = Self::canonical_app_id(bundle_id);
+                    if initial_active_app == Some(canonical_id.as_str()) {
                         Self::activate_scene(&mut scene)?;
-                        self.active_capture_app = Some(bundle_id.clone());
+                        self.active_capture_app = Some(canonical_id.clone());
                     }
                     info!("Created app scene for '{}'", bundle_id);
-                    self.app_scenes.insert(bundle_id.clone(), (scene, source));
+                    self.app_scenes.insert(canonical_id, (scene, source));
                 }
                 Err(e) => {
                     warn!(
@@ -547,34 +620,13 @@ impl CaptureContext {
                 .context("Failed to stop recording before video reset")?;
         }
 
-        // Get new display resolution
-        let (base_width, base_height) = match get_main_display_resolution() {
-            Ok((w, h)) => {
-                info!("New display resolution: {}x{}", w, h);
-                (w, h)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to detect new display resolution: {}. Using defaults.",
-                    e
-                );
-                let default_video_info = ObsVideoInfoBuilder::new().build();
-                (
-                    default_video_info.get_base_width(),
-                    default_video_info.get_base_height(),
-                )
-            }
-        };
-
-        // Calculate output dimensions
-        let (output_width, output_height) = calculate_output_dimensions(
-            base_width,
-            base_height,
-            self.recording_config.max_output_height,
-        );
+        // Recompute canvas + output (monitors may have changed: hot-plug, rotation,
+        // resolution). Same monitor-normalized logic as initialize().
+        let ((base_width, base_height), (output_width, output_height)) =
+            self.canvas_and_output_dimensions();
 
         info!(
-            "Resetting video: {}x{} (native) -> {}x{} (output), {} fps",
+            "Resetting video: {}x{} (canvas) -> {}x{} (output), {} fps",
             base_width, base_height, output_width, output_height, self.recording_config.fps
         );
 
@@ -839,9 +891,13 @@ impl CaptureContext {
 
     /// Check if an app needs a scene created (wasn't running at startup).
     pub fn needs_scene_for_app(&self, bundle_id: &str) -> bool {
+        let canonical = Self::canonical_app_id(bundle_id);
         self.use_single_active_app_capture()
-            && self.target_apps.iter().any(|a| a == bundle_id)
-            && !self.app_scenes.contains_key(bundle_id)
+            && self
+                .target_apps
+                .iter()
+                .any(|a| Self::canonical_app_id(a) == canonical)
+            && !self.app_scenes.contains_key(&canonical)
     }
 
     /// Switch to a different app's pre-created scene.
@@ -931,6 +987,57 @@ impl CaptureContext {
             None => Ok(None),
         }
     }
+
+    /// Apply the monitor-level fit to the active app's capture source: scale the
+    /// window by its monitor's 1080-shortest-edge factor and place it at its real
+    /// on-monitor position. Re-applied each poll so it tracks the window as it
+    /// moves/resizes; de-duplicated so an unchanged transform is a no-op.
+    /// Windows-only; a no-op elsewhere (macOS captures the main display only).
+    #[cfg(target_os = "windows")]
+    pub fn apply_monitor_fit_to_active(&mut self) {
+        use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
+        use libobs_wrapper::graphics::Vec2;
+        use libobs_wrapper::scenes::ObsTransformInfoBuilder;
+
+        let Some(app) = self.active_capture_app.clone() else {
+            return;
+        };
+        let Some(fit) = super::window_geometry::monitor_fit_for_app(&app) else {
+            return;
+        };
+        let key = (
+            app.clone(),
+            fit.scale.to_bits(),
+            fit.pos_x.to_bits(),
+            fit.pos_y.to_bits(),
+        );
+        if self.last_monitor_fit.as_ref() == Some(&key) {
+            return;
+        }
+
+        // Explicit transform: no bounds, top-left aligned, scaled by the monitor
+        // factor, positioned at the window's real on-monitor offset (in canvas px).
+        let info = ObsTransformInfoBuilder::new()
+            .set_pos(Vec2::new(fit.pos_x, fit.pos_y))
+            .set_scale(Vec2::new(fit.scale, fit.scale))
+            .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
+            .set_bounds_type(ObsBoundsType::None)
+            .build(0, 0);
+
+        let applied = {
+            let Some((scene, source)) = self.app_scenes.get(&app) else {
+                return;
+            };
+            scene.set_transform_info(source.source(), &info).is_ok()
+        };
+        if applied {
+            self.last_monitor_fit = Some(key);
+        }
+    }
+
+    /// No-op on non-Windows platforms (macOS captures the main display only).
+    #[cfg(not(target_os = "windows"))]
+    pub fn apply_monitor_fit_to_active(&mut self) {}
 
     /// Return whether the active source has started producing non-zero-sized frames.
     pub fn active_source_is_ready(&self) -> Result<bool> {

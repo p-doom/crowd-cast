@@ -21,6 +21,7 @@ GITHUB_REPO="${CROWD_CAST_GITHUB_REPO:-}"
 S3_BUCKET="${CROWD_CAST_S3_BUCKET:-}"
 CHANNEL="${CROWD_CAST_CHANNEL:-dev}"
 DRY_RUN=0
+ALLOW_MISMATCH=0
 
 # --- Args we need to extract but also pass through ---
 BUILD_NUMBER=""
@@ -39,6 +40,7 @@ Publish options:
   --s3-bucket <bucket>         S3 bucket for appcast.xml
   --s3-appcast-key <key>       S3 object key for appcast (default: appcast.xml)
   --dry-run                    Print publish steps without executing them
+  --allow-version-mismatch     Release even if Windows is on a different marketing version
 
 All other options are forwarded to release-macos.sh (run with -h to see them).
 At minimum you need: --build-number, --identity.
@@ -68,6 +70,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             DRY_RUN=1
+            shift
+            ;;
+        --allow-version-mismatch)
+            ALLOW_MISMATCH=1
             shift
             ;;
         --version)
@@ -149,6 +155,23 @@ if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
     exit 1
 fi
 
+# Version guard: refuse to release macOS at a marketing version that differs from
+# the latest Windows release, so the carried-forward exe and the download buttons
+# never advertise two different marketing versions. Override with --allow-version-mismatch.
+WIN_MKT=""
+while IFS= read -r tag; do
+    if [[ "$tag" =~ ^win-v([0-9.]+)[+] ]]; then WIN_MKT="${BASH_REMATCH[1]}"; break; fi
+done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+if [[ -n "$WIN_MKT" && "$WIN_MKT" != "$APP_VERSION" ]]; then
+    if [[ "$ALLOW_MISMATCH" -eq 1 ]]; then
+        echo "Warning: releasing macOS $APP_VERSION while the latest Windows release is $WIN_MKT (proceeding, --allow-version-mismatch)." >&2
+    else
+        echo "Version mismatch: releasing macOS $APP_VERSION while the latest Windows release is $WIN_MKT." >&2
+        echo "Release Windows $APP_VERSION first, or pass --allow-version-mismatch." >&2
+        exit 1
+    fi
+fi
+
 echo "Will publish as: $RELEASE_TAG"
 echo "  GitHub Release: https://github.com/${GITHUB_REPO}/releases/tag/${RELEASE_TAG}"
 echo "  Appcast feed:   ${FEED_URL}"
@@ -175,17 +198,46 @@ if [[ ! -f "$SPARKLE_ARCHIVE_DIR/appcast.xml" ]]; then
     exit 1
 fi
 
+# --- Carry the current Windows installer forward ---
+# The download buttons use /releases/latest/download/..., and this macOS release
+# becomes "Latest" when it is the most recent, so it must also carry the current
+# crowd-cast-setup.exe or the Windows button 404s. We copy it from the most recent
+# release that has one. The Windows WinSparkle appcast still points at its own
+# immutable asset, so auto-update is unaffected; this is purely the human download.
+CARRY_DIR="target/release/carry-forward"
+WIN_EXE="$CARRY_DIR/crowd-cast-setup.exe"
+rm -rf "$CARRY_DIR" && mkdir -p "$CARRY_DIR"
+WIN_TAG=""
+while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
+    names="$(gh release view "$tag" --repo "$GITHUB_REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+    if grep -qx 'crowd-cast-setup.exe' <<<"$names"; then WIN_TAG="$tag"; break; fi
+done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+
+# Assets always include the Sparkle zip + dmg; append the carried exe if found.
+ASSETS=("$SPARKLE_ARCHIVE_DIR/$SPARKLE_ZIP" "$DMG_PATH")
+if [[ -n "$WIN_TAG" ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[dry-run] would carry forward crowd-cast-setup.exe from $WIN_TAG"
+    else
+        gh release download "$WIN_TAG" --repo "$GITHUB_REPO" \
+            --pattern 'crowd-cast-setup.exe' --dir "$CARRY_DIR" --clobber
+        echo "Carried forward crowd-cast-setup.exe from $WIN_TAG"
+    fi
+    ASSETS+=("$WIN_EXE")
+else
+    echo "No Windows crowd-cast-setup.exe found yet; publishing macOS-only (win button stays 404 until Windows releases)."
+fi
+
 # --- Publish to GitHub Releases ---
 echo
 echo "=== Publishing to GitHub Releases ==="
 if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[dry-run] gh release create $RELEASE_TAG"
-    echo "[dry-run]   $SPARKLE_ARCHIVE_DIR/$SPARKLE_ZIP"
-    echo "[dry-run]   $DMG_PATH"
+    for a in "${ASSETS[@]}"; do echo "[dry-run]   $a"; done
 else
     gh release create "$RELEASE_TAG" \
-        "$SPARKLE_ARCHIVE_DIR/$SPARKLE_ZIP" \
-        "$DMG_PATH" \
+        "${ASSETS[@]}" \
         --repo "$GITHUB_REPO" \
         --title "$RELEASE_TAG" \
         --generate-notes \

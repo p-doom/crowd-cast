@@ -161,7 +161,7 @@ fn disable_autostart_windows() -> Result<()> {
         Ok(())
     } else {
         // Not an error if the key doesn't exist
-        debug!("Registry key may not have existed");
+        tracing::debug!("Registry key may not have existed");
         Ok(())
     }
 }

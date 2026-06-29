@@ -1,5 +1,8 @@
 <div align="center">
-  <img src="https://github.com/p-doom/crowd-code/blob/main/img/pdoom-logo.png?raw=true" width="60%" alt="p(doom)" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://huggingface.co/datasets/p-doom/AGI-CAST-0.6k/resolve/main/pdoom_logo_white_transparent.png">
+    <img src="https://huggingface.co/datasets/p-doom/AGI-CAST-0.6k/resolve/main/pdoom_logo_black_transparent.png" width="60%" alt="p(doom)" />
+  </picture>
 </div>
 <hr>
 <div align="center" style="line-height: 1;">
@@ -25,7 +28,30 @@
 
 Infrastructure for capturing paired screencast and keyboard/mouse input data.
 
-## Overview
+## Quick Start
+
+> [![Download for macOS](https://img.shields.io/badge/Download%20for%20macOS-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/CrowdCast.dmg)
+> [![Download for Windows](https://img.shields.io/badge/Download%20for%20Windows-0078D6?style=for-the-badge&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTAgMy40NDkgOS43NSAyLjF2OS40NTFIMFptMTAuOTQ5LTEuNTAxTDI0IDB2MTEuNEgxMC45NDlaTTAgMTIuNmg5Ljc1djkuNDUxTDAgMjAuNjk5Wm0xMC45NDkgMEgyNFYyNGwtMTMuMDUxLTEuODAxWiIvPjwvc3ZnPg%3D%3D&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/crowd-cast-setup.exe)
+
+Download the installer for your platform and follow the instructions in the setup wizard.
+
+- **macOS**: open `CrowdCast.dmg` and grant permissions by following the setup wizard.
+- **Windows**: run `crowd-cast-setup.exe`. The agent runs from a single executable; OBS is fetched automatically on first launch and no special permissions are required. If SmartScreen shows "Windows protected your PC", click More info, then Run anyway.
+
+<!-- Download links use /releases/latest/download/<asset> with stable filenames so they never need per-release edits. Each resolves to the newest release containing that asset. -->
+
+## Features
+
+- **Single binary**: No external OBS installation required (libobs is embedded)
+- **Privacy-aware capture**: Only records when selected applications are in the foreground
+- **Full control**: Start or stop recording at any time, and delete the last 10 minutes of recording
+- **Automatic updates**: Sparkle framework keeps the app up to date in the background
+- **Idle detection**: Automatically pauses recording when you step away, resumes on return
+- **Hardware acceleration**: Uses native encoding (VideoToolbox on macOS)
+- **Efficient uploads**: Streaming uploads via pre-signed S3 URLs with retry/backoff
+- **Easy setup**: Wizard handles permissions and application selection
+
+## How It Works
 
 crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsproject/obs-studio) for screen capture and recording, eliminating the need to install OBS Studio separately.
 
@@ -35,8 +61,6 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
 - **Sync Engine** - Coordinates recording with input capture, filters by frontmost app
 - **Input Capture** - Cross-platform keyboard/mouse capture (rdev/evdev)
 - **System Tray** - Control recording from the menu bar
-
-## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -67,75 +91,6 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
                               └─────────────┘
 ```
 
-## Features
-
-- **Single binary**: No external OBS installation required (libobs is embedded)
-- **Privacy-aware capture**: Only records when selected applications are in the foreground
-- **Automatic updates**: Sparkle framework keeps the app up to date in the background
-- **Idle detection**: Automatically pauses recording when you step away, resumes on return
-- **Hardware acceleration**: Uses native encoding (VideoToolbox on macOS)
-- **Efficient uploads**: Streaming uploads via pre-signed S3 URLs with retry/backoff
-- **Easy setup**: Wizard handles permissions and application selection
-
-## Quick Start
-
-### For users
-
-Download `CrowdCast.dmg` from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest), open it and follow the instructions in the wizard. 
-
-### Building from source
-
-```bash
-# Clone the repository
-git clone https://github.com/p-doom/crowd-cast.git
-cd crowd-cast
-
-# Build (endpoint required at build time)
-CROWD_CAST_API_GATEWAY_URL="https://your-api-gateway.execute-api.region.amazonaws.com/prod/presign" \
-  cargo build --release
-
-# Run the setup wizard
-./target/release/crowd-cast-agent --setup
-```
-
-On macOS, `build.rs` automatically installs OBS binaries via `cargo-obs-build` during
-`cargo build`. Set `CROWD_CAST_SKIP_OBS_INSTALL=1` to skip this behavior.
-
-## Platform-Specific Setup
-
-### macOS
-
-1. Grant **Accessibility** permission to the agent (System Settings → Privacy & Security → Accessibility)
-
-#### macOS Distribution
-
-First-time setup on a release machine:
-
-```bash
-scripts/setup-macos-signing.sh \
-  --p12 /path/to/developer-id.p12
-```
-
-For a full release (build, sign, notarize, publish to GitHub Releases + upload appcast to S3):
-
-```bash
-scripts/build-and-publish-macos.sh \
-  --github-repo p-doom/crowd-cast \
-  --s3-bucket crowd-cast-bucket \
-  --identity "Developer ID Application: Your Name (TEAMID)" \
-  --notarize \
-  --version 1.0.0 \
-  --build-number 1055 \
-  --sparkle-public-ed-key "YOUR_PUBLIC_KEY" \
-  --sparkle-private-ed-key-file /path/to/private-key.txt
-```
-
-Auto-updates are delivered via Sparkle using an appcast hosted on S3.
-
-### Linux/Windows
-
-Support coming soon...
-
 ## Configuration
 
 Most settings are managed through the setup wizard and the tray menu. The configuration file is at:
@@ -162,7 +117,6 @@ delete_after_upload = true
 
 Upload endpoint is set at build time via `CROWD_CAST_API_GATEWAY_URL`.
 
-
 ## Data Format
 
 Input logs are stored in MessagePack format. Each file contains an array of `[timestamp_us, [event_type, event_data]]` tuples:
@@ -187,59 +141,6 @@ Event types:
 - `MouseScroll`: `[delta_x, delta_y, x, y]`
 
 Timestamps are microseconds relative to the segment start. Video and input files share the same session/segment IDs for alignment.
-
-## Utilities
-
-Overlay keylogs on top of a screen capture:
-
-```bash
-python scripts/overlay_keylogs.py --video capture.mp4 --input input.msgpack --output capture_with_keys.mp4
-```
-
-To just generate subtitles (ASS):
-
-```bash
-python scripts/overlay_keylogs.py --input input.msgpack --ass-out keylogs.ass
-```
-
-## Backend Setup
-
-The agent expects a Lambda endpoint that returns pre-signed S3 URLs. Example Lambda handler:
-
-```python
-import boto3
-import json
-
-s3 = boto3.client('s3')
-BUCKET = 'your-bucket'
-
-def handler(event, context):
-    body = json.loads(event['body'])
-    file_name = body['fileName']
-    version = body['version']
-    user_id = body['userId']
-    
-    key = f"uploads/{version}/{user_id}/{file_name}"
-    
-    content_type = (
-        "application/msgpack" if file_name.endswith(".msgpack") else "video/mp4"
-    )
-
-    upload_url = s3.generate_presigned_url(
-        'put_object',
-        Params={'Bucket': BUCKET, 'Key': key, 'ContentType': content_type},
-        ExpiresIn=3600
-    )
-    
-    return {
-        'statusCode': 200,
-        'body': json.dumps({
-            'uploadUrl': upload_url,
-            'key': key,
-            'contentType': content_type,
-        })
-    }
-```
 
 ## Development
 
@@ -329,10 +230,119 @@ pub fn new_window_capture(ctx: &ObsContext, window_name: &str) -> Result<ObsSour
 }
 ```
 
-## License
+## Releasing
 
-MIT License, see [LICENSE.md](LICENSE.md)
+### macOS
+
+First-time setup on a release machine:
+
+```bash
+scripts/setup-macos-signing.sh \
+  --p12 /path/to/developer-id.p12
+```
+
+For a full release (build, sign, notarize, publish to GitHub Releases + upload appcast to S3):
+
+```bash
+scripts/build-and-publish-macos.sh \
+  --github-repo p-doom/crowd-cast \
+  --s3-bucket crowd-cast-bucket \
+  --identity "Developer ID Application: Your Name (TEAMID)" \
+  --notarize \
+  --version 1.0.0 \
+  --build-number 1055 \
+  --sparkle-public-ed-key "YOUR_PUBLIC_KEY" \
+  --sparkle-private-ed-key-file /path/to/private-key.txt
+```
+
+Auto-updates are delivered via Sparkle using an appcast hosted on S3.
+
+### Windows
+
+Build the per-user installer (no admin / UAC required) with [Inno Setup](https://jrsoftware.org/isinfo.php):
+
+```powershell
+# One-time: install the Inno Setup compiler
+winget install JRSoftware.InnoSetup
+
+# Build the release binary + installer
+$env:CROWD_CAST_API_GATEWAY_URL = "https://.../prod/presign"
+pwsh scripts/build-windows-installer.ps1
+# -> dist/crowd-cast-setup-<version>.exe
+```
+
+The installer (`installer/windows/crowd-cast.iss`) installs the agent and its
+`obs.dll` loader under `%LOCALAPPDATA%\Programs\crowd-cast`, creates a Start Menu
+shortcut tagged with the app's AppUserModelID (so toast notifications are branded
+"crowd-cast"), and registers an uninstaller that stops the agent and removes the
+autostart entry and install directory. Autostart itself is managed in-app via the
+setup wizard's "start at login" option.
+
+On first launch the agent downloads the rest of the OBS runtime (codecs,
+plugins) into the install folder and relaunches itself automatically, a
+one-time step that needs network access.
+
+### Linux
+
+Support coming soon...
+
+## Backend Setup
+
+The agent expects a Lambda endpoint that returns pre-signed S3 URLs. Example Lambda handler:
+
+```python
+import boto3
+import json
+
+s3 = boto3.client('s3')
+BUCKET = 'your-bucket'
+
+def handler(event, context):
+    body = json.loads(event['body'])
+    file_name = body['fileName']
+    version = body['version']
+    user_id = body['userId']
+    
+    key = f"uploads/{version}/{user_id}/{file_name}"
+    
+    content_type = (
+        "application/msgpack" if file_name.endswith(".msgpack") else "video/mp4"
+    )
+
+    upload_url = s3.generate_presigned_url(
+        'put_object',
+        Params={'Bucket': BUCKET, 'Key': key, 'ContentType': content_type},
+        ExpiresIn=3600
+    )
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'uploadUrl': upload_url,
+            'key': key,
+            'contentType': content_type,
+        })
+    }
+```
+
+## Utilities
+
+Overlay keylogs on top of a screen capture:
+
+```bash
+python scripts/overlay_keylogs.py --video capture.mp4 --input input.msgpack --output capture_with_keys.mp4
+```
+
+To just generate subtitles (ASS):
+
+```bash
+python scripts/overlay_keylogs.py --input input.msgpack --ass-out keylogs.ass
+```
 
 ## Contributing
 
 Contributions welcome! Please open an issue first to discuss proposed changes.
+
+## License
+
+MIT License, see [LICENSE.md](LICENSE.md)

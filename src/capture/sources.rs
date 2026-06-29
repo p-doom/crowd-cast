@@ -68,8 +68,59 @@ impl ScreenCaptureSource {
         })
     }
 
-    /// Create a new screen capture source (fallback for non-macOS)
-    #[cfg(not(target_os = "macos"))]
+    /// Create a new full-screen capture source on Windows.
+    ///
+    /// Uses libobs `monitor_capture` via Windows Graphics Capture (WGC),
+    /// targeting the primary monitor. `capture_audio` is ignored — the
+    /// Windows monitor source has no audio track (audio is window-scoped only).
+    #[cfg(target_os = "windows")]
+    pub fn new_display_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        _capture_audio: bool,
+    ) -> Result<Self> {
+        use libobs_simple::sources::windows::{
+            MonitorCaptureSourceBuilder, ObsDisplayCaptureMethod,
+        };
+
+        info!("Creating Windows monitor capture source: {}", name);
+
+        // Pick the primary monitor, falling back to the first enumerated one.
+        let monitors = MonitorCaptureSourceBuilder::get_monitors()
+            .map_err(|e| anyhow::anyhow!("Failed to enumerate monitors: {}", e))?;
+        let primary = monitors
+            .iter()
+            .find(|m| m.0.is_primary)
+            .or_else(|| monitors.first());
+
+        let mut builder = context
+            .source_builder::<MonitorCaptureSourceBuilder, _>(name)?
+            .set_capture_cursor(true)
+            .set_capture_method(ObsDisplayCaptureMethod::MethodWgc);
+
+        if let Some(monitor) = primary {
+            info!("Capturing monitor '{}'", monitor.0.name);
+            builder = builder.set_monitor(monitor);
+        } else {
+            tracing::warn!("No monitors enumerated; using default monitor capture settings");
+        }
+
+        let source = builder
+            .add_to_scene(scene)
+            .context("Failed to add monitor capture source to scene")?;
+
+        debug!("Monitor capture source '{}' created successfully", name);
+
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+        })
+    }
+
+    /// Create a new screen capture source (fallback for unsupported platforms)
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn new_display_capture(
         _context: &mut ObsContext,
         _scene: &mut ObsSceneRef,
@@ -128,12 +179,59 @@ impl ScreenCaptureSource {
         })
     }
 
-    /// Create a new application capture source (fallback for non-macOS)
-    #[cfg(not(target_os = "macos"))]
+    /// Create a new application capture source on Windows.
+    ///
+    /// Uses libobs `window_capture` (Windows Graphics Capture) bound to a
+    /// top-level window of the target application, matched by executable name.
+    /// Returns an error if the application has no capturable window right now;
+    /// callers (app-scene setup) treat that as "skip this app for now".
+    /// `display_uuid` and `capture_audio` are unused on Windows.
+    #[cfg(target_os = "windows")]
+    pub fn new_application_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        bundle_id: &str,
+        _display_uuid: &str,
+        _capture_audio: bool,
+    ) -> Result<Self> {
+        use libobs_simple::sources::windows::{
+            ObsWindowCaptureMethod, ObsWindowPriority, WindowCaptureSourceBuilder,
+        };
+
+        let obs_id = find_window_obs_id_for_app(bundle_id)?;
+        info!(
+            "Creating Windows window capture source: {} (app: {}, window: {})",
+            name, bundle_id, obs_id
+        );
+
+        let source = context
+            .source_builder::<WindowCaptureSourceBuilder, _>(name)?
+            .set_window_raw(obs_id.as_str())
+            .set_priority(ObsWindowPriority::Executable)
+            .set_cursor(true)
+            .set_capture_method(ObsWindowCaptureMethod::MethodWgc)
+            .add_to_scene(scene)
+            .context("Failed to add window capture source to scene")?;
+
+        debug!(
+            "Window capture source '{}' for '{}' created successfully",
+            name, bundle_id
+        );
+
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+        })
+    }
+
+    /// Create a new application capture source (fallback for unsupported platforms)
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn new_application_capture(
         _context: &mut ObsContext,
         _scene: &mut ObsSceneRef,
-        name: &str,
+        _name: &str,
         _bundle_id: &str,
         _display_uuid: &str,
         _capture_audio: bool,
@@ -200,8 +298,30 @@ impl ScreenCaptureSource {
         Ok(())
     }
 
-    /// Update the target application (non-macOS stub)
-    #[cfg(not(target_os = "macos"))]
+    /// Re-resolve the target application's window and update this `window_capture`
+    /// source in-place (Windows). Used by the readiness watchdog to recover when
+    /// the captured window has changed (e.g. closed and reopened).
+    #[cfg(target_os = "windows")]
+    pub fn update_application(&mut self, bundle_id: &str) -> Result<()> {
+        use libobs_simple::sources::windows::WindowCaptureSourceUpdater;
+        use libobs_wrapper::data::ObsObjectUpdater;
+
+        let obs_id = find_window_obs_id_for_app(bundle_id)?;
+        WindowCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
+            .context("Failed to create window capture updater")?
+            .set_window_raw(obs_id.as_str())
+            .update()
+            .context("Failed to update window capture target")?;
+
+        info!(
+            "Updated window capture source '{}' to application '{}'",
+            self.name, bundle_id
+        );
+        Ok(())
+    }
+
+    /// Update the target application (fallback for unsupported platforms)
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn update_application(&mut self, _bundle_id: &str) -> Result<()> {
         Ok(())
     }
@@ -377,10 +497,45 @@ pub fn get_main_display_uuid() -> Result<String> {
     }
 }
 
-/// Get the UUID string for the main display (non-macOS fallback)
-#[cfg(not(target_os = "macos"))]
+/// Get the UUID string for the main display (Windows).
+///
+/// Windows `window_capture` targets a window, not a display, so it has no use
+/// for a display UUID. Return an empty placeholder so the shared app-scene
+/// setup (which passes a display UUID to `new_application_capture`) works
+/// uniformly; the value is ignored on Windows.
+#[cfg(target_os = "windows")]
+pub fn get_main_display_uuid() -> Result<String> {
+    Ok(String::new())
+}
+
+/// Get the UUID string for the main display (fallback for unsupported platforms)
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn get_main_display_uuid() -> Result<String> {
     anyhow::bail!("Display UUID not available on this platform")
+}
+
+/// Find the OBS window id of a capturable top-level window belonging to the
+/// given application (matched by executable file stem, case-insensitive).
+#[cfg(target_os = "windows")]
+fn find_window_obs_id_for_app(bundle_id: &str) -> Result<String> {
+    use libobs_simple::sources::windows::{WindowCaptureSourceBuilder, WindowSearchMode};
+
+    let windows = WindowCaptureSourceBuilder::get_windows(WindowSearchMode::ExcludeMinimized)
+        .map_err(|e| anyhow::anyhow!("Failed to enumerate windows: {}", e))?;
+
+    windows
+        .iter()
+        .find(|w| {
+            std::path::Path::new(&w.0.full_exe)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|stem| stem.eq_ignore_ascii_case(bundle_id))
+                .unwrap_or(false)
+        })
+        .map(|w| w.0.obs_id.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!("No capturable window found for application '{}'", bundle_id)
+        })
 }
 
 /// Get the actual resolution of the main display
@@ -427,8 +582,37 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     }
 }
 
-/// Get the actual resolution of the main display (non-macOS fallback)
-#[cfg(not(target_os = "macos"))]
+/// Get the actual pixel resolution of the primary display on Windows.
+///
+/// Uses `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`, which reports the
+/// current mode's true pixel dimensions independent of the process's
+/// DPI-awareness (unlike `GetSystemMetrics`).
+#[cfg(target_os = "windows")]
+pub fn get_main_display_resolution() -> Result<(u32, u32)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
+
+    unsafe {
+        let mut devmode = DEVMODEW::default();
+        devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+
+        let ok = EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut devmode);
+        if !ok.as_bool() {
+            anyhow::bail!("EnumDisplaySettingsW failed to read the primary display mode");
+        }
+
+        let width = devmode.dmPelsWidth;
+        let height = devmode.dmPelsHeight;
+        if width == 0 || height == 0 {
+            anyhow::bail!("Invalid display dimensions: {}x{}", width, height);
+        }
+
+        Ok((width, height))
+    }
+}
+
+/// Get the actual resolution of the main display (fallback for unsupported platforms)
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     anyhow::bail!("Display resolution detection not available on this platform")
 }

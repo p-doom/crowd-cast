@@ -143,7 +143,7 @@ fn default_idle_timeout_secs() -> u64 {
 }
 
 fn default_single_active_app_capture() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 fn default_capture_watchdog_timeout_ms() -> u64 {
@@ -242,6 +242,39 @@ impl Default for Config {
     }
 }
 
+/// The agent's own app identifier: the value `get_frontmost_app()` reports when
+/// the agent itself is in the foreground. Computed once and cached.
+///
+/// On Windows/Linux this is the lowercased executable stem (e.g.
+/// `crowd-cast-agent`), matching how frontmost detection reports apps; on macOS
+/// it's the bundle identifier.
+pub fn agent_self_identifier() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            "dev.crowd-cast.agent".to_string()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                })
+                .unwrap_or_default()
+        }
+    })
+}
+
+/// Whether `bundle_id` refers to the crowd-cast agent itself.
+pub fn is_agent_self(bundle_id: &str) -> bool {
+    let me = agent_self_identifier();
+    !me.is_empty() && bundle_id.eq_ignore_ascii_case(me)
+}
+
 impl Config {
     /// Load configuration from default location or create default
     pub fn load() -> Result<Self> {
@@ -315,6 +348,14 @@ impl Config {
 
     /// Check if input should be captured for the given app
     pub fn should_capture_app(&self, bundle_id: &str) -> bool {
+        // Never capture the agent itself. On Windows the user can pick it from the
+        // window list, and because clicking the tray brings the agent to the
+        // foreground, that becomes a capture-switch + process-restart loop with no
+        // way out via the UI. Exclude it before capture_all/target_apps so nothing
+        // can trigger it (and any config that already lists it is effectively healed).
+        if is_agent_self(bundle_id) {
+            return false;
+        }
         if self.capture.capture_all {
             return true;
         }
@@ -324,7 +365,20 @@ impl Config {
             return false;
         }
 
-        self.capture.target_apps.iter().any(|app| app == bundle_id)
+        // On Windows, app identifiers are executable names whose case the user
+        // can't reliably predict, so match case-insensitively. On macOS/Linux the
+        // identifiers (bundle IDs / process names) are case-sensitive.
+        #[cfg(target_os = "windows")]
+        {
+            self.capture
+                .target_apps
+                .iter()
+                .any(|app| app.eq_ignore_ascii_case(bundle_id))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.capture.target_apps.iter().any(|app| app == bundle_id)
+        }
     }
 
     /// Mark setup as completed and save
@@ -348,5 +402,35 @@ impl Config {
     /// Clear all target apps
     pub fn clear_target_apps(&mut self) {
         self.capture.target_apps.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_never_captures_itself() {
+        let me = agent_self_identifier();
+        // In tests this is the test binary's stem; we only need it non-empty to
+        // exercise the exclusion logic.
+        assert!(!me.is_empty(), "agent self-identifier should resolve");
+
+        // Excluded even when capture_all is on.
+        let mut cfg = Config::default();
+        cfg.capture.capture_all = true;
+        assert!(
+            !cfg.should_capture_app(me),
+            "agent must never capture itself, even with capture_all"
+        );
+
+        // Excluded even if explicitly listed; other apps are still captured.
+        cfg.capture.capture_all = false;
+        cfg.capture.target_apps = vec![me.to_string(), "firefox".to_string()];
+        assert!(!cfg.should_capture_app(me));
+        assert!(cfg.should_capture_app("firefox"));
+
+        // Self-exclusion is case-insensitive.
+        assert!(!cfg.should_capture_app(&me.to_ascii_uppercase()));
     }
 }
