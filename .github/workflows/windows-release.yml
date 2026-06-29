@@ -7,6 +7,11 @@ name: Windows Release
 on:
   workflow_dispatch:
     inputs:
+      channel:
+        description: "dev = test build: prerelease, NO appcast publish (does not auto-update users); prod = real release"
+        type: choice
+        options: [prod, dev]
+        default: prod
       version_base:
         description: "Marketing version (blank = Cargo.toml version)"
         required: false
@@ -41,16 +46,24 @@ jobs:
           $base  = "${{ github.event.inputs.version_base }}"
           if ([string]::IsNullOrWhiteSpace($base)) { $base = $cargo }
           $build = "${{ github.run_number }}"
+          # dev builds get a distinct tag so they never collide with or shadow a prod win-v tag.
+          if ("${{ github.event.inputs.channel }}" -eq "dev") {
+            $tag = "win-dev-v$base+$build"
+          } else {
+            $tag = "win-v$base+$build"
+          }
           "marketing=$base"           >> $env:GITHUB_OUTPUT
           "build=$build"              >> $env:GITHUB_OUTPUT
           "buildVersion=$base.$build" >> $env:GITHUB_OUTPUT
-          "tag=win-v$base+$build"     >> $env:GITHUB_OUTPUT
+          "tag=$tag"                  >> $env:GITHUB_OUTPUT
 
       # Version guard: refuse to release Windows at a marketing version that differs
       # from the latest macOS release, so the carried-forward dmg and the download
       # buttons never advertise two different marketing versions at once. Override
       # with the allow_version_mismatch input when the drift is intentional.
+      # Skipped for dev builds (they are prereleases and never become "latest").
       - name: Check version alignment with macOS
+        if: ${{ github.event.inputs.channel != 'dev' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -134,6 +147,7 @@ jobs:
       # release). The macOS Sparkle appcast still points at its own immutable asset,
       # so auto-update is untouched; this is purely the human download.
       - name: Carry forward the latest macOS download (CrowdCast.dmg)
+        if: ${{ github.event.inputs.channel != 'dev' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -163,7 +177,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: "v${{ steps.ver.outputs.marketing }}"
+          name: ${{ github.event.inputs.channel == 'dev' && format('v{0} (cross-platform test)', steps.ver.outputs.marketing) || format('v{0}', steps.ver.outputs.marketing) }}
+          # dev = prerelease: excluded from /releases/latest, so the docs download
+          # buttons keep pointing at the current prod release.
+          prerelease: ${{ github.event.inputs.channel == 'dev' }}
           body: |
             ## Installation
 
@@ -179,6 +196,8 @@ jobs:
             dist/CrowdCast.dmg
 
       - name: Configure AWS credentials
+        # dev builds never publish an appcast, so no AWS access is needed.
+        if: ${{ github.event.inputs.channel != 'dev' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -187,7 +206,10 @@ jobs:
 
       # Publish the appcast LAST — once it's live, clients start updating, so the
       # release asset (previous step) must already exist for the download URL.
+      # SKIPPED for dev builds: this is the only step that triggers auto-update,
+      # so a dev build reaches no existing user.
       - name: Publish appcast to S3
+        if: ${{ github.event.inputs.channel != 'dev' }}
         # no-cache so WinSparkle/WinINet always revalidates the appcast and never
         # serves a stale version that hides a freshly published release.
         run: aws s3 cp dist/appcast-win.xml s3://crowd-cast-bucket/appcast-win.xml --cache-control "no-cache"
