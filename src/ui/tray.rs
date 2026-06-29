@@ -101,11 +101,7 @@ fn compute_auth_display(
         }
         return (String::new(), "Sign in with Google".to_string(), true);
     }
-    (
-        String::new(),
-        "Sign in (not configured)".to_string(),
-        false,
-    )
+    (String::new(), "Sign in (not configured)".to_string(), false)
 }
 
 // ---------------------------------------------------------------------------
@@ -177,12 +173,9 @@ impl TrayApp {
     /// Compute the full display state from current TrayApp state.
     fn compute_display_state(&self) -> TrayDisplayState {
         let (status_text, icon_state, can_start, can_stop) = match &self.last_status {
-            Some(EngineStatus::Idle) => (
-                "Status: Idle".to_string(),
-                TrayIconState::Idle,
-                true,
-                false,
-            ),
+            Some(EngineStatus::Idle) => {
+                ("Status: Idle".to_string(), TrayIconState::Idle, true, false)
+            }
             Some(EngineStatus::Capturing { event_count }) => (
                 format!("Status: Capturing ({} events)", event_count),
                 TrayIconState::Recording,
@@ -219,12 +212,7 @@ impl TrayApp {
                 true,
                 false,
             ),
-            None => (
-                "Status: Idle".to_string(),
-                TrayIconState::Idle,
-                true,
-                false,
-            ),
+            None => ("Status: Idle".to_string(), TrayIconState::Idle, true, false),
         };
 
         TrayDisplayState {
@@ -359,8 +347,7 @@ impl TrayApp {
 
             // Periodic background update check (bypasses Sparkle's scheduler
             // which relies on NSUserDefaults that may not persist).
-            const UPDATE_CHECK_INTERVAL: std::time::Duration =
-                std::time::Duration::from_secs(600);
+            const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
             if self.last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
                 if self.updater.can_check_for_updates() {
                     info!("Scheduled background update check");
@@ -413,6 +400,13 @@ impl TrayApp {
                 }
                 PrepareForUpdateAction::ClearRequest => {
                     self.pending_prepare_for_update = false;
+                    if self
+                        .last_status
+                        .as_ref()
+                        .is_some_and(|status| !status_blocks_immediate_update(status))
+                    {
+                        self.updater.set_busy(false);
+                    }
                 }
                 PrepareForUpdateAction::Wait => {}
             }
@@ -564,7 +558,11 @@ fn create_platform_tray(icon_paths: &TrayIconPaths) -> Result<Box<dyn PlatformTr
     {
         Ok(Box::new(super::tray_windows::WindowsTray::new(icon_paths)?))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(super::tray_linux::LinuxTray::new(icon_paths)?))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = icon_paths;
         Ok(Box::new(super::platform_tray::StubTray))

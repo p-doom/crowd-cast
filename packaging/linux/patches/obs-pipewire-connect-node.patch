@@ -1,0 +1,126 @@
+diff --git a/plugins/linux-pipewire/pipewire.c b/plugins/linux-pipewire/pipewire.c
+index d312a18..83de907 100644
+--- a/plugins/linux-pipewire/pipewire.c
++++ b/plugins/linux-pipewire/pipewire.c
+@@ -1131,8 +1131,14 @@ obs_pipewire *obs_pipewire_connect_fd(int pipewire_fd, const struct pw_registry_
+ 
+ 	pw_thread_loop_lock(obs_pw->thread_loop);
+ 
+-	/* Core */
+-	obs_pw->core = pw_context_connect_fd(obs_pw->context, fcntl(obs_pw->pipewire_fd, F_DUPFD_CLOEXEC, 5), NULL, 0);
++	/* Core. A pipewire_fd <= 0 means "connect to the default PipeWire daemon" (used by the
++	 * crowd-cast ConnectNode path, which binds an existing node without going through the
++	 * desktop portal / OpenPipeWireRemote). The portal path always passes a real fd. */
++	if (obs_pw->pipewire_fd > 0)
++		obs_pw->core = pw_context_connect_fd(obs_pw->context, fcntl(obs_pw->pipewire_fd, F_DUPFD_CLOEXEC, 5), NULL,
++						     0);
++	else
++		obs_pw->core = pw_context_connect(obs_pw->context, NULL, 0);
+ 	if (!obs_pw->core) {
+ 		blog(LOG_WARNING, "Error creating PipeWire core: %m");
+ 		pw_thread_loop_unlock(obs_pw->thread_loop);
+diff --git a/plugins/linux-pipewire/screencast-portal.c b/plugins/linux-pipewire/screencast-portal.c
+index d5fe531..95b3817 100644
+--- a/plugins/linux-pipewire/screencast-portal.c
++++ b/plugins/linux-pipewire/screencast-portal.c
+@@ -509,6 +509,33 @@ static const char *screencast_portal_window_capture_get_name(void *data)
+ 	return obs_module_text("PipeWireWindowCapture");
+ }
+ 
++/* crowd-cast: connect directly to an existing PipeWire node (e.g. one produced by
++ * org.gnome.Mutter.ScreenCast RecordWindow/RecordMonitor), bypassing the xdg-desktop-portal
++ * session and its window/screen picker. Mirrors on_pipewire_remote_opened_cb, but connects to
++ * the default PipeWire daemon (fd -1) instead of a portal-provided fd, and uses the node id
++ * already stored in capture->pipewire_node. */
++static void connect_to_node_directly(struct screencast_portal_capture *capture)
++{
++	struct obs_pipewire_connect_stream_info connect_info;
++
++	capture->obs_pw = obs_pipewire_connect_fd(-1, NULL, NULL);
++	if (!capture->obs_pw)
++		return;
++
++	connect_info = (struct obs_pipewire_connect_stream_info){
++		.stream_name = "OBS Studio",
++		.stream_properties = pw_properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture",
++						       PW_KEY_MEDIA_ROLE, "Screen", NULL),
++		.screencast =
++			{
++				.cursor_visible = capture->cursor_visible,
++			},
++	};
++
++	capture->obs_pw_stream =
++		obs_pipewire_connect_stream(capture->obs_pw, capture->source, capture->pipewire_node, &connect_info);
++}
++
+ static void *screencast_portal_desktop_capture_create(obs_data_t *settings, obs_source_t *source)
+ {
+ 	struct screencast_portal_capture *capture;
+@@ -517,9 +544,13 @@ static void *screencast_portal_desktop_capture_create(obs_data_t *settings, obs_
+ 	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_MONITOR;
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
+ 	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
++	capture->pipewire_node = (uint32_t)obs_data_get_int(settings, "ConnectNode");
+ 	capture->source = source;
+ 
+-	init_screencast_capture(capture);
++	if (capture->pipewire_node > 0)
++		connect_to_node_directly(capture);
++	else
++		init_screencast_capture(capture);
+ 
+ 	return capture;
+ }
+@@ -531,9 +562,13 @@ static void *screencast_portal_window_capture_create(obs_data_t *settings, obs_s
+ 	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_WINDOW;
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
+ 	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
++	capture->pipewire_node = (uint32_t)obs_data_get_int(settings, "ConnectNode");
+ 	capture->source = source;
+ 
+-	init_screencast_capture(capture);
++	if (capture->pipewire_node > 0)
++		connect_to_node_directly(capture);
++	else
++		init_screencast_capture(capture);
+ 
+ 	return capture;
+ }
+@@ -546,9 +581,13 @@ static void *screencast_portal_capture_create(obs_data_t *settings, obs_source_t
+ 	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_UNIFIED;
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
+ 	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
++	capture->pipewire_node = (uint32_t)obs_data_get_int(settings, "ConnectNode");
+ 	capture->source = source;
+ 
+-	init_screencast_capture(capture);
++	if (capture->pipewire_node > 0)
++		connect_to_node_directly(capture);
++	else
++		init_screencast_capture(capture);
+ 
+ 	return capture;
+ }
+@@ -625,6 +664,21 @@ static void screencast_portal_capture_update(void *data, obs_data_t *settings)
+ 
+ 	if (capture->obs_pw_stream)
+ 		obs_pipewire_stream_set_cursor_visible(capture->obs_pw_stream, capture->cursor_visible);
++
++	/* crowd-cast: re-point a direct-node capture to a new PipeWire node in place. When the
++	 * ConnectNode setting changes to a different positive node id (crowd-cast follow-focus
++	 * moving to another window of the same app), tear down the current stream + obs_pipewire
++	 * and reconnect to the new node WITHOUT recreating the source (so the scene item, its
++	 * transform and z-order are preserved). Mirrors the teardown in
++	 * screencast_portal_capture_destroy followed by connect_to_node_directly. */
++	uint32_t new_node = (uint32_t)obs_data_get_int(settings, "ConnectNode");
++	if (new_node > 0 && new_node != capture->pipewire_node) {
++		g_clear_pointer(&capture->obs_pw_stream, obs_pipewire_stream_destroy);
++		obs_pipewire_destroy(capture->obs_pw);
++		capture->obs_pw = NULL;
++		capture->pipewire_node = new_node;
++		connect_to_node_directly(capture);
++	}
+ }
+ 
+ static void screencast_portal_capture_show(void *data)

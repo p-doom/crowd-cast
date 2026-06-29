@@ -15,6 +15,12 @@ mod wizard_windows;
 #[cfg(target_os = "windows")]
 pub use wizard_windows::{run_settings_panel, AppPickerResult};
 
+#[cfg(target_os = "linux")]
+pub mod requirements;
+
+#[cfg(target_os = "linux")]
+pub mod gnome_focus;
+
 pub use autostart::*;
 pub use permissions::*;
 pub use wizard::{needs_setup, run_wizard, run_wizard_async, WizardResult};

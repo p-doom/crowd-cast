@@ -125,8 +125,30 @@ fn list_running_apps_macos() -> Vec<AppInfo> {
 // Linux Implementation
 // ============================================================================
 
+/// Whether this is a Wayland session. The identity namespace is environment-canonical:
+/// Wayland keys on the compositor's `app_id`/`wm_class`, X11 on `/proc/<pid>/comm`. Both the
+/// app list (here) and frontmost detection (`frontmost.rs`) must agree per environment.
+#[cfg(target_os = "linux")]
+fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|s| s.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+}
+
 #[cfg(target_os = "linux")]
 fn list_running_apps_linux() -> Vec<AppInfo> {
+    if is_wayland_session() {
+        list_open_apps_wayland()
+    } else {
+        list_running_apps_x11()
+    }
+}
+
+/// X11: enumerate running GUI processes by `/proc/<pid>/comm` (the X11 frontmost path resolves
+/// the same key via `_NET_WM_PID` → `/proc/comm`, so selection and gating agree).
+#[cfg(target_os = "linux")]
+fn list_running_apps_x11() -> Vec<AppInfo> {
     use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
@@ -176,6 +198,28 @@ fn list_running_apps_linux() -> Vec<AppInfo> {
         }
     }
 
+    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps
+}
+
+/// Wayland: enumerate currently-open windows' applications by the identity the compositor
+/// reports — the GNOME focus extension's `ListWindows` D-Bus method (`wm_class`). This is the SAME
+/// `get_wm_class()`/`app_id` value the gate matches against (`should_capture_app`), so the
+/// wizard's app list and runtime gating agree **by construction** — no `.desktop`/`wm_class`
+/// heuristic that could disagree (e.g. Chrome's `StartupWMClass` `Google-chrome` vs the
+/// window's `google-chrome`). Like macOS (`NSWorkspace` running apps), only apps that are open
+/// appear — per-app capture needs the window to exist anyway. Empty when no focus provider is
+/// live (fail closed; a live provider is a hard recording prerequisite on Wayland).
+#[cfg(target_os = "linux")]
+fn list_open_apps_wayland() -> Vec<AppInfo> {
+    let mut apps: Vec<AppInfo> = crate::capture::focus::list_app_ids()
+        .into_iter()
+        .map(|id| AppInfo {
+            bundle_id: id.clone(),
+            name: id,
+            pid: 0,
+        })
+        .collect();
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps
 }

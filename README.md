@@ -91,11 +91,118 @@ crowd-cast is a single-binary agent that embeds [libobs](https://github.com/obsp
                               └─────────────┘
 ```
 
+## Features
+
+- **Single binary**: No external OBS installation required (libobs is embedded)
+- **Privacy-aware capture**: Only records when selected applications are in the foreground
+- **Automatic updates**: signed background updates on macOS, Windows, and Linux
+- **Idle detection**: Automatically pauses recording when you step away, resumes on return
+- **Hardware acceleration**: Uses native encoding (VideoToolbox on macOS)
+- **Efficient uploads**: Streaming uploads via pre-signed S3 URLs with retry/backoff
+- **Easy setup**: Wizard handles permissions and application selection
+
+## Quick Start
+
+### For users
+
+Download the installer for your platform from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest):
+
+- macOS: `CrowdCast.dmg`
+- Windows: `crowd-cast-setup.exe`
+- Linux: `curl -fsSL https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh | bash`
+
+Linux support is limited to GNOME on Wayland and sway. GNOME supports per-app capture; sway currently supports full-screen capture.
+
+### Building from source
+
+```bash
+# Clone the repository
+git clone https://github.com/p-doom/crowd-cast.git
+cd crowd-cast
+
+# Build (endpoint required at build time)
+CROWD_CAST_API_GATEWAY_URL="https://your-api-gateway.execute-api.region.amazonaws.com/prod/presign" \
+  cargo build --release
+
+# Run the setup wizard
+./target/release/crowd-cast-agent --setup
+```
+
+> **Build speed:** `cargo build --release` is tuned for fast incremental rebuilds
+> (~seconds, not minutes) — LTO is off because it costs minutes and buys nothing for
+> this libobs-backed app. For an even quicker loop use `cargo run` (debug).
+
+On macOS, `build.rs` automatically installs OBS binaries via `cargo-obs-build` during
+`cargo build`. Set `CROWD_CAST_SKIP_OBS_INSTALL=1` to skip this behavior.
+
+On **Linux** there is no automatic OBS install, so the linker has to be told where
+`libobs` lives — otherwise the build fails at link time with
+`rust-lld: error: unable to find library -lobs`. Set `LIBOBS_PATH` to a directory
+that contains `libobs.so` (the unversioned linker symlink), built for the OBS ABI in
+`CROWD_CAST_OBS_ABI` (default `32.0.2`):
+
+```bash
+# Linux build
+LIBOBS_PATH=/path/to/obs/usr/lib \
+CROWD_CAST_API_GATEWAY_URL="https://your-api-gateway.execute-api.region.amazonaws.com/prod/presign" \
+  cargo build --release
+```
+
+`cargo check` does not link, so it will not catch a missing or wrong `LIBOBS_PATH` —
+only `cargo build`/`run` will.
+
+## Platform-Specific Setup
+
+### macOS
+
+1. Grant **Accessibility** permission to the agent (System Settings → Privacy & Security → Accessibility)
+
+#### macOS Distribution
+
+First-time setup on a release machine:
+
+```bash
+scripts/setup-macos-signing.sh \
+  --p12 /path/to/developer-id.p12
+```
+
+For a full release (build, sign, notarize, publish to GitHub Releases + upload appcast to S3):
+
+```bash
+scripts/build-and-publish-macos.sh \
+  --github-repo p-doom/crowd-cast \
+  --s3-bucket crowd-cast-bucket \
+  --identity "Developer ID Application: Your Name (TEAMID)" \
+  --notarize \
+  --version 1.0.0 \
+  --build-number 1055 \
+  --sparkle-public-ed-key "YOUR_PUBLIC_KEY" \
+  --sparkle-private-ed-key-file /path/to/private-key.txt
+```
+
+Auto-updates are delivered via Sparkle using an appcast hosted on S3.
+
+### Linux
+
+Linux installs into user space under `~/.local` and downloads the matching libobs bundle during installation. The production installer is published with each release:
+
+```bash
+curl -fsSL https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh | bash
+```
+
+Supported Linux sessions are GNOME on Wayland and sway. Other desktop sessions are blocked during setup so the agent does not run in an unvalidated capture mode. Linux auto-updates use a signed appcast hosted on S3 and install silently when recording and uploads are idle.
+
+### Windows
+
+Download `crowd-cast-setup.exe` from the [latest release](https://github.com/p-doom/crowd-cast/releases/latest) and run the setup wizard. Windows auto-updates are delivered through the signed Windows appcast.
+
 ## Configuration
 
 Most settings are managed through the setup wizard and the tray menu. The configuration file is at:
 
 - macOS: `~/Library/Application Support/dev.crowd-cast.agent/config.toml`
+- Linux: `~/.config/agent/config.toml`
+- Windows: `%APPDATA%\agent\config.toml`
 
 Key settings:
 
