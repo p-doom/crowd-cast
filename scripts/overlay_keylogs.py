@@ -396,13 +396,17 @@ def build_ass(
 
 
 def run_ffmpeg(video_path: str, ass_path: str, output_path: str) -> None:
+    # ffmpeg's subtitles filter treats ':' and '\' specially in the filtergraph,
+    # so a Windows path like C:\dir\f.ass must be escaped (backslashes -> '/',
+    # drive colon -> '\:') and quoted. No-op on POSIX paths.
+    escaped = ass_path.replace("\\", "/").replace(":", "\\:")
     command = [
         "ffmpeg",
         "-y",
         "-i",
         video_path,
         "-vf",
-        f"subtitles={ass_path}",
+        f"subtitles='{escaped}'",
         "-c:a",
         "copy",
         output_path,

@@ -1,7 +1,9 @@
 //! Input capture backend trait
 
 use crate::data::InputEvent;
-use anyhow::Result;
+use crate::input::secure::SecureInputState;
+use anyhow::{Context, Result};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Trait for input capture backends
@@ -20,25 +22,32 @@ pub trait InputBackend: Send + Sync {
     fn current_timestamp(&self) -> Option<u64>;
 }
 
-/// Create the appropriate input backend for the current platform
-pub fn create_input_backend() -> Box<dyn InputBackend> {
+/// Create the appropriate input backend for the current platform.
+///
+/// Linux uses evdev for both X11 and Wayland: raw pre-acceleration deltas, reaches the
+/// same input layer raw-input consumers read, and works regardless of display server.
+/// rdev is not linked on Linux (see Cargo.toml). macOS/Windows use rdev.
+pub fn create_input_backend(secure: Arc<SecureInputState>) -> Result<Box<dyn InputBackend>> {
     #[cfg(target_os = "linux")]
     {
-        // Check if we're on Wayland
-        if std::env::var("XDG_SESSION_TYPE")
-            .map(|s| s == "wayland")
-            .unwrap_or(false)
-        {
-            // Try evdev backend for Wayland
-            if let Ok(backend) = super::evdev_backend::EvdevBackend::new() {
-                tracing::info!("Using evdev backend for Wayland");
-                return Box::new(backend);
-            }
-            tracing::warn!("evdev backend failed, falling back to rdev (may not work on Wayland)");
-        }
+        // No fallback by design: crowd-cast exists to record input, so a backend that can't
+        // read the input devices is worse than useless -- it would keep recording video while
+        // silently dropping every keystroke. Startup gates on 'input' group membership (see
+        // installer::requirements), so evdev should succeed by the time we get here; if it
+        // still fails, fail closed and loud rather than degrade to recording no input.
+        let backend = super::evdev_backend::EvdevBackend::new(secure).context(
+            "evdev input backend init failed -- ensure the user is in the 'input' group",
+        )?;
+        tracing::info!("Using evdev backend for input capture");
+        Ok(Box::new(backend))
     }
 
-    // Default to rdev backend
-    tracing::info!("Using rdev backend for input capture");
-    Box::new(super::rdev_backend::RdevBackend::new())
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Secure-input gating is Linux-only; macOS/Windows rely on OS facilities
+        // (e.g. macOS Secure Event Input), so the shared gate is inert here.
+        let _ = secure;
+        tracing::info!("Using rdev backend for input capture");
+        Ok(Box::new(super::rdev_backend::RdevBackend::new()))
+    }
 }

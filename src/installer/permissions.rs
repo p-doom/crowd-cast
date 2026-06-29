@@ -3,6 +3,7 @@
 #[allow(unused_imports)]
 use anyhow::{Context, Result};
 use std::process::Command;
+#[allow(unused_imports)]
 use tracing::{debug, info, warn};
 
 /// Permission status for all required permissions
@@ -350,18 +351,9 @@ pub fn prompt_screen_recording_permission() -> bool {
 
 #[cfg(target_os = "linux")]
 fn check_input_group_linux() -> PermissionState {
-    // Check if we're on Wayland
-    let is_wayland = std::env::var("XDG_SESSION_TYPE")
-        .map(|s| s == "wayland")
-        .unwrap_or(false);
-
-    if !is_wayland {
-        // X11 doesn't need input group
-        debug!("Not on Wayland, input group not required");
-        return PermissionState::NotApplicable;
-    }
-
-    // Check if user is in the input group
+    // crowd-cast reads input via evdev on BOTH X11 and Wayland (see
+    // input::create_input_backend), and /dev/input/event* is only readable by members of the
+    // 'input' group -- so membership is required regardless of session type.
     match Command::new("groups").output() {
         Ok(output) => {
             let groups = String::from_utf8_lossy(&output.stdout);
@@ -390,7 +382,7 @@ fn request_permissions_linux() -> Result<PermissionStatus> {
     let input_group = check_input_group_linux();
 
     if input_group == PermissionState::Denied {
-        warn!("User is not in the 'input' group. For Wayland input capture, run:");
+        warn!("User is not in the 'input' group. For input capture, run:");
         warn!("  sudo usermod -aG input $USER");
         warn!("Then log out and log back in.");
     }
@@ -400,28 +392,6 @@ fn request_permissions_linux() -> Result<PermissionStatus> {
         screen_recording: PermissionState::NotApplicable,
         input_group,
     })
-}
-
-#[cfg(target_os = "linux")]
-pub fn add_user_to_input_group() -> Result<()> {
-    let username = std::env::var("USER").context("Could not get current username")?;
-
-    info!(
-        "Adding user '{}' to input group (requires sudo)...",
-        username
-    );
-
-    let status = Command::new("sudo")
-        .args(["usermod", "-aG", "input", &username])
-        .status()
-        .context("Failed to run usermod")?;
-
-    if status.success() {
-        info!("Successfully added user to input group. Please log out and log back in.");
-        Ok(())
-    } else {
-        anyhow::bail!("Failed to add user to input group")
-    }
 }
 
 // ============================================================================

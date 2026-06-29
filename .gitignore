@@ -1,4 +1,10 @@
 obs-build/
 target/
 build/
+dist/
 .venv/
+packaging/linux/.cache/
+packaging/linux/.cache-rust/
+packaging/linux/out/
+.claude/
+.DS_Store

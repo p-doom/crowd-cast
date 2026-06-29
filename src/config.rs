@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Main configuration structure
@@ -22,6 +23,10 @@ pub struct Config {
     /// Recording configuration
     #[serde(default)]
     pub recording: RecordingConfig,
+
+    /// Secure-input gating (withholding secrets such as passwords from capture)
+    #[serde(default)]
+    pub security: SecurityConfig,
 
     /// Path to config file (not serialized)
     #[serde(skip)]
@@ -61,7 +66,8 @@ pub struct CaptureConfig {
     pub pause_uploads_on_idle: bool,
 
     /// On macOS, keep only the frontmost tracked application's capture source active.
-    /// This avoids running multiple ScreenCaptureKit application sources at once.
+    /// This avoids running multiple ScreenCaptureKit application sources at once. Linux
+    /// per-app capture uses the single-active path whenever it is supported.
     #[serde(default = "default_single_active_app_capture")]
     pub single_active_app_capture: bool,
 
@@ -76,6 +82,11 @@ pub struct CaptureConfig {
     /// Number of automatic retries before declaring the active capture source unhealthy.
     #[serde(default = "default_capture_watchdog_max_retries")]
     pub capture_watchdog_max_retries: u32,
+
+    /// xdg-desktop-portal ScreenCast restore tokens for supported Wayland display capture,
+    /// keyed by reserved identifiers such as `__display__`.
+    #[serde(default)]
+    pub restore_tokens: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,7 +154,9 @@ fn default_idle_timeout_secs() -> u64 {
 }
 
 fn default_single_active_app_capture() -> bool {
-    cfg!(target_os = "macos")
+    // On by default where follow-focus per-app capture exists. On Linux this is mandatory
+    // for supported per-app capture rather than a portal-backed multi-source option.
+    cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"))
 }
 
 fn default_capture_watchdog_timeout_ms() -> u64 {
@@ -193,6 +206,7 @@ impl Default for CaptureConfig {
             blank_video_on_untracked_app: true,
             capture_watchdog_timeout_ms: default_capture_watchdog_timeout_ms(),
             capture_watchdog_max_retries: default_capture_watchdog_max_retries(),
+            restore_tokens: HashMap::new(),
         }
     }
 }
@@ -230,6 +244,31 @@ impl Default for RecordingConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Withhold keystrokes from capture while a secure context (e.g. a focused password
+    /// field) is detected. Best-effort; the server-side scrub remains the authoritative
+    /// backstop. Default: true.
+    #[serde(default = "default_true")]
+    pub gating_enabled: bool,
+
+    /// On Linux, enable system accessibility (org.a11y.Status IsEnabled) at startup so
+    /// applications expose their UI tree to the password-field detector. This is a
+    /// system-wide, session-scoped change and should be disclosed to the user in the
+    /// setup wizard. Without it, only already-accessible apps are covered. Default: true.
+    #[serde(default = "default_true")]
+    pub enable_accessibility: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            gating_enabled: true,
+            enable_accessibility: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -237,9 +276,43 @@ impl Default for Config {
             input: InputConfig::default(),
             upload: UploadConfig::default(),
             recording: RecordingConfig::default(),
+            security: SecurityConfig::default(),
             config_path: None,
         }
     }
+}
+
+/// The agent's own app identifier: the value `get_frontmost_app()` reports when
+/// the agent itself is in the foreground. Computed once and cached.
+///
+/// On Windows/Linux this is the lowercased executable stem (e.g.
+/// `crowd-cast-agent`), matching how frontmost detection reports apps; on macOS
+/// it's the bundle identifier.
+pub fn agent_self_identifier() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            "dev.crowd-cast.agent".to_string()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                })
+                .unwrap_or_default()
+        }
+    })
+}
+
+/// Whether `bundle_id` refers to the crowd-cast agent itself.
+pub fn is_agent_self(bundle_id: &str) -> bool {
+    let me = agent_self_identifier();
+    !me.is_empty() && bundle_id.eq_ignore_ascii_case(me)
 }
 
 impl Config {
@@ -315,6 +388,14 @@ impl Config {
 
     /// Check if input should be captured for the given app
     pub fn should_capture_app(&self, bundle_id: &str) -> bool {
+        // Never capture the agent itself. On Windows the user can pick it from the
+        // window list, and because clicking the tray brings the agent to the
+        // foreground, that becomes a capture-switch + process-restart loop with no
+        // way out via the UI. Exclude it before capture_all/target_apps so nothing
+        // can trigger it (and any config that already lists it is effectively healed).
+        if is_agent_self(bundle_id) {
+            return false;
+        }
         if self.capture.capture_all {
             return true;
         }
@@ -324,7 +405,20 @@ impl Config {
             return false;
         }
 
-        self.capture.target_apps.iter().any(|app| app == bundle_id)
+        // On Windows, app identifiers are executable names whose case the user
+        // can't reliably predict, so match case-insensitively. On macOS/Linux the
+        // identifiers (bundle IDs / process names) are case-sensitive.
+        #[cfg(target_os = "windows")]
+        {
+            self.capture
+                .target_apps
+                .iter()
+                .any(|app| app.eq_ignore_ascii_case(bundle_id))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.capture.target_apps.iter().any(|app| app == bundle_id)
+        }
     }
 
     /// Mark setup as completed and save
@@ -348,5 +442,35 @@ impl Config {
     /// Clear all target apps
     pub fn clear_target_apps(&mut self) {
         self.capture.target_apps.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_never_captures_itself() {
+        let me = agent_self_identifier();
+        // In tests this is the test binary's stem; we only need it non-empty to
+        // exercise the exclusion logic.
+        assert!(!me.is_empty(), "agent self-identifier should resolve");
+
+        // Excluded even when capture_all is on.
+        let mut cfg = Config::default();
+        cfg.capture.capture_all = true;
+        assert!(
+            !cfg.should_capture_app(me),
+            "agent must never capture itself, even with capture_all"
+        );
+
+        // Excluded even if explicitly listed; other apps are still captured.
+        cfg.capture.capture_all = false;
+        cfg.capture.target_apps = vec![me.to_string(), "firefox".to_string()];
+        assert!(!cfg.should_capture_app(me));
+        assert!(cfg.should_capture_app("firefox"));
+
+        // Self-exclusion is case-insensitive.
+        assert!(!cfg.should_capture_app(&me.to_ascii_uppercase()));
     }
 }

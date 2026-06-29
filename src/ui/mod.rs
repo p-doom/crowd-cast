@@ -1,10 +1,31 @@
 //! System tray UI and notifications
 
 pub mod app_selector;
+#[cfg(target_os = "windows")]
+mod aumid_windows;
+/// Shared Ed25519 message construction for the Linux appcast manifest (also `#[path]`-included
+/// by `bin/cc-sign-manifest`). Linux-only; the signer binary compiles it standalone.
+#[cfg(target_os = "linux")]
+pub(crate) mod appcast_sig;
 pub mod notifications;
+#[cfg(target_os = "linux")]
+pub mod notify_linux;
+mod platform_tray;
 mod tray;
 pub mod tray_ffi;
+#[cfg(target_os = "linux")]
+mod tray_linux;
+#[cfg(target_os = "macos")]
+mod tray_macos;
+#[cfg(target_os = "windows")]
+mod tray_windows;
+#[cfg(target_os = "linux")]
+pub(crate) mod update_dialog;
 mod updater;
+#[cfg(target_os = "windows")]
+mod updater_windows;
+#[cfg(target_os = "linux")]
+mod updater_linux;
 
 pub use notifications::{
     init_notifications, is_authorized as notifications_authorized,
@@ -15,7 +36,16 @@ pub use notifications::{
     show_update_completed_notification, show_update_installing_notification, NotificationAction,
 };
 pub use tray::*;
+#[cfg(target_os = "linux")]
+pub use tray_linux::request_tray_exit;
 pub use updater::UpdaterController;
+
+/// Register the Windows notification identity (AUMID + Start Menu shortcut) so
+/// toasts are branded as crowd-cast. No-op error handling inside.
+#[cfg(target_os = "windows")]
+pub fn register_notification_identity() {
+    aumid_windows::register();
+}
 
 #[cfg(target_os = "macos")]
 pub fn current_app_bundle_path() -> Option<std::path::PathBuf> {

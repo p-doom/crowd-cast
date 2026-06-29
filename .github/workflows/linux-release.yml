@@ -1,9 +1,11 @@
 name: Linux Release
 
 # Manual trigger (Actions tab → "Run workflow", or `gh workflow run linux-release.yml`).
-# Mirrors windows-release.yml: marketing version comes from Cargo.toml, the AUTO build number
-# (github.run_number) makes every release strictly newer to the in-app updater (is_newer in
-# src/ui/updater_linux.rs compares version, then build number), so no manual version bump is needed.
+# Marketing version comes from Cargo.toml. The AUTO build number (github.run_number) makes
+# same-version rebuilds strictly newer to the in-app updater (is_newer in
+# src/ui/updater_linux.rs compares version, then build number). For a new public marketing version,
+# bump Cargo.toml; Linux binaries report CARGO_PKG_VERSION at runtime, so the appcast version must
+# match it.
 #
 # The Linux updater fetches a SIGNED JSON manifest ("appcast-linux.json" + .sig) — the Linux analog
 # of the mac/win Sparkle appcast. It is published to the SAME S3 bucket as appcast.xml/appcast-win.xml
@@ -18,7 +20,7 @@ on:
         options: [dev, prod]
         default: dev          # safe default: an accidental dispatch goes to dev, never prod
       version_base:
-        description: "Marketing version (blank = Cargo.toml version)"
+        description: "Marketing version (blank = Cargo.toml version; must match Cargo.toml on Linux)"
         required: false
         default: ""
 
@@ -56,20 +58,25 @@ jobs:
           cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
           base="${{ github.event.inputs.version_base }}"
           [ -z "$base" ] && base="$cargo_ver"
+          if [ "$base" != "$cargo_ver" ]; then
+            echo "::error::Linux appcast version ($base) must match Cargo.toml version ($cargo_ver); bump Cargo.toml instead of overriding version_base."
+            exit 1
+          fi
           build="${{ github.run_number }}"
           channel="${{ github.event.inputs.channel }}"
           bundle_url="https://github.com/${{ github.repository }}/releases/download/obs-bundle-${OBS_ABI}/obs-bundle-${OBS_ABI}-x86_64.tar.zst"
           if [ "$channel" = "prod" ]; then
-            feed_key="appcast-linux.json"; tag="linux-v$base+$build"; prerelease="false"; upload_test=""
+            feed_key="appcast-linux.json"; tag="linux-v$base+$build"; prerelease="false"; upload_test=""; release_name="v$base"
           else
             # dev: isolated feed + pre-release + clips routed to uploads/TEST_VERSION/ (CROWD_CAST_UPLOAD_TEST)
-            feed_key="appcast-linux-dev.json"; tag="linux-dev-v$base+$build"; prerelease="true"; upload_test="1"
+            feed_key="appcast-linux-dev.json"; tag="linux-dev-v$base+$build"; prerelease="true"; upload_test="1"; release_name="crowd-cast (Linux dev) $base build $build"
           fi
           {
             echo "marketing=$base"
             echo "build=$build"
             echo "channel=$channel"
             echo "tag=$tag"
+            echo "release_name=$release_name"
             echo "prerelease=$prerelease"
             echo "feed_key=$feed_key"
             echo "feed_url=https://${S3_BUCKET}.s3.amazonaws.com/${feed_key}"
@@ -116,6 +123,7 @@ jobs:
       - name: Generate + sign the appcast manifest
         env:
           ED_PRIVATE_KEY: ${{ secrets.CROWD_CAST_ED_PRIVATE_KEY }}
+          ED_PUBLIC_KEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
         run: |
           keyfile="$RUNNER_TEMP/ed25519.key"
           # shellcheck disable=SC2064
@@ -133,6 +141,17 @@ jobs:
             --signer "dist/cc-sign-manifest" \
             --key-file "$keyfile" \
             --out-dir dist
+          python3 - "${{ steps.ver.outputs.feed_url }}" "$ED_PUBLIC_KEY" \
+            packaging/linux/install.sh dist/install-linux.sh <<'PY'
+          import pathlib, sys
+          feed_url, pubkey, src, dest = sys.argv[1:]
+          text = pathlib.Path(src).read_text(encoding="utf-8")
+          text = text.replace("__CROWD_CAST_DEFAULT_FEED_URL__", feed_url)
+          text = text.replace("__CROWD_CAST_UPDATE_PUBKEY__", pubkey)
+          pathlib.Path(dest).write_text(text, encoding="utf-8")
+          PY
+          chmod 0755 dist/install-linux.sh
+          cp assets/logo.png dist/logo.png
 
       # Prod only: re-attach the latest signed macOS (.dmg) and Windows (.exe) downloads so this
       # release — which becomes "Latest" — keeps working /releases/latest/download/ buttons for ALL
@@ -166,14 +185,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           prerelease: ${{ steps.ver.outputs.prerelease }}
-          name: "crowd-cast (Linux ${{ steps.ver.outputs.channel }}) ${{ steps.ver.outputs.marketing }} build ${{ steps.ver.outputs.build }}"
+          name: ${{ steps.ver.outputs.release_name }}
           # The Linux binary is built here; the libobs bundle stays in its per-ABI Release (the
           # manifest points there, no re-upload); the dmg/exe are carried forward on prod only.
           # fail_on_unmatched_files=false so dev (no carried dmg/exe) uploads just the binary.
           fail_on_unmatched_files: false
           files: |
             dist/crowd-cast-agent-x86_64
+            dist/install-linux.sh
+            dist/logo.png
             dist/CrowdCast.dmg
             dist/crowd-cast-setup.exe
 

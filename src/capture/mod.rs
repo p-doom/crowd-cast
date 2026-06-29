@@ -11,10 +11,54 @@
 
 mod apps;
 mod context;
+#[cfg(target_os = "linux")]
+pub(crate) mod focus;
 mod frontmost;
+#[cfg(target_os = "linux")]
+pub(crate) mod gnome_screencast;
+#[cfg(target_os = "linux")]
+pub(crate) mod monitor_layout;
 mod recording;
 mod recovery;
 mod sources;
+#[cfg(target_os = "windows")]
+mod window_geometry;
+#[cfg(target_os = "linux")]
+pub(crate) mod wayland_output;
+#[cfg(target_os = "linux")]
+pub(crate) mod x11_windows;
+
+/// Whether this is a GNOME Wayland session, where per-app capture goes through the private
+/// Mutter ScreenCast API (picker-free) rather than the portal. Cheap env check; the actual
+/// availability of the focus extension (which supplies window-ids) is gated at use.
+#[cfg(target_os = "linux")]
+pub fn is_gnome_wayland() -> bool {
+    sources::is_wayland_session() && crate::installer::gnome_focus::is_gnome()
+}
+
+/// Whether this platform/session can drive the single-active-app capture model (capture
+/// only the frontmost tracked app, switching on focus). macOS always can (ScreenCaptureKit
+/// per-app). Windows always can (per-window capture + follow focus). Linux can only when the
+/// current session has an explicitly supported per-app backend: GNOME Wayland through private
+/// Mutter ScreenCast, or pure X11 through XComposite.
+pub fn is_single_active_capable() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::installer::requirements::per_app_capture_available()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        false
+    }
+}
 
 pub use apps::{list_capturable_apps, list_running_apps};
 pub use context::{CaptureContext, RecordingSession};
@@ -25,6 +69,10 @@ pub use recording::{
 };
 pub use recovery::{get_display_name, get_display_uuid, DisplayChangeEvent, DisplayMonitor};
 pub use sources::{get_main_display_resolution, get_main_display_uuid, ScreenCaptureSource};
+// Linux/Wayland display-capture restore-token persistence (handled in main): the reserved
+// map key and the session predicate used to gate the one-time monitor-pick wait.
+#[cfg(target_os = "linux")]
+pub(crate) use sources::{is_wayland_session, DISPLAY_CAPTURE_KEY};
 
 /// Events emitted by the capture system
 #[derive(Debug, Clone)]

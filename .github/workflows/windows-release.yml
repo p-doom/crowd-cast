@@ -7,10 +7,20 @@ name: Windows Release
 on:
   workflow_dispatch:
     inputs:
+      channel:
+        description: "dev = test build: prerelease, NO appcast publish (does not auto-update users); prod = real release"
+        type: choice
+        options: [prod, dev]
+        default: prod
       version_base:
         description: "Marketing version (blank = Cargo.toml version)"
         required: false
         default: ""
+      allow_version_mismatch:
+        description: "Release even if macOS is on a different marketing version"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # create the GitHub Release
@@ -36,10 +46,45 @@ jobs:
           $base  = "${{ github.event.inputs.version_base }}"
           if ([string]::IsNullOrWhiteSpace($base)) { $base = $cargo }
           $build = "${{ github.run_number }}"
+          # dev builds get a distinct tag so they never collide with or shadow a prod win-v tag.
+          if ("${{ github.event.inputs.channel }}" -eq "dev") {
+            $tag = "win-dev-v$base+$build"
+          } else {
+            $tag = "win-v$base+$build"
+          }
           "marketing=$base"           >> $env:GITHUB_OUTPUT
           "build=$build"              >> $env:GITHUB_OUTPUT
           "buildVersion=$base.$build" >> $env:GITHUB_OUTPUT
-          "tag=win-v$base+$build"     >> $env:GITHUB_OUTPUT
+          "tag=$tag"                  >> $env:GITHUB_OUTPUT
+
+      # Version guard: refuse to release Windows at a marketing version that differs
+      # from the latest macOS release, so the carried-forward dmg and the download
+      # buttons never advertise two different marketing versions at once. Override
+      # with the allow_version_mismatch input when the drift is intentional.
+      # Skipped for dev builds (they are prereleases and never become "latest").
+      - name: Check version alignment with macOS
+        if: ${{ github.event.inputs.channel != 'dev' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $win  = "${{ steps.ver.outputs.marketing }}"
+          # macOS releases are tagged v{marketing}-{build}; Windows are win-v{marketing}+{build}.
+          $macTag = gh release list --repo $repo --limit 40 --json tagName,createdAt |
+            ConvertFrom-Json | Sort-Object { [datetime]$_.createdAt } -Descending |
+            Where-Object { $_.tagName -match '^v\d+\.\d+\.\d+-' } |
+            Select-Object -First 1 -ExpandProperty tagName
+          if (-not $macTag) { Write-Host "No macOS release yet; skipping alignment check."; exit 0 }
+          $mac = ($macTag -replace '^v','') -replace '-.*$',''
+          if ($mac -eq $win) { Write-Host "Versions aligned: both at $win."; exit 0 }
+          $msg = "Version mismatch: releasing Windows $win while the latest macOS release is $mac."
+          if ("${{ github.event.inputs.allow_version_mismatch }}" -eq "true") {
+            Write-Host "::warning::$msg Proceeding because allow_version_mismatch=true."
+          } else {
+            Write-Error "$msg Release macOS $win first, or re-run with allow_version_mismatch=true."
+            exit 1
+          }
 
       - name: Build release binary + installer
         shell: pwsh
@@ -47,12 +92,36 @@ jobs:
           CROWD_CAST_API_GATEWAY_URL: ${{ secrets.CROWD_CAST_API_GATEWAY_URL }}
           CROWD_CAST_GOOGLE_CLIENT_ID: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_ID }}
           CROWD_CAST_GOOGLE_CLIENT_SECRET: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_SECRET }}
-          CROWD_CAST_APPCAST_URL: https://crowd-cast-bucket.s3.amazonaws.com/appcast-win.xml
+          # dev: bake an empty appcast URL so the test build's updater is inert (build.rs only
+          # wires WinSparkle when this is non-empty) — the test build never self-updates.
+          CROWD_CAST_APPCAST_URL: ${{ github.event.inputs.channel == 'dev' && '' || 'https://crowd-cast-bucket.s3.amazonaws.com/appcast-win.xml' }}
           CROWD_CAST_ED_PUBLIC_KEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
           # Auto build number → comparable version = {marketing}.{run_number}
           CROWD_CAST_VERSION_BASE: ${{ steps.ver.outputs.marketing }}
           CROWD_CAST_BUILD_NUMBER: ${{ steps.ver.outputs.build }}
         run: pwsh scripts/build-windows-installer.ps1 -Version "${{ steps.ver.outputs.marketing }}"
+
+      # Authenticode-sign the installer via Azure Trusted Signing. MUST run before the
+      # Ed25519/appcast step below: that step hashes the final .exe bytes, and signing
+      # appends a signature, so signing afterwards would make WinSparkle reject the
+      # download on a length/signature mismatch. The service-principal creds must go
+      # through the action's own auth INPUTS (azure-*): the action maps those to
+      # action-scoped env vars that the signing subprocess inherits. Step-level env: is
+      # NOT seen by that subprocess (DefaultAzureCredential then fails "not configured").
+      - name: Authenticode-sign the installer (Azure Trusted Signing)
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://weu.codesigning.azure.net/
+          signing-account-name: crowdcastsign
+          certificate-profile-name: crowdcast-public
+          files-folder: ${{ github.workspace }}/dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Sign installer + generate appcast
         shell: pwsh
@@ -62,8 +131,8 @@ jobs:
           $v   = "${{ steps.ver.outputs.marketing }}"
           $bv  = "${{ steps.ver.outputs.buildVersion }}"
           $tag = "${{ steps.ver.outputs.tag }}"
-          $installer = "dist/crowd-cast-setup-$v.exe"
-          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/crowd-cast-setup-$v.exe"
+          $installer = "dist/crowd-cast-setup.exe"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/crowd-cast-setup.exe"
           $keyFile = Join-Path $env:RUNNER_TEMP 'ed25519.key'
           [System.IO.File]::WriteAllText($keyFile, $env:ED_PRIVATE_KEY, (New-Object System.Text.UTF8Encoding($false)))
           try {
@@ -72,14 +141,65 @@ jobs:
             Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
           }
 
+      # Carry the current macOS installer forward into this release. The download
+      # buttons use /releases/latest/download/..., and this Windows release becomes
+      # "Latest", so without the dmg here the macOS button 404s whenever Windows
+      # shipped most recently. We copy the dmg from the most recent release that has
+      # one (the latest macOS build, or the carried copy from the previous Windows
+      # release). The macOS Sparkle appcast still points at its own immutable asset,
+      # so auto-update is untouched; this is purely the human download.
+      - name: Carry forward the latest macOS download (CrowdCast.dmg)
+        if: ${{ github.event.inputs.channel != 'dev' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Best-effort: never fail the release over the carried download.
+          $repo = "${{ github.repository }}"
+          $dmgTag = $null
+          try {
+            $tags = (gh release list --repo $repo --limit 40 --json tagName,createdAt |
+              ConvertFrom-Json | Sort-Object { [datetime]$_.createdAt } -Descending).tagName
+            foreach ($t in $tags) {
+              $names = (gh release view $t --repo $repo --json assets | ConvertFrom-Json).assets.name
+              if ($names -contains 'CrowdCast.dmg') { $dmgTag = $t; break }
+            }
+            if ($dmgTag) {
+              gh release download $dmgTag --repo $repo --pattern 'CrowdCast.dmg' --dir dist
+              Write-Host "Carried forward CrowdCast.dmg from $dmgTag"
+            } else {
+              Write-Host "No macOS CrowdCast.dmg found yet; shipping Windows-only (mac button stays 404 until macOS releases)."
+            }
+          } catch {
+            Write-Host "Carry-forward skipped (non-fatal): $_"
+          }
+          exit 0
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: "crowd-cast (Windows) ${{ steps.ver.outputs.marketing }} build ${{ steps.ver.outputs.build }}"
-          files: dist/crowd-cast-setup-${{ steps.ver.outputs.marketing }}.exe
+          name: ${{ github.event.inputs.channel == 'dev' && format('v{0} (cross-platform test)', steps.ver.outputs.marketing) || format('v{0}', steps.ver.outputs.marketing) }}
+          # dev = prerelease: excluded from /releases/latest, so the docs download
+          # buttons keep pointing at the current prod release.
+          prerelease: ${{ github.event.inputs.channel == 'dev' }}
+          body: |
+            ## Installation
+
+            Please refer to the [quickstart guide](https://pdoom.org/crowd-cast-quickstart.html) for installation instructions.
+
+            ## What's changed
+            <!-- Add the user-facing changes for this release. -->
+          # CrowdCast.dmg is carried forward (above) and may be absent on a very
+          # first release, so do not fail if it is missing.
+          fail_on_unmatched_files: false
+          files: |
+            dist/crowd-cast-setup.exe
+            dist/CrowdCast.dmg
 
       - name: Configure AWS credentials
+        # dev builds never publish an appcast, so no AWS access is needed.
+        if: ${{ github.event.inputs.channel != 'dev' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -88,5 +208,10 @@ jobs:
 
       # Publish the appcast LAST — once it's live, clients start updating, so the
       # release asset (previous step) must already exist for the download URL.
+      # SKIPPED for dev builds: this is the only step that triggers auto-update,
+      # so a dev build reaches no existing user.
       - name: Publish appcast to S3
-        run: aws s3 cp dist/appcast-win.xml s3://crowd-cast-bucket/appcast-win.xml
+        if: ${{ github.event.inputs.channel != 'dev' }}
+        # no-cache so WinSparkle/WinINet always revalidates the appcast and never
+        # serves a stale version that hides a freshly published release.
+        run: aws s3 cp dist/appcast-win.xml s3://crowd-cast-bucket/appcast-win.xml --cache-control "no-cache"

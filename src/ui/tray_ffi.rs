@@ -32,8 +32,10 @@ pub struct TrayMenuItem {
     pub submenu: *mut TrayMenuItem,
 }
 
-// Only include FFI functions when tray is available
-#[cfg(not(no_tray))]
+// The dmikushin/tray C library is compiled only on macOS (build.rs). Linux has a native
+// tray too (ksni, src/ui/tray_linux.rs) but does NOT link this C library, so it must use the
+// stubs below even though it is a `not(no_tray)` build. Windows is `no_tray` and also stubs.
+#[cfg(all(not(no_tray), not(target_os = "linux")))]
 extern "C" {
     /// Initialize the tray icon and menu
     /// Returns 0 on success, -1 on failure
@@ -61,32 +63,32 @@ extern "C" {
 }
 
 // Stub implementations when tray is not available
-#[cfg(no_tray)]
+#[cfg(any(no_tray, target_os = "linux"))]
 pub unsafe fn tray_init(_tray: *mut Tray) -> c_int {
     -1
 }
 
-#[cfg(no_tray)]
+#[cfg(any(no_tray, target_os = "linux"))]
 pub unsafe fn tray_loop(_blocking: c_int) -> c_int {
     std::thread::sleep(std::time::Duration::from_millis(100));
     0
 }
 
-#[cfg(no_tray)]
+#[cfg(any(no_tray, target_os = "linux"))]
 pub unsafe fn tray_update(_tray: *mut Tray) {}
 
-#[cfg(no_tray)]
+#[cfg(any(no_tray, target_os = "linux"))]
 pub unsafe fn tray_prepare_for_restart() {}
 
-#[cfg(no_tray)]
+#[cfg(any(no_tray, target_os = "linux"))]
 pub unsafe fn tray_exit() {}
 
-#[cfg(no_tray)]
+#[cfg(any(no_tray, target_os = "linux"))]
 pub unsafe fn tray_screen_was_unlocked() -> bool {
     false
 }
 
-#[cfg(no_tray)]
+#[cfg(any(no_tray, target_os = "linux"))]
 pub unsafe fn tray_needs_restart() -> bool {
     false
 }

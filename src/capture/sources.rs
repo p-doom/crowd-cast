@@ -19,11 +19,40 @@ use libobs_simple::sources::macos::{
 #[cfg(target_os = "macos")]
 use libobs_wrapper::data::ObsObjectUpdater;
 
+#[cfg(target_os = "linux")]
+use libobs_simple::sources::linux::{
+    PipeWireDesktopCaptureSourceBuilder, PipeWireScreenCaptureSourceBuilder,
+    X11CaptureSourceBuilder, XCompositeInputSourceBuilder, XCompositeInputSourceUpdater,
+};
+#[cfg(target_os = "linux")]
+use libobs_wrapper::data::{ObsData, ObsObjectUpdater};
+
+/// Returns true when running under a Wayland session (vs X11), used to choose the right
+/// Linux capture backend (PipeWire/portal on Wayland, XSHM/XComposite on X11).
+#[cfg(target_os = "linux")]
+pub(crate) fn is_wayland_session() -> bool {
+    std::env::var("XDG_SESSION_TYPE")
+        .map(|s| s.eq_ignore_ascii_case("wayland"))
+        .unwrap_or(false)
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// Reserved `restore_tokens` map key for the full-screen display capture source on Wayland.
+/// Display capture has no app/window identity, so its xdg-desktop-portal restore token is
+/// persisted under this sentinel (kept distinct from any real bundle id) so the monitor pick
+/// happens once and then restores silently on later launches. The leading underscores make a
+/// collision with a real macOS bundle id or Linux process name impossible.
+#[cfg(target_os = "linux")]
+pub const DISPLAY_CAPTURE_KEY: &str = "__display__";
+
 /// Wrapper around a screen capture source
 pub struct ScreenCaptureSource {
     source: ObsSourceRef,
     name: String,
     is_active: bool,
+    /// Target app/window identifier this source captures (None for display capture).
+    /// Used to key persisted portal restore tokens on Linux/Wayland.
+    app_id: Option<String>,
 }
 
 impl ScreenCaptureSource {
@@ -40,6 +69,7 @@ impl ScreenCaptureSource {
         scene: &mut ObsSceneRef,
         name: &str,
         capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
         // Get the current main display UUID - this is refreshed each time,
         // so it will be correct even after display reconnection
@@ -65,18 +95,136 @@ impl ScreenCaptureSource {
             source,
             name: name.to_string(),
             is_active: true,
+            app_id: None,
         })
     }
 
-    /// Create a new screen capture source (fallback for non-macOS)
-    #[cfg(not(target_os = "macos"))]
+    /// Create a new full-screen capture source on Windows.
+    ///
+    /// Uses libobs `monitor_capture` via Windows Graphics Capture (WGC),
+    /// targeting the primary monitor. `capture_audio` is ignored — the
+    /// Windows monitor source has no audio track (audio is window-scoped only).
+    #[cfg(target_os = "windows")]
+    pub fn new_display_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        _capture_audio: bool,
+        _restore_token: Option<&str>,
+    ) -> Result<Self> {
+        use libobs_simple::sources::windows::{
+            MonitorCaptureSourceBuilder, ObsDisplayCaptureMethod,
+        };
+
+        info!("Creating Windows monitor capture source: {}", name);
+
+        // Pick the primary monitor, falling back to the first enumerated one.
+        let monitors = MonitorCaptureSourceBuilder::get_monitors()
+            .map_err(|e| anyhow::anyhow!("Failed to enumerate monitors: {}", e))?;
+        let primary = monitors
+            .iter()
+            .find(|m| m.0.is_primary)
+            .or_else(|| monitors.first());
+
+        let mut builder = context
+            .source_builder::<MonitorCaptureSourceBuilder, _>(name)?
+            .set_capture_cursor(true)
+            .set_capture_method(ObsDisplayCaptureMethod::MethodWgc);
+
+        if let Some(monitor) = primary {
+            info!("Capturing monitor '{}'", monitor.0.name);
+            builder = builder.set_monitor(monitor);
+        } else {
+            tracing::warn!("No monitors enumerated; using default monitor capture settings");
+        }
+
+        let source = builder
+            .add_to_scene(scene)
+            .context("Failed to add monitor capture source to scene")?;
+
+        debug!("Monitor capture source '{}' created successfully", name);
+
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+            app_id: None,
+        })
+    }
+
+    /// Create a new display (full-screen) capture source on Linux.
+    ///
+    /// - **Wayland**: captures via xdg-desktop-portal ScreenCast + PipeWire (the GPU /
+    ///   zero-copy path). The first run shows the portal picker (on wlroots/sway this is a
+    ///   bare `slurp` crosshair); the restore token read back afterwards is persisted under
+    ///   [`DISPLAY_CAPTURE_KEY`] so the monitor pick happens once and later launches restore
+    ///   the same output silently.
+    /// - **X11**: captures the whole primary screen via XSHM (`xshm_input`) — no portal, no
+    ///   picker, so `restore_token` is ignored.
+    ///
+    /// Audio is configured at the output level, so `_capture_audio` is unused here.
+    #[cfg(target_os = "linux")]
+    pub fn new_display_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        _capture_audio: bool,
+        restore_token: Option<&str>,
+    ) -> Result<Self> {
+        let wayland = is_wayland_session();
+        let source = if wayland {
+            info!(
+                "Creating Linux PipeWire (Wayland) display capture source: {} (has_token: {})",
+                name,
+                restore_token.map(|t| !t.is_empty()).unwrap_or(false)
+            );
+            // First launch (no token): the portal asks the user to pick a monitor and the
+            // token is read back afterwards (see CaptureContext::collect_restore_tokens).
+            // Later launches pass the saved token so the same output is restored silently.
+            // Mirrors the per-window path: OBS requests persist mode itself, so an empty
+            // token is simply not set rather than seeded.
+            let mut builder = context
+                .source_builder::<PipeWireDesktopCaptureSourceBuilder, _>(name)?
+                .set_show_cursor(true);
+            if let Some(token) = restore_token {
+                if !token.is_empty() {
+                    builder = builder.set_restore_token(token.to_string());
+                }
+            }
+            builder
+                .add_to_scene(scene)
+                .context("Failed to add PipeWire desktop capture source to scene")?
+        } else {
+            info!("Creating Linux X11 (xshm) display capture source: {}", name);
+            context
+                .source_builder::<X11CaptureSourceBuilder, _>(name)?
+                .set_screen(0)
+                .set_show_cursor(true)
+                .add_to_scene(scene)
+                .context("Failed to add X11 screen capture source to scene")?
+        };
+
+        debug!("Linux display capture source '{}' created", name);
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+            // Wayland display capture persists its portal token under the reserved key;
+            // X11 has no token, so it stays identity-less.
+            app_id: wayland.then(|| DISPLAY_CAPTURE_KEY.to_string()),
+        })
+    }
+
+    /// Create a new screen capture source (fallback for unsupported platforms)
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     pub fn new_display_capture(
         _context: &mut ObsContext,
         _scene: &mut ObsSceneRef,
         _name: &str,
         _capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
-        anyhow::bail!("Screen capture not yet implemented for this platform");
+        anyhow::bail!("Screen capture not supported on this platform");
     }
 
     /// Create a new application capture source for a specific application
@@ -99,6 +247,7 @@ impl ScreenCaptureSource {
         bundle_id: &str,
         display_uuid: &str,
         capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
         info!(
             "Creating macOS application capture source: {} (app: {}, audio: {})",
@@ -125,25 +274,205 @@ impl ScreenCaptureSource {
             source,
             name: name.to_string(),
             is_active: true,
+            app_id: Some(bundle_id.to_string()),
         })
     }
 
-    /// Create a new application capture source (fallback for non-macOS)
-    #[cfg(not(target_os = "macos"))]
+    /// Create a new application capture source on Windows.
+    ///
+    /// Uses libobs `window_capture` (Windows Graphics Capture) bound to a
+    /// top-level window of the target application, matched by executable name.
+    /// Returns an error if the application has no capturable window right now;
+    /// callers (app-scene setup) treat that as "skip this app for now".
+    /// `display_uuid` and `capture_audio` are unused on Windows.
+    #[cfg(target_os = "windows")]
+    pub fn new_application_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        bundle_id: &str,
+        _display_uuid: &str,
+        _capture_audio: bool,
+        _restore_token: Option<&str>,
+    ) -> Result<Self> {
+        use libobs_simple::sources::windows::{
+            ObsWindowCaptureMethod, ObsWindowPriority, WindowCaptureSourceBuilder,
+        };
+
+        let obs_id = find_window_obs_id_for_app(bundle_id)?;
+        info!(
+            "Creating Windows window capture source: {} (app: {}, window: {})",
+            name, bundle_id, obs_id
+        );
+
+        let source = context
+            .source_builder::<WindowCaptureSourceBuilder, _>(name)?
+            .set_window_raw(obs_id.as_str())
+            .set_priority(ObsWindowPriority::Executable)
+            .set_cursor(true)
+            .set_capture_method(ObsWindowCaptureMethod::MethodWgc)
+            .add_to_scene(scene)
+            .context("Failed to add window capture source to scene")?;
+
+        debug!(
+            "Window capture source '{}' for '{}' created successfully",
+            name, bundle_id
+        );
+
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+            app_id: Some(bundle_id.to_string()),
+        })
+    }
+
+    /// Create a per-application / per-window capture source on Linux.
+    ///
+    /// Privacy-preserving: only the target window's own buffer is captured, so an
+    /// overlapping non-selected window cannot leak (no monitor cropping involved).
+    /// - **Wayland**: not supported here. GNOME Wayland per-app capture binds Mutter-owned
+    ///   PipeWire nodes through [`Self::new_window_node_capture`]; sway is display capture
+    ///   only. xdg-desktop-portal WINDOW capture is not a supported crowd-cast backend.
+    /// - **X11**: per-window capture via XComposite. `bundle_id` MUST be the X11 window id
+    ///   (decimal string); mapping an application to its window id is the caller's job (see
+    ///   the frontmost/app-enumeration code) and is intentionally not done here.
+    ///
+    /// `_display_uuid` is unused on Linux (kept for signature parity with macOS).
+    #[cfg(target_os = "linux")]
+    pub fn new_application_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        bundle_id: &str,
+        _display_uuid: &str,
+        _capture_audio: bool,
+        restore_token: Option<&str>,
+    ) -> Result<Self> {
+        if is_wayland_session() {
+            anyhow::bail!(
+                "Linux Wayland per-app capture must use GNOME Mutter ScreenCast nodes; \
+                 xdg-desktop-portal WINDOW capture is unsupported"
+            );
+        }
+        let _ = restore_token;
+        // X11: `bundle_id` is the app identity (`/proc/comm`), not a window id. Bind the
+        // app's window id *only if it is the focused window right now* (no fallback; see
+        // x11_windows). Empty otherwise (e.g. created at setup before the app is focused);
+        // the source stays blank and not-ready, so the engine's readiness gate keeps input
+        // capture off until a focus switch re-resolves it. Fail-closed, never a wrong window.
+        let capture_window =
+            crate::capture::x11_windows::resolve_capture_window(bundle_id).unwrap_or_default();
+        info!(
+            "Creating Linux X11 (xcomposite) window capture source: {} (app: {}, resolved: {})",
+            name,
+            bundle_id,
+            if capture_window.is_empty() {
+                "<no window yet>"
+            } else {
+                &capture_window
+            }
+        );
+        let source = context
+            .source_builder::<XCompositeInputSourceBuilder, _>(name)?
+            .set_capture_window(capture_window)
+            .set_show_cursor(true)
+            .add_to_scene(scene)
+            .context("Failed to add XComposite window capture source to scene")?;
+
+        debug!("Linux application capture source '{}' created", name);
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+            app_id: Some(bundle_id.to_string()),
+        })
+    }
+
+    /// Create a per-app capture source on Linux that binds an already-existing PipeWire node
+    /// directly (no portal, no picker). The node is produced out-of-band by
+    /// `gnome_screencast` via Mutter `RecordWindow`; OBS connects to it through the
+    /// obs-pipewire `ConnectNode` setting (bundled-OBS patch). The node must stay alive (its
+    /// Mutter session is held by the `GnomeScreenCast` manager) for this source's lifetime.
+    ///
+    /// Uses the **unified** `pipewire-screen-capture-source` as the container, NOT the
+    /// window-capture source. obs-pipewire only registers the window-capture source when the
+    /// xdg-desktop-portal advertises WINDOW capture — but we never touch the portal here (the
+    /// node comes from Mutter, and `ConnectNode` binds it on the default PipeWire daemon). The
+    /// screen-capture source is registered whenever *any* screencast type is available, so this
+    /// path no longer breaks when a non-GNOME portal backend (e.g. a stale xdg-desktop-portal-wlr
+    /// serving the session) advertises monitor-only. `ConnectNode` behaves identically across
+    /// the three obs-pipewire source types (see the bundled-OBS patch).
+    #[cfg(target_os = "linux")]
+    pub fn new_window_node_capture(
+        context: &mut ObsContext,
+        scene: &mut ObsSceneRef,
+        name: &str,
+        app_id: &str,
+        node_id: u32,
+    ) -> Result<Self> {
+        info!(
+            "Creating Linux PipeWire node capture source: {} (app: {}, node: {})",
+            name, app_id, node_id
+        );
+        let source = context
+            .source_builder::<PipeWireScreenCaptureSourceBuilder, _>(name)?
+            .set_connect_node(node_id as i64)
+            .set_show_cursor(true)
+            .add_to_scene(scene)
+            .context("Failed to add PipeWire node capture source to scene")?;
+        Ok(Self {
+            source,
+            name: name.to_string(),
+            is_active: true,
+            app_id: Some(app_id.to_string()),
+        })
+    }
+
+    /// Unsupported-platform implementation.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     pub fn new_application_capture(
         _context: &mut ObsContext,
         _scene: &mut ObsSceneRef,
-        name: &str,
+        _name: &str,
         _bundle_id: &str,
         _display_uuid: &str,
         _capture_audio: bool,
+        _restore_token: Option<&str>,
     ) -> Result<Self> {
-        anyhow::bail!("Application capture not yet implemented for this platform");
+        anyhow::bail!("Application capture not supported on this platform");
     }
 
     /// Get the source name
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The target app/window identifier this source captures. Linux Wayland display capture
+    /// uses [`DISPLAY_CAPTURE_KEY`] so its portal restore token can be persisted.
+    pub fn app_id(&self) -> Option<&str> {
+        self.app_id.as_deref()
+    }
+
+    /// Read the xdg-desktop-portal restore token from a Wayland PipeWire source.
+    /// Returns None for other source types/platforms or before the user has selected a
+    /// display (the token only becomes available once the portal session is established).
+    #[cfg(target_os = "linux")]
+    pub fn restore_token(&self) -> Option<String> {
+        use libobs_simple::sources::linux::PipeWireSourceExtTrait;
+        match self.source.get_restore_token() {
+            Ok(token) => token,
+            Err(e) => {
+                debug!("get_restore_token('{}') unavailable: {}", self.name, e);
+                None
+            }
+        }
+    }
+
+    /// Restore token (non-Linux stub: portal restore tokens are Wayland-only).
+    #[cfg(not(target_os = "linux"))]
+    pub fn restore_token(&self) -> Option<String> {
+        None
     }
 
     /// Check if the source is active (producing frames)
@@ -200,8 +529,87 @@ impl ScreenCaptureSource {
         Ok(())
     }
 
-    /// Update the target application (non-macOS stub)
-    #[cfg(not(target_os = "macos"))]
+    /// Re-resolve the target application's window and update this `window_capture`
+    /// source in-place (Windows). Used by the readiness watchdog to recover when
+    /// the captured window has changed (e.g. closed and reopened).
+    #[cfg(target_os = "windows")]
+    pub fn update_application(&mut self, bundle_id: &str) -> Result<()> {
+        use libobs_simple::sources::windows::WindowCaptureSourceUpdater;
+        use libobs_wrapper::data::ObsObjectUpdater;
+
+        let obs_id = find_window_obs_id_for_app(bundle_id)?;
+        WindowCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
+            .context("Failed to create window capture updater")?
+            .set_window_raw(obs_id.as_str())
+            .update()
+            .context("Failed to update window capture target")?;
+
+        info!(
+            "Updated window capture source '{}' to application '{}'",
+            self.name, bundle_id
+        );
+        Ok(())
+    }
+
+    /// Re-resolve and re-point this source at the app's focused window, in-place.
+    ///
+    /// On X11 the window id is ephemeral (app restart / new window), so on every focus switch
+    /// and capture-watchdog refresh we re-resolve `bundle_id` deterministically to the *focused
+    /// window* (only if it still belongs to this app — no fallback) and update `capture_window`
+    /// via `obs_source_update()` (no source recreation). Binds empty when this app isn't the
+    /// focused one, leaving the source blank/not-ready so input capture stays gated off (the
+    /// engine never switches the active capture to a non-frontmost app, so in practice this
+    /// updates the just-focused app to its focused window). No-op on Wayland: GNOME uses
+    /// `update_connect_node`, and non-GNOME Wayland per-app capture is unsupported.
+    #[cfg(target_os = "linux")]
+    pub fn update_application(&mut self, bundle_id: &str) -> Result<()> {
+        if is_wayland_session() {
+            return Ok(());
+        }
+        let capture_window =
+            crate::capture::x11_windows::resolve_capture_window(bundle_id).unwrap_or_default();
+        let runtime = self.source.runtime();
+        XCompositeInputSourceUpdater::create_update(runtime, &mut self.source)
+            .context("Failed to create XComposite source updater")?
+            .set_capture_window(capture_window.clone())
+            .update()
+            .context("Failed to update XComposite capture window")?;
+        self.app_id = Some(bundle_id.to_string());
+        debug!(
+            "Re-resolved XComposite capture for '{}' (window: {})",
+            bundle_id,
+            if capture_window.is_empty() {
+                "<none>"
+            } else {
+                &capture_window
+            }
+        );
+        Ok(())
+    }
+
+    /// Re-point a GNOME Wayland direct-node capture (created by `new_window_node_capture`) to a
+    /// different PipeWire node, in place. Sets the `ConnectNode` setting and calls
+    /// `obs_source_update`; the bundled obs-pipewire patch sees the changed node in its update
+    /// handler and reconnects the stream to it — no source recreation, the scene item (and its
+    /// transform/z-order) is preserved. Used by GNOME follow-focus to track the focused window.
+    #[cfg(target_os = "linux")]
+    pub fn update_connect_node(&mut self, node_id: u32) -> Result<()> {
+        let mut data = ObsData::new(self.source.runtime())
+            .context("Failed to allocate ObsData for ConnectNode")?;
+        data.set_int("ConnectNode", node_id as i64)
+            .context("Failed to set ConnectNode")?;
+        self.source
+            .update_raw(data)
+            .context("Failed to obs_source_update ConnectNode")?;
+        debug!(
+            "Re-pointed node capture '{}' to node {}",
+            self.name, node_id
+        );
+        Ok(())
+    }
+
+    /// Update the target application (fallback for unsupported platforms: no-op stub).
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     pub fn update_application(&mut self, _bundle_id: &str) -> Result<()> {
         Ok(())
     }
@@ -377,10 +785,55 @@ pub fn get_main_display_uuid() -> Result<String> {
     }
 }
 
-/// Get the UUID string for the main display (non-macOS fallback)
-#[cfg(not(target_os = "macos"))]
+/// Get the UUID string for the main display.
+///
+/// On Linux the capture sources do not need a display UUID (unlike macOS ScreenCaptureKit
+/// application capture), so this returns an empty string to keep the cross-platform call
+/// sites (e.g. `setup_display_or_multi_capture`) working without special-casing.
+#[cfg(target_os = "linux")]
+pub fn get_main_display_uuid() -> Result<String> {
+    Ok(String::new())
+}
+
+/// Get the UUID string for the main display (Windows).
+///
+/// Windows `window_capture` targets a window, not a display, so it has no use
+/// for a display UUID. Return an empty placeholder so the shared app-scene
+/// setup (which passes a display UUID to `new_application_capture`) works
+/// uniformly; the value is ignored on Windows.
+#[cfg(target_os = "windows")]
+pub fn get_main_display_uuid() -> Result<String> {
+    Ok(String::new())
+}
+
+/// Get the UUID string for the main display (unsupported-platform fallback)
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn get_main_display_uuid() -> Result<String> {
     anyhow::bail!("Display UUID not available on this platform")
+}
+
+/// Find the OBS window id of a capturable top-level window belonging to the
+/// given application (matched by executable file stem, case-insensitive).
+#[cfg(target_os = "windows")]
+fn find_window_obs_id_for_app(bundle_id: &str) -> Result<String> {
+    use libobs_simple::sources::windows::{WindowCaptureSourceBuilder, WindowSearchMode};
+
+    let windows = WindowCaptureSourceBuilder::get_windows(WindowSearchMode::ExcludeMinimized)
+        .map_err(|e| anyhow::anyhow!("Failed to enumerate windows: {}", e))?;
+
+    windows
+        .iter()
+        .find(|w| {
+            std::path::Path::new(&w.0.full_exe)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|stem| stem.eq_ignore_ascii_case(bundle_id))
+                .unwrap_or(false)
+        })
+        .map(|w| w.0.obs_id.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!("No capturable window found for application '{}'", bundle_id)
+        })
 }
 
 /// Get the actual resolution of the main display
@@ -427,8 +880,56 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     }
 }
 
-/// Get the actual resolution of the main display (non-macOS fallback)
-#[cfg(not(target_os = "macos"))]
+/// Get the actual pixel resolution of the primary display on Windows.
+///
+/// Uses `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`, which reports the
+/// current mode's true pixel dimensions independent of the process's
+/// DPI-awareness (unlike `GetSystemMetrics`).
+#[cfg(target_os = "windows")]
+pub fn get_main_display_resolution() -> Result<(u32, u32)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
+
+    unsafe {
+        let mut devmode = DEVMODEW::default();
+        devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+
+        let ok = EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut devmode);
+        if !ok.as_bool() {
+            anyhow::bail!("EnumDisplaySettingsW failed to read the primary display mode");
+        }
+
+        let width = devmode.dmPelsWidth;
+        let height = devmode.dmPelsHeight;
+        if width == 0 || height == 0 {
+            anyhow::bail!("Invalid display dimensions: {}x{}", width, height);
+        }
+
+        Ok((width, height))
+    }
+}
+
+/// Get the actual resolution of the main display (Linux).
+///
+/// Detects per session type — pure X11 reads the root-window geometry, Wayland reads the
+/// largest `wl_output` current mode — with no cross-backend fallback: the chosen backend
+/// either reports a size or this returns `Err`, and callers fail closed (never a guessed
+/// default), so the capture canvas and recording metadata always reflect the real display.
+#[cfg(target_os = "linux")]
+pub fn get_main_display_resolution() -> Result<(u32, u32)> {
+    if crate::capture::x11_windows::is_pure_x11_session() {
+        crate::capture::x11_windows::x11_screen_size()
+            .context("X11 root window reported no usable screen geometry")
+    } else if is_wayland_session() {
+        crate::capture::wayland_output::wayland_output_size()
+            .context("no Wayland output reported a current mode")
+    } else {
+        anyhow::bail!("no X11 or Wayland session detected for display resolution detection")
+    }
+}
+
+/// Get the actual resolution of the main display (unsupported-platform fallback)
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     anyhow::bail!("Display resolution detection not available on this platform")
 }

@@ -137,8 +137,12 @@ impl AuthManager {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", &auth_url])
+            // NOTE: do NOT use `cmd /C start <url>` — cmd treats `&` as a command
+            // separator and truncates the OAuth URL at the first query param, so
+            // Google sees a request missing `response_type` etc. rundll32 takes
+            // the full URL as a single argument with no shell parsing.
+            let _ = std::process::Command::new("rundll32")
+                .args(["url.dll,FileProtocolHandler", &auth_url])
                 .spawn();
         }
 
@@ -160,22 +164,20 @@ impl AuthManager {
         // Parse ID token to extract claims
         let claims = decode_id_token_claims(&token_response.id_token)?;
 
-        let expiry = chrono::Utc::now()
-            + chrono::Duration::seconds(token_response.expires_in as i64);
+        let expiry =
+            chrono::Utc::now() + chrono::Duration::seconds(token_response.expires_in as i64);
 
         let auth_state = AuthState {
             google_sub: claims.sub,
             email: claims.email.clone(),
             name: claims.name,
             id_token: token_response.id_token,
-            refresh_token: token_response
-                .refresh_token
-                .unwrap_or_else(|| {
-                    self.state
-                        .as_ref()
-                        .map(|s| s.refresh_token.clone())
-                        .unwrap_or_default()
-                }),
+            refresh_token: token_response.refresh_token.unwrap_or_else(|| {
+                self.state
+                    .as_ref()
+                    .map(|s| s.refresh_token.clone())
+                    .unwrap_or_default()
+            }),
             token_expiry: expiry.to_rfc3339(),
         };
 
@@ -189,10 +191,7 @@ impl AuthManager {
 
     /// Refresh the ID token using the stored refresh token.
     async fn refresh_token(&mut self) -> Result<()> {
-        let state = self
-            .state
-            .as_ref()
-            .context("Not authenticated")?;
+        let state = self.state.as_ref().context("Not authenticated")?;
 
         let client = reqwest::Client::new();
         let resp = client
@@ -210,14 +209,19 @@ impl AuthManager {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Token refresh failed: HTTP {} — {}", status, &body[..body.len().min(200)]);
+            anyhow::bail!(
+                "Token refresh failed: HTTP {} — {}",
+                status,
+                &body[..body.len().min(200)]
+            );
         }
 
-        let token_resp: TokenResponse = resp.json().await
+        let token_resp: TokenResponse = resp
+            .json()
+            .await
             .context("Failed to parse refresh response")?;
 
-        let expiry = chrono::Utc::now()
-            + chrono::Duration::seconds(token_resp.expires_in as i64);
+        let expiry = chrono::Utc::now() + chrono::Duration::seconds(token_resp.expires_in as i64);
 
         let mut new_state = state.clone();
         new_state.id_token = token_resp.id_token;
@@ -280,13 +284,10 @@ impl AuthManager {
 
         // Parse the GET request to extract the code parameter
         let first_line = request.lines().next().unwrap_or("");
-        let path = first_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("");
+        let path = first_line.split_whitespace().nth(1).unwrap_or("");
 
-        let code = extract_query_param(path, "code")
-            .context("No 'code' parameter in OAuth callback")?;
+        let code =
+            extract_query_param(path, "code").context("No 'code' parameter in OAuth callback")?;
 
         // Send a success response to the browser
         let html = r#"<html><body style="font-family:system-ui;text-align:center;padding-top:80px;">
@@ -330,7 +331,11 @@ impl AuthManager {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Token exchange failed: HTTP {} — {}", status, &body[..body.len().min(500)]);
+            anyhow::bail!(
+                "Token exchange failed: HTTP {} — {}",
+                status,
+                &body[..body.len().min(500)]
+            );
         }
 
         resp.json::<TokenResponse>()
@@ -440,10 +445,7 @@ mod tests {
             extract_query_param("/?code=abc123&state=xyz", "state"),
             Some("xyz".to_string())
         );
-        assert_eq!(
-            extract_query_param("/?code=abc123", "missing"),
-            None
-        );
+        assert_eq!(extract_query_param("/?code=abc123", "missing"), None);
         assert_eq!(extract_query_param("/noquery", "code"), None);
     }
 

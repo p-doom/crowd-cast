@@ -10,7 +10,7 @@ use crate::capture::list_capturable_apps;
 use crate::config::Config;
 use crate::installer::autostart::{disable_autostart, enable_autostart, AutostartConfig};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::wizard_ffi::{self, AppInfoWrapper};
 
 /// Result of running the GUI wizard
@@ -44,20 +44,25 @@ impl Default for WizardResult {
 pub fn run_wizard_gui(config: &mut Config) -> Result<WizardResult> {
     info!("Starting native setup wizard");
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        run_wizard_macos(config)
+        run_wizard_native(config)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        // For non-macOS, we could fall back to CLI wizard or return error
-        anyhow::bail!("Native GUI wizard is only available on macOS. Use --setup for CLI wizard.");
+        super::wizard_windows::run_wizard_windows(config)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = config;
+        anyhow::bail!("Native GUI wizard is not available on this platform. Edit config.toml manually.");
     }
 }
 
-#[cfg(target_os = "macos")]
-fn run_wizard_macos(config: &mut Config) -> Result<WizardResult> {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_wizard_native(config: &mut Config) -> Result<WizardResult> {
     // Get list of available apps
     info!("Loading available applications...");
     let apps = list_capturable_apps();
@@ -71,9 +76,22 @@ fn run_wizard_macos(config: &mut Config) -> Result<WizardResult> {
     // Set apps in the native wizard
     wizard_ffi::set_available_apps(&app_wrappers);
 
-    // Run the native wizard (blocks until closed)
+    // Linux: detect host requirements (GPU, screen-capture backend, input group,
+    // VAAPI) and hand them to the wizard to display + gate Finish on.
+    #[cfg(target_os = "linux")]
+    {
+        let reqs = crate::installer::requirements::collect(config.capture.start_on_login);
+        wizard_ffi::set_requirements(&reqs);
+        wizard_ffi::set_per_app_available(
+            crate::installer::requirements::per_app_capture_available(),
+        );
+    }
+
+    // Run the native wizard (blocks until closed). Seed the autostart checkbox with the
+    // saved preference so a re-opened wizard reflects the user's actual state rather than
+    // silently defaulting it off.
     info!("Launching native wizard window...");
-    let native_result = wizard_ffi::run_native_wizard();
+    let native_result = wizard_ffi::run_native_wizard(config.capture.start_on_login);
 
     // Convert result
     let result = WizardResult {

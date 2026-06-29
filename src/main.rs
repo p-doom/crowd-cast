@@ -3,6 +3,12 @@
 //! Captures paired screencast and input data for dataset collection.
 //! Uses embedded libobs for single-binary distribution.
 
+// Release builds run as a background tray agent, so use the Windows GUI
+// subsystem to avoid popping a console window (which would show libobs/log
+// output) when launched from the installer/Start Menu. Debug builds keep the
+// console for development. No-op on non-Windows targets.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod auth;
 mod capture;
 mod config;
@@ -36,8 +42,9 @@ pub extern "C" fn is_intentional_exit() -> bool {
 
 /// Channel for the SIGINT handler to send shutdown commands.
 #[cfg(unix)]
-static CMD_SENDER_FOR_SIGNAL: std::sync::Mutex<Option<(mpsc::Sender<EngineCommand>, Arc<tokio::runtime::Runtime>)>> =
-    std::sync::Mutex::new(None);
+static CMD_SENDER_FOR_SIGNAL: std::sync::Mutex<
+    Option<(mpsc::Sender<EngineCommand>, Arc<tokio::runtime::Runtime>)>,
+> = std::sync::Mutex::new(None);
 
 /// SIGINT handler: mark exit as intentional and trigger shutdown.
 #[cfg(unix)]
@@ -51,9 +58,47 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
             });
         }
     }
-    #[cfg(not(no_tray))]
+    // Break the tray loop so main() can run its clean shutdown. macOS exits the Cocoa
+    // run loop via the tray C library; Linux flips an atomic the ksni poll loop reads.
+    #[cfg(all(not(no_tray), target_os = "macos"))]
     unsafe {
         ui::tray_ffi::tray_exit();
+    }
+    #[cfg(all(not(no_tray), target_os = "linux"))]
+    ui::request_tray_exit();
+}
+
+/// Channel for the Windows console control handler to send shutdown commands.
+#[cfg(windows)]
+static WIN_CMD_SENDER: std::sync::Mutex<Option<mpsc::Sender<EngineCommand>>> =
+    std::sync::Mutex::new(None);
+
+/// Windows console control handler (Ctrl+C / Ctrl+Break / console close).
+///
+/// Windows has no SIGINT, so without this Ctrl+C hard-kills the process and the
+/// current segment's buffered input events are never flushed to disk. This marks
+/// the exit intentional and asks the engine to shut down gracefully (which runs
+/// stop_recording → writes the segment's .msgpack). Returning TRUE keeps the
+/// process alive long enough for main() to join the engine thread and flush.
+#[cfg(windows)]
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> windows::Win32::Foundation::BOOL {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+        | CTRL_SHUTDOWN_EVENT => {
+            INTENTIONAL_EXIT.store(true, Ordering::SeqCst);
+            if let Ok(guard) = WIN_CMD_SENDER.lock() {
+                if let Some(tx) = guard.as_ref() {
+                    let _ = tx.try_send(EngineCommand::Shutdown);
+                }
+            }
+            BOOL(1)
+        }
+        _ => BOOL(0),
     }
 }
 
@@ -63,6 +108,21 @@ use sync::{create_engine_channels, EngineCommand, SyncEngine};
 
 /// Main entry point, runs tray on main thread (required for macOS)
 fn main() -> Result<()> {
+    // On Windows, declare Per-Monitor-V2 DPI awareness before any graphics or
+    // window initialization. libobs (and its window/monitor capture sources) read
+    // window rectangles in physical pixels; if the host process is DPI-unaware the
+    // system virtualizes those coordinates on scaled displays (e.g. 150%), so the
+    // captured window texture and the rect libobs uses disagree and the capture is
+    // mis-scaled/cropped. OBS itself runs Per-Monitor-V2 for this reason.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        // Best-effort: fails harmlessly if awareness was already set (e.g. via manifest).
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     // Initialize logging
     let _log_guard = logging::init_logging()?;
 
@@ -82,12 +142,155 @@ fn main() -> Result<()> {
 
     info!("crowd-cast Agent starting...");
 
+    // On Windows, register our notification identity (AUMID + Start Menu
+    // shortcut) so toasts are branded as crowd-cast rather than PowerShell.
+    #[cfg(target_os = "windows")]
+    ui::register_notification_identity();
+
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
         return Ok(());
+    }
+
+    // Headless host-requirements diagnostic (Linux): print the same checks the
+    // setup wizard gates on, then exit. Useful for support and CI.
+    #[cfg(target_os = "linux")]
+    {
+        if args.iter().any(|a| a == "--check-requirements") {
+            let autostart_desired = Config::load()
+                .map(|c| c.capture.start_on_login)
+                .unwrap_or(false);
+            for r in installer::requirements::collect(autostart_desired) {
+                let mark = if r.satisfied {
+                    "OK"
+                } else {
+                    match r.severity {
+                        installer::requirements::Severity::Required => "MISSING",
+                        installer::requirements::Severity::Blocking => "MISSING",
+                        installer::requirements::Severity::Recommended => "WARN",
+                        installer::requirements::Severity::Optional => "OPTIONAL",
+                    }
+                };
+                println!("[{:>8}] {}", mark, r.label);
+                if !r.satisfied && !r.detail.is_empty() {
+                    println!("           {}", r.detail);
+                }
+                if !r.satisfied && !r.command.is_empty() {
+                    println!("           $ {}", r.command);
+                }
+            }
+            return Ok(());
+        }
+
+        // Print the follow-focus provider's view of the focused app as you switch windows,
+        // for ~15s, then exit. Diagnostic for the Linux follow-focus provider.
+        if args.iter().any(|a| a == "--print-focus") {
+            crate::capture::focus::ensure_started();
+            println!("follow-focus diagnostic: switch focus between windows (~15s)...");
+            let mut last = String::new();
+            for _ in 0..150 {
+                let live = crate::capture::focus::is_live();
+                let focused = crate::capture::get_frontmost_app()
+                    .map(|a| format!("{} (pid {})", a.bundle_id, a.pid))
+                    .unwrap_or_else(|| "<none>".into());
+                let cur = format!("live={live} focused={focused}");
+                if cur != last {
+                    println!("{cur}");
+                    last = cur;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            return Ok(());
+        }
+
+        // X11 per-window capture diagnostic: report whether this session can do XComposite
+        // per-app capture, and for each app identity passed after the flag, the window id the
+        // source would bind. Follow-focus binds only the *focused* window, so an app resolves
+        // only while it is focused — focus the app, then run e.g.
+        //   crowd-cast-agent --print-windows firefox
+        if let Some(pos) = args.iter().position(|a| a == "--print-windows") {
+            let capable = crate::capture::x11_windows::x11_per_app_capable();
+            println!("x11 per-app (XComposite) capable: {capable}");
+            match crate::capture::get_main_display_resolution() {
+                Ok((w, h)) => println!("display resolution: {w}x{h}"),
+                Err(e) => println!("display resolution: <undetected: {e}>"),
+            }
+            let apps: Vec<&str> = args[pos + 1..]
+                .iter()
+                .map(String::as_str)
+                .filter(|s| !s.starts_with('-'))
+                .collect();
+            if apps.is_empty() {
+                println!("(pass app identities to resolve, e.g. --print-windows firefox code)");
+            }
+            for app in apps {
+                match crate::capture::x11_windows::resolve_capture_window(app) {
+                    Some(cw) => println!("  {app} -> {cw:?}"),
+                    None => println!("  {app} -> <no resolvable window>"),
+                }
+            }
+            return Ok(());
+        }
+
+        // List the app identities the wizard offers for capture, exactly as enumeration
+        // produces them. On Wayland these are app_id/wm_class (from installed `.desktop`
+        // entries); on X11 they are `/proc/comm`. Use this to confirm enumeration agrees with
+        // what `--print-focus` reports for the same app.
+        if args.iter().any(|a| a == "--list-apps") {
+            let apps = crate::capture::list_capturable_apps();
+            println!("capturable app identities ({}):", apps.len());
+            for app in &apps {
+                println!("  {}\t({})", app.bundle_id, app.name);
+            }
+            return Ok(());
+        }
+
+        // Internal: render the tray "Settings" app-selection panel in THIS process and write
+        // the result as JSON to the given path, then exit. The agent process can't show GTK
+        // itself: libobs's Wayland support runs a glib MainLoop on the default GMainContext
+        // from a background thread, so once GTK is initialized in that process the two race
+        // inside non-thread-safe GTK and crash (NULL GdkScreen -> SIGSEGV). The agent re-execs
+        // us with this flag to get a clean, libobs-free process for the dialog; see
+        // `ui::app_selector::show_panel`. This must stay ABOVE all libobs/tray/runtime init.
+        if let Some(pos) = args.iter().position(|a| a == "--settings-panel-out") {
+            let out = args
+                .get(pos + 1)
+                .ok_or_else(|| anyhow::anyhow!("--settings-panel-out requires a file path"))?;
+            ui::app_selector::run_settings_panel_subprocess(std::path::Path::new(out))?;
+            return Ok(());
+        }
+
+        // Internal: render the manual "Check for Updates" status dialog in a clean process.
+        // The parent agent writes simple status snapshots to the supplied file while the
+        // dialog polls it. This must stay above libobs/tray/runtime init for the same GTK
+        // default-GMainContext reason as `--settings-panel-out`.
+        if let Some(pos) = args.iter().position(|a| a == "--update-check-dialog") {
+            let status = args
+                .get(pos + 1)
+                .ok_or_else(|| anyhow::anyhow!("--update-check-dialog requires a file path"))?;
+            ui::update_dialog::run_update_check_dialog_subprocess(std::path::Path::new(status))?;
+            return Ok(());
+        }
+
+        // Install + enable the bundled GNOME focus extension, then exit. This is the
+        // command the wizard surfaces for the GNOME follow-focus prerequisite; it writes
+        // no shell state beyond the per-user extensions dir and gsettings, and takes effect
+        // after the next login (gnome-shell loads the extension at session start).
+        if args.iter().any(|a| a == "--install-focus-extension") {
+            match installer::gnome_focus::install_and_enable() {
+                Ok(msg) => {
+                    println!("{msg}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("Failed to install focus extension: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     let force_setup = args.iter().any(|a| a == "--setup" || a == "-s");
@@ -109,8 +312,48 @@ fn main() -> Result<()> {
     let mut config = Config::load()?;
     info!("Configuration loaded from {:?}", config.config_path());
 
+    // On Linux, also re-show the wizard whenever a Required host component is missing
+    // (e.g. the ScreenCast portal backend), or the saved config requires a capture mode
+    // this host can't provide (e.g. per-app capture where it isn't available) -- so the
+    // agent never runs with a config it cannot satisfy.
+    #[cfg(target_os = "linux")]
+    let requirements_unmet = installer::requirements::has_unmet_required();
+    #[cfg(target_os = "linux")]
+    let config_incompatible = !config.capture.target_apps.is_empty()
+        && !installer::requirements::per_app_capture_available();
+    #[cfg(not(target_os = "linux"))]
+    let requirements_unmet = false;
+    #[cfg(not(target_os = "linux"))]
+    let config_incompatible = false;
+
+    // start_on_login is a preference, but once set it becomes a precondition: on wlroots
+    // compositors (sway/Hyprland/...) autostart needs a manual `exec` line the agent cannot
+    // write itself. If the user opted into autostart but that line isn't present, the agent
+    // must not silently run in a state that won't actually start on login -- gate on the
+    // wizard until the line is pasted (detected on the post-wizard re-exec) or the user
+    // disables start-on-login. No fallback, fail closed. (Other sessions either honor XDG
+    // autostart or have no manual step, so `linux_manual_autostart()` is None there.)
+    #[cfg(target_os = "linux")]
+    let autostart_unsatisfied = config.capture.start_on_login
+        && installer::autostart::linux_manual_autostart().is_some()
+        && !installer::autostart::is_autostart_enabled();
+    #[cfg(not(target_os = "linux"))]
+    let autostart_unsatisfied = false;
+
     // Run setup wizard if needed
-    if force_setup || needs_setup(&config) || missing_permissions {
+    if force_setup
+        || needs_setup(&config)
+        || missing_permissions
+        || requirements_unmet
+        || config_incompatible
+        || autostart_unsatisfied
+    {
+        if autostart_unsatisfied {
+            info!(
+                "start_on_login is set but the autostart line is not in the compositor config \
+                 -- opening setup until it is pasted or start-on-login is disabled"
+            );
+        }
         info!("Running setup wizard...");
         let result = run_wizard_gui(&mut config)?;
 
@@ -171,6 +414,12 @@ fn main() -> Result<()> {
         };
     info!("OBS binaries ready");
 
+    // Prime the capture mode + target list before initialize so the canvas can choose the
+    // multi-monitor per-app envelope vs the display-capture canvas (setup_capture re-sets these).
+    capture_ctx.set_single_active_app_capture(config.capture.single_active_app_capture);
+    let target_apps = config.capture.target_apps.clone();
+    capture_ctx.set_target_apps(&target_apps);
+
     // Initialize libobs context
     if let Err(e) = capture_ctx.initialize() {
         error!("Failed to initialize libobs: {}", e);
@@ -178,11 +427,8 @@ fn main() -> Result<()> {
     }
     info!("libobs context initialized");
 
-    capture_ctx.set_single_active_app_capture(config.capture.single_active_app_capture);
-
-    // Set up capture sources (application capture for target apps, or display capture fallback)
-    let target_apps = &config.capture.target_apps;
-    if let Err(e) = capture_ctx.setup_capture(target_apps) {
+    // Set up capture sources (per-app window capture for target apps, or display capture).
+    if let Err(e) = capture_ctx.setup_capture(&target_apps, &config.capture.restore_tokens) {
         error!("Failed to setup capture: {}", e);
         std::process::exit(1);
     }
@@ -194,6 +440,41 @@ fn main() -> Result<()> {
             target_apps.len(),
             target_apps
         );
+    }
+
+    // Linux/Wayland display capture: the first launch shows the portal monitor picker (a bare
+    // slurp crosshair on wlroots/sway). Read back and persist its restore token under the
+    // reserved display key so later launches restore the same output silently — no picker.
+    // No-op once a token exists, and skipped on X11 (no portal, so the token never appears).
+    #[cfg(target_os = "linux")]
+    if target_apps.is_empty() && capture::is_wayland_session() {
+        use std::time::{Duration, Instant};
+        let key = capture::DISPLAY_CAPTURE_KEY;
+        if !config.capture.restore_tokens.contains_key(key) {
+            info!("Display capture: waiting for monitor selection to persist its restore token...");
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let tokens = capture_ctx.collect_restore_tokens();
+                if let Some(token) = tokens.get(key) {
+                    if !token.is_empty() {
+                        config
+                            .capture
+                            .restore_tokens
+                            .insert(key.to_string(), token.clone());
+                        match config.save() {
+                            Ok(()) => info!("Persisted display capture restore token"),
+                            Err(e) => warn!("Failed to save display restore token: {}", e),
+                        }
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    warn!("Timed out waiting for monitor selection; it will be requested again next launch.");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
     }
 
     // Create engine channels
@@ -217,7 +498,7 @@ fn main() -> Result<()> {
         status_tx.clone(),
         notification_rx,
         auth_manager.clone(),
-    );
+    )?;
 
     // Wrap runtime in Arc for sharing with signal handler
     let runtime = Arc::new(runtime);
@@ -248,6 +529,21 @@ fn main() -> Result<()> {
         *CMD_SENDER_FOR_SIGNAL.lock().unwrap() = Some((sigint_tx, sigint_runtime));
     }
 
+    // Windows: install a console control handler so Ctrl+C (and console close)
+    // shut the engine down gracefully and flush the current segment to disk,
+    // instead of hard-killing the process and losing buffered input events.
+    #[cfg(windows)]
+    {
+        *WIN_CMD_SENDER.lock().unwrap() = Some(cmd_tx.clone());
+        unsafe {
+            use windows::Win32::Foundation::BOOL;
+            use windows::Win32::System::Console::SetConsoleCtrlHandler;
+            if let Err(e) = SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(1)) {
+                warn!("Failed to install console Ctrl+C handler: {}", e);
+            }
+        }
+    }
+
     // Run tray on main thread
     #[cfg(not(no_tray))]
     {
@@ -256,7 +552,12 @@ fn main() -> Result<()> {
 
         info!("Starting system tray on main thread");
 
-        match ui::TrayApp::new(tray_cmd_tx, tray_status_rx, auth_manager.clone(), Some(runtime.clone())) {
+        match ui::TrayApp::new(
+            tray_cmd_tx,
+            tray_status_rx,
+            auth_manager.clone(),
+            Some(runtime.clone()),
+        ) {
             Ok(tray) => {
                 if let Err(e) = tray.run() {
                     error!("Tray error: {}", e);
@@ -279,21 +580,27 @@ fn main() -> Result<()> {
         engine_handle.join().ok();
     }
 
-    // Send shutdown command to engine (in case tray exited without Ctrl+C)
-    runtime.block_on(async {
-        let _ = cmd_tx.send(EngineCommand::Shutdown).await;
-    });
+    // Send shutdown command to engine (in case tray exited without Ctrl+C), then wait for
+    // the engine thread. On no_tray builds (Windows) the engine was already joined above
+    // (after the Ctrl+C handler sent Shutdown), so this is skipped to avoid a double join.
+    #[cfg(not(no_tray))]
+    {
+        runtime.block_on(async {
+            let _ = cmd_tx.send(EngineCommand::Shutdown).await;
+        });
 
-    // Wait for engine thread to finish
-    let _ = engine_handle.join();
+        // Wait for engine thread to finish. The no_tray path above already joined
+        // engine_handle while waiting for Ctrl+C, so this (tray-owned) path is the
+        // only other join — no double join.
+        let _ = engine_handle.join();
+    }
 
     // Determine exit code: intentional exits (Quit menu, Sparkle update, Ctrl+C)
     // exit with 0 so KeepAlive/Crashed does NOT restart. All other exits
     // (SIGTERM from macOS sleep/hibernate, NSApp termination) exit with 1
     // so KeepAlive/Crashed DOES restart on next login.
     #[cfg(not(no_tray))]
-    let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst)
-        || ui::was_quit_requested();
+    let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst) || ui::was_quit_requested();
     #[cfg(no_tray)]
     let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst);
 
@@ -337,6 +644,20 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    -h, --help    Print this help message");
     println!("    -s, --setup   Run the setup wizard");
+    #[cfg(target_os = "linux")]
+    {
+        println!("        --check-requirements");
+        println!("                  Print host requirement checks and exit (Linux)");
+        println!("        --install-focus-extension");
+        println!("                  Install + enable the GNOME follow-focus extension (Linux)");
+        println!("        --print-focus");
+        println!("                  Diagnostic: print the focused app for ~15s (Linux)");
+        println!("        --print-windows [APP...]");
+        println!("                  Diagnostic: report X11 per-app capability and resolve each");
+        println!("                  APP identity to its XComposite capture window (Linux/X11)");
+        println!("        --list-apps");
+        println!("                  Diagnostic: print the app identities offered for capture");
+    }
     println!();
     println!("ENVIRONMENT:");
     println!("    RUST_LOG      Set log level (e.g., debug, info, warn)");

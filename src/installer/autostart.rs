@@ -161,7 +161,7 @@ fn disable_autostart_windows() -> Result<()> {
         Ok(())
     } else {
         // Not an error if the key doesn't exist
-        debug!("Registry key may not have existed");
+        tracing::debug!("Registry key may not have existed");
         Ok(())
     }
 }
@@ -361,14 +361,183 @@ fn get_autostart_path() -> Result<PathBuf> {
         .join("crowd-cast.desktop"))
 }
 
+/// A wlroots-based compositor (sway/Hyprland/river/wayfire/labwc/...). Unlike full desktop
+/// environments (GNOME/KDE/XFCE), these do NOT run XDG autostart entries, so a
+/// `~/.config/autostart/*.desktop` file is inert there and must not be reported as "enabled".
+#[cfg(target_os = "linux")]
+fn is_wlroots_session() -> bool {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    // XDG_CURRENT_DESKTOP is authoritative when set. Full desktop environments (GNOME/KDE/
+    // XFCE) honor XDG autostart and are NEVER wlroots — even though SWAYSOCK/HYPRLAND_* can
+    // leak into their session env: sway exports SWAYSOCK to the systemd/dbus user environment,
+    // which persists into a later GNOME login and would otherwise misclassify GNOME as sway.
+    // Only fall back to the compositor sockets when XDG_CURRENT_DESKTOP is unset.
+    let d = env("XDG_CURRENT_DESKTOP").to_lowercase();
+    if !d.is_empty() {
+        return ["sway", "wlroots", "hyprland", "river", "wayfire", "labwc"]
+            .iter()
+            .any(|c| d.contains(c));
+    }
+    !env("SWAYSOCK").is_empty() || !env("HYPRLAND_INSTANCE_SIGNATURE").is_empty()
+}
+
+#[cfg(target_os = "linux")]
+fn config_home() -> PathBuf {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let cfg = env("XDG_CONFIG_HOME");
+    if cfg.is_empty() {
+        PathBuf::from(env("HOME")).join(".config")
+    } else {
+        PathBuf::from(cfg)
+    }
+}
+
+/// Manual autostart instructions for a compositor that does not run XDG autostart entries.
+/// Carries the exact line the user must paste and where it goes.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct ManualAutostart {
+    /// Human-readable compositor name (e.g. "sway", "Hyprland").
+    pub compositor: String,
+    /// The config file the user should add the line to.
+    pub config_path: PathBuf,
+    /// The exact line to paste, in that compositor's syntax.
+    pub exec_line: String,
+    /// A ready-to-run shell command that appends `exec_line` to `config_path`, so the user
+    /// can fix it with one copy-paste. Only surfaced while the line is absent, so no
+    /// in-command idempotency guard is needed.
+    pub command: String,
+}
+
+/// The manual autostart line for the current session, or `None` on desktops that honor XDG
+/// autostart (GNOME/KDE/XFCE) and on X11 DEs — there autostart is fully automatic.
+#[cfg(target_os = "linux")]
+pub fn linux_manual_autostart() -> Option<ManualAutostart> {
+    linux_manual_autostart_for(&AutostartConfig::default())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_manual_autostart_for(config: &AutostartConfig) -> Option<ManualAutostart> {
+    if !is_wlroots_session() {
+        return None;
+    }
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let exe = config.app_path.to_string_lossy().to_string();
+    let args = if config.args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", config.args.join(" "))
+    };
+    let cfg = config_home();
+    let desktop = env("XDG_CURRENT_DESKTOP").to_lowercase();
+
+    // Per-compositor config path + exec-directive syntax. Giving sway's `exec` line on
+    // Hyprland (which uses `exec-once`) would be wrong, so each is handled explicitly.
+    let (compositor, config_path, exec_line) =
+        if !env("HYPRLAND_INSTANCE_SIGNATURE").is_empty() || desktop.contains("hyprland") {
+            (
+                "Hyprland".to_string(),
+                cfg.join("hypr").join("hyprland.conf"),
+                format!("exec-once = {exe}{args}"),
+            )
+        } else if desktop.contains("river") {
+            (
+                "river".to_string(),
+                cfg.join("river").join("init"),
+                format!("riverctl spawn \"{exe}{args}\""),
+            )
+        } else {
+            // sway, plus other sway-style wlroots compositors.
+            let name = if !env("SWAYSOCK").is_empty() || desktop.contains("sway") {
+                "sway".to_string()
+            } else {
+                "your wlroots compositor".to_string()
+            };
+            (
+                name,
+                cfg.join("sway").join("config"),
+                format!("exec {exe}{args}"),
+            )
+        };
+
+    // Append the line to the config. No idempotency guard needed: this is only ever surfaced
+    // while the line is absent (the requirement is hidden once `is_autostart_enabled()` sees
+    // it), so the "show only when not satisfied" check upstream already prevents a re-append.
+    let cfg_str = config_path.to_string_lossy();
+    let command = format!("echo '{exec_line}' >> {cfg_str}");
+
+    Some(ManualAutostart {
+        compositor,
+        config_path,
+        exec_line,
+        command,
+    })
+}
+
+/// True iff the compositor config (and any `config.d/` includes) contains an uncommented
+/// line that launches our binary — i.e. the user actually pasted the autostart line. This
+/// is the wlroots equivalent of "is the autostart entry present", and avoids the false
+/// positive of trusting an inert `~/.config/autostart/*.desktop`.
+#[cfg(target_os = "linux")]
+fn compositor_config_has_exec(m: &ManualAutostart) -> bool {
+    let exe = AutostartConfig::default()
+        .app_path
+        .to_string_lossy()
+        .to_string();
+    if exe.is_empty() {
+        return false;
+    }
+    let mut files = vec![m.config_path.clone()];
+    if let Some(parent) = m.config_path.parent() {
+        // sway commonly splits its config across a `config.d/` directory.
+        if let Ok(entries) = std::fs::read_dir(parent.join("config.d")) {
+            files.extend(entries.flatten().map(|e| e.path()));
+        }
+    }
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        for line in text.lines() {
+            let l = line.trim();
+            if l.starts_with('#') {
+                continue;
+            }
+            // Match on the binary path on an exec/spawn directive so prompt/formatting
+            // differences don't cause a false negative.
+            if l.contains(&exe) && (l.contains("exec") || l.contains("spawn")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn is_autostart_enabled_linux() -> bool {
+    // wlroots: "enabled" iff the exec line is actually present in the compositor config.
+    if let Some(m) = linux_manual_autostart() {
+        return compositor_config_has_exec(&m);
+    }
+    // XDG-autostart desktops (GNOME/KDE/XFCE) / X11: the desktop file existing is sufficient.
     get_autostart_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
 fn enable_autostart_linux(config: &AutostartConfig) -> Result<()> {
     use std::fs;
+
+    // wlroots compositors don't run XDG autostart entries. Writing one would be an inert
+    // artifact that falsely reports "enabled" (violates the no-fallback / fail-closed law).
+    // Autostart there requires a manual config line, surfaced by the wizard via
+    // `linux_manual_autostart()`; there is nothing to write here.
+    if let Some(m) = linux_manual_autostart_for(config) {
+        info!(
+            "Autostart on {} is manual — user must add `{}` to {:?} (no XDG autostart support)",
+            m.compositor, m.exec_line, m.config_path
+        );
+        return Ok(());
+    }
 
     let desktop_path = get_autostart_path()?;
 
@@ -491,5 +660,4 @@ mod tests {
         let enabled = is_autostart_enabled();
         println!("Autostart enabled: {}", enabled);
     }
-
 }
