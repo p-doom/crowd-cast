@@ -24,6 +24,10 @@ env:
   # build.rs panics if this is unset; a placeholder is fine for `cargo check`
   # (nothing connects to it at check time).
   CROWD_CAST_API_GATEWAY_URL: "https://example.execute-api.us-east-1.amazonaws.com/prod/presign"
+  # `cargo check` does not link, so it needs no OBS binaries. Skipping the macOS
+  # OBS download (only macOS build.rs reads this) avoids an unauthenticated GitHub
+  # API fetch that gets rate-limited on CI runners. (No-op on Windows/Linux.)
+  CROWD_CAST_SKIP_OBS_INSTALL: "1"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -67,13 +71,9 @@ jobs:
           brew install simde
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I$(brew --prefix)/include" >> "$GITHUB_ENV"
 
+      # Pure compile gate: `cargo check` typechecks each platform's cfg code without
+      # linking, so it needs no libobs binaries/bundle. The unit tests link the binary
+      # (requiring provisioned OBS per platform) and are run locally + in the release
+      # pipelines, so they are intentionally out of scope here.
       - name: cargo check
         run: cargo check --workspace --all-targets
-
-      - name: cargo test
-        # Tests link the binary, which only resolves where libobs is provisioned at
-        # build time. On macOS build.rs installs it via cargo-obs-build; Windows/Linux
-        # would need the prebuilt OBS bundle (out of scope for a compile gate), so the
-        # platform-agnostic unit tests run on macOS.
-        if: matrix.os == 'macos-latest'
-        run: cargo test --workspace
