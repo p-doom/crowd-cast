@@ -92,7 +92,9 @@ jobs:
           CROWD_CAST_API_GATEWAY_URL: ${{ secrets.CROWD_CAST_API_GATEWAY_URL }}
           CROWD_CAST_GOOGLE_CLIENT_ID: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_ID }}
           CROWD_CAST_GOOGLE_CLIENT_SECRET: ${{ secrets.CROWD_CAST_GOOGLE_CLIENT_SECRET }}
-          CROWD_CAST_APPCAST_URL: https://crowd-cast-bucket.s3.amazonaws.com/appcast-win.xml
+          # dev: bake an empty appcast URL so the test build's updater is inert (build.rs only
+          # wires WinSparkle when this is non-empty) — the test build never self-updates.
+          CROWD_CAST_APPCAST_URL: ${{ github.event.inputs.channel == 'dev' && '' || 'https://crowd-cast-bucket.s3.amazonaws.com/appcast-win.xml' }}
           CROWD_CAST_ED_PUBLIC_KEY: ${{ secrets.CROWD_CAST_ED_PUBLIC_KEY }}
           # Auto build number → comparable version = {marketing}.{run_number}
           CROWD_CAST_VERSION_BASE: ${{ steps.ver.outputs.marketing }}
