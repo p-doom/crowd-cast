@@ -291,24 +291,16 @@ impl CaptureContext {
         // if monitor enumeration fails.
         #[cfg(target_os = "linux")]
         if self.use_single_active_app_capture() {
-            match super::monitor_layout::capture_canvas_size() {
-                Ok((w, h)) => {
-                    debug!("Multi-monitor capture canvas: {}x{}", w, h);
-                    let output = calculate_output_dimensions(
-                        w,
-                        h,
-                        self.recording_config.max_output_height,
-                    );
-                    return ((w, h), output);
-                }
-                Err(e) => {
-                    warn!(
-                        "Could not enumerate monitors for the multi-monitor capture canvas: {}. \
-                         Falling back to display resolution.",
-                        e
-                    );
-                }
+            if let Some((w, h)) = super::monitor_layout::capture_canvas_size() {
+                debug!("Multi-monitor capture canvas: {}x{}", w, h);
+                let output =
+                    calculate_output_dimensions(w, h, self.recording_config.max_output_height);
+                return ((w, h), output);
             }
+            warn!(
+                "Could not enumerate monitors for the multi-monitor capture canvas. \
+                 Falling back to display resolution."
+            );
         }
 
         let (base_width, base_height) = match get_main_display_resolution() {
@@ -1558,8 +1550,9 @@ impl CaptureContext {
         }
     }
 
-    /// No-op on non-Windows platforms (macOS captures the main display only).
-    #[cfg(not(target_os = "windows"))]
+    /// No-op on platforms without per-monitor fit (macOS captures the main display only;
+    /// Windows and Linux have their own real implementations above).
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     pub fn apply_monitor_fit_to_active(&mut self) {}
 
     /// Return whether the active source has started producing non-zero-sized frames.

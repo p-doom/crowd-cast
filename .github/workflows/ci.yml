@@ -58,6 +58,15 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libgtk-3-dev
 
+      # The libobs crate vendors OBS headers that #include <simde/x86/sse2.h>. On dev/release
+      # machines simde is already present (pulled in with OBS); a clean macOS runner needs it
+      # installed and added to bindgen's clang include path.
+      - name: Install simde headers (macOS libobs bindgen)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install simde
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I$(brew --prefix)/include" >> "$GITHUB_ENV"
+
       - name: cargo check
         run: cargo check --workspace --all-targets
 

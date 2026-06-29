@@ -3,9 +3,9 @@
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use anyhow::Context as _;
 use anyhow::Result;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::ffi::{CStr, CString};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::os::raw::c_char;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use tracing::info;
