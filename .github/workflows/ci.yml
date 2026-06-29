@@ -1,0 +1,70 @@
+name: CI
+
+# Cross-platform compile gate for every pull request (and pushes to main).
+# Runs `cargo check` on macOS, Windows, and Linux so a change that breaks any
+# platform's cfg path is caught before merge — `cargo check` on one OS only
+# typechecks that OS's `#[cfg(target_os = ...)]` code.
+#
+# This is a CHECK, not a release build: it does not link the final binary
+# (so it needs no signing creds, no libobs bundle, no installer tooling) and
+# uses a placeholder API gateway URL since build.rs only requires the var to
+# be present, not reachable.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # build.rs panics if this is unset; a placeholder is fine for `cargo check`
+  # (nothing connects to it at check time).
+  CROWD_CAST_API_GATEWAY_URL: "https://example.execute-api.us-east-1.amazonaws.com/prod/presign"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: cargo check (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+          - name: Linux
+            os: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Linux builds compile the GTK3 setup wizard (src/ui/wizard_linux.c) and
+      # probe GTK via pkg-config in build.rs, so the dev headers must be present.
+      # Linking against libobs is deferred to `cargo build`, so no OBS bundle is
+      # needed for `cargo check`.
+      - name: Install Linux build deps
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-3-dev
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: cargo test
+        # Tests link the binary, which only resolves where libobs is provisioned at
+        # build time. On macOS build.rs installs it via cargo-obs-build; Windows/Linux
+        # would need the prebuilt OBS bundle (out of scope for a compile gate), so the
+        # platform-agnostic unit tests run on macOS.
+        if: matrix.os == 'macos-latest'
+        run: cargo test --workspace
