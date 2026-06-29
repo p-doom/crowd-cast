@@ -133,7 +133,7 @@ impl MacOSTray {
 
         // Initial menu strings (overwritten by the first update() call)
         let menu_strings = vec![
-            CString::new("Status: Idle")?,          // 0: status
+            CString::new("Status: Idle")?,           // 0: status
             CString::new("")?,                       // 1: account
             CString::new("-")?,                      // 2: separator
             CString::new("Start Recording")?,        // 3
@@ -377,11 +377,9 @@ impl PlatformTray for MacOSTray {
         // Sign action text + enabled state
         if let Ok(text) = CString::new(state.sign_action_text.as_bytes()) {
             self.menu_strings[MENU_SIGN_ACTION] = text;
-            self.menu_items[MENU_SIGN_ACTION].text =
-                self.menu_strings[MENU_SIGN_ACTION].as_ptr();
+            self.menu_items[MENU_SIGN_ACTION].text = self.menu_strings[MENU_SIGN_ACTION].as_ptr();
         }
-        self.menu_items[MENU_SIGN_ACTION].disabled =
-            if state.auth_action_enabled { 0 } else { 1 };
+        self.menu_items[MENU_SIGN_ACTION].disabled = if state.auth_action_enabled { 0 } else { 1 };
 
         // Check for Updates enabled state
         self.menu_items[MENU_UPDATES].disabled = if state.can_check_updates { 0 } else { 1 };

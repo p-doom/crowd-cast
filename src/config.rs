@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Main configuration structure
@@ -22,6 +23,10 @@ pub struct Config {
     /// Recording configuration
     #[serde(default)]
     pub recording: RecordingConfig,
+
+    /// Secure-input gating (withholding secrets such as passwords from capture)
+    #[serde(default)]
+    pub security: SecurityConfig,
 
     /// Path to config file (not serialized)
     #[serde(skip)]
@@ -61,7 +66,8 @@ pub struct CaptureConfig {
     pub pause_uploads_on_idle: bool,
 
     /// On macOS, keep only the frontmost tracked application's capture source active.
-    /// This avoids running multiple ScreenCaptureKit application sources at once.
+    /// This avoids running multiple ScreenCaptureKit application sources at once. Linux
+    /// per-app capture uses the single-active path whenever it is supported.
     #[serde(default = "default_single_active_app_capture")]
     pub single_active_app_capture: bool,
 
@@ -76,6 +82,11 @@ pub struct CaptureConfig {
     /// Number of automatic retries before declaring the active capture source unhealthy.
     #[serde(default = "default_capture_watchdog_max_retries")]
     pub capture_watchdog_max_retries: u32,
+
+    /// xdg-desktop-portal ScreenCast restore tokens for supported Wayland display capture,
+    /// keyed by reserved identifiers such as `__display__`.
+    #[serde(default)]
+    pub restore_tokens: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,7 +154,9 @@ fn default_idle_timeout_secs() -> u64 {
 }
 
 fn default_single_active_app_capture() -> bool {
-    cfg!(any(target_os = "macos", target_os = "windows"))
+    // On by default where follow-focus per-app capture exists. On Linux this is mandatory
+    // for supported per-app capture rather than a portal-backed multi-source option.
+    cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"))
 }
 
 fn default_capture_watchdog_timeout_ms() -> u64 {
@@ -193,6 +206,7 @@ impl Default for CaptureConfig {
             blank_video_on_untracked_app: true,
             capture_watchdog_timeout_ms: default_capture_watchdog_timeout_ms(),
             capture_watchdog_max_retries: default_capture_watchdog_max_retries(),
+            restore_tokens: HashMap::new(),
         }
     }
 }
@@ -230,6 +244,31 @@ impl Default for RecordingConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Withhold keystrokes from capture while a secure context (e.g. a focused password
+    /// field) is detected. Best-effort; the server-side scrub remains the authoritative
+    /// backstop. Default: true.
+    #[serde(default = "default_true")]
+    pub gating_enabled: bool,
+
+    /// On Linux, enable system accessibility (org.a11y.Status IsEnabled) at startup so
+    /// applications expose their UI tree to the password-field detector. This is a
+    /// system-wide, session-scoped change and should be disclosed to the user in the
+    /// setup wizard. Without it, only already-accessible apps are covered. Default: true.
+    #[serde(default = "default_true")]
+    pub enable_accessibility: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            gating_enabled: true,
+            enable_accessibility: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -237,6 +276,7 @@ impl Default for Config {
             input: InputConfig::default(),
             upload: UploadConfig::default(),
             recording: RecordingConfig::default(),
+            security: SecurityConfig::default(),
             config_path: None,
         }
     }

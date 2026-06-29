@@ -37,7 +37,9 @@ impl Default for WizardConfig {
     }
 }
 
-#[cfg(target_os = "macos")]
+// Shared C ABI implemented by the native wizard on each platform
+// (src/ui/wizard_darwin.m on macOS, src/ui/wizard_linux.c on Linux).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 extern "C" {
     /// Set the list of available apps for selection
     fn wizard_set_apps(apps: *const WizardAppInfo, count: usize);
@@ -47,7 +49,11 @@ extern "C" {
 
     /// Free memory allocated by the wizard for selected_apps
     fn wizard_free_result(config: *mut WizardConfig);
+}
 
+// macOS-only permission helpers (TCC). No Linux equivalent in the wizard ABI.
+#[cfg(target_os = "macos")]
+extern "C" {
     /// Check accessibility permission status (1 = granted, 0 = denied)
     fn wizard_check_accessibility() -> i32;
 
@@ -112,7 +118,7 @@ pub struct NativeWizardResult {
 }
 
 /// Set the available apps for the wizard to display
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn set_available_apps(apps: &[AppInfoWrapper]) {
     let ffi_apps: Vec<WizardAppInfo> = apps.iter().map(|a| a.as_ffi()).collect();
     unsafe {
@@ -121,9 +127,12 @@ pub fn set_available_apps(apps: &[AppInfoWrapper]) {
 }
 
 /// Run the native wizard and return the result
-#[cfg(target_os = "macos")]
-pub fn run_native_wizard() -> NativeWizardResult {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn run_native_wizard(autostart_default: bool) -> NativeWizardResult {
     let mut config = WizardConfig::default();
+    // Seed the "Start on login" checkbox with the saved preference so a re-opened wizard
+    // shows the user's actual state (the native side reads this as the initial value).
+    config.enable_autostart = autostart_default;
 
     let _result = unsafe { wizard_run(&mut config) };
 
@@ -207,12 +216,12 @@ pub fn open_notifications_settings() {
     unsafe { wizard_open_notifications_settings() }
 }
 
-// Non-macOS stubs
-#[cfg(not(target_os = "macos"))]
+// Stubs for platforms without a native wizard (e.g. Windows)
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn set_available_apps(_apps: &[AppInfoWrapper]) {}
 
-#[cfg(not(target_os = "macos"))]
-pub fn run_native_wizard() -> NativeWizardResult {
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn run_native_wizard(_autostart_default: bool) -> NativeWizardResult {
     NativeWizardResult {
         completed: false,
         cancelled: true,
@@ -258,3 +267,64 @@ pub fn open_screen_recording_settings() {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn open_notifications_settings() {}
+
+// ---- Linux: host requirement checklist (rendered + gated by the GTK wizard) ----
+
+/// Matches the C `WizardRequirement` in src/ui/wizard_linux.c.
+/// `severity`: 0 = Required, 1 = Recommended, 2 = Optional.
+#[repr(C)]
+pub struct WizardRequirement {
+    pub label: *const c_char,
+    pub detail: *const c_char,
+    pub command: *const c_char,
+    pub severity: u32,
+    pub satisfied: bool,
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn wizard_set_requirements(reqs: *const WizardRequirement, count: usize);
+    fn wizard_set_per_app_available(available: bool);
+}
+
+/// Pass the detected host requirements to the GTK wizard for display + gating.
+#[cfg(target_os = "linux")]
+pub fn set_requirements(reqs: &[crate::installer::requirements::Requirement]) {
+    let labels: Vec<CString> = reqs
+        .iter()
+        .map(|r| CString::new(r.label.as_str()).unwrap_or_default())
+        .collect();
+    let details: Vec<CString> = reqs
+        .iter()
+        .map(|r| CString::new(r.detail.as_str()).unwrap_or_default())
+        .collect();
+    let commands: Vec<CString> = reqs
+        .iter()
+        .map(|r| CString::new(r.command.as_str()).unwrap_or_default())
+        .collect();
+    let ffi: Vec<WizardRequirement> = reqs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| WizardRequirement {
+            label: labels[i].as_ptr(),
+            detail: details[i].as_ptr(),
+            command: commands[i].as_ptr(),
+            severity: r.severity as u32,
+            satisfied: r.satisfied,
+        })
+        .collect();
+    unsafe {
+        wizard_set_requirements(ffi.as_ptr(), ffi.len());
+    }
+    // `labels`/`details`/`commands` must outlive the call; the C side strdup's them.
+    drop(labels);
+    drop(details);
+    drop(commands);
+}
+
+/// Tell the wizard whether per-app capture is available; when false it greys out the
+/// per-app picker and forces full-screen capture.
+#[cfg(target_os = "linux")]
+pub fn set_per_app_available(available: bool) {
+    unsafe { wizard_set_per_app_available(available) }
+}

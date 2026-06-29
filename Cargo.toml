@@ -1,10 +1,22 @@
 [package]
 name = "crowd-cast-agent"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 description = "crowd-cast data collection agent - captures paired screencast and input data"
 license = "MIT"
 repository = "https://github.com/crowd-cast/crowd-cast"
+
+[features]
+# Opt-in build of offline release tooling (the appcast manifest signer). Off by default so normal
+# app builds and `cargo test` never compile the extra binary.
+release-tools = []
+
+# Offline Ed25519 signer for the Linux appcast manifest. Gated behind `release-tools` so it's built
+# only by the release workflow (`cargo build --release --features release-tools --bin cc-sign-manifest`).
+[[bin]]
+name = "cc-sign-manifest"
+path = "src/bin/cc-sign-manifest.rs"
+required-features = ["release-tools"]
 
 [dependencies]
 # Async runtime
@@ -13,13 +25,18 @@ tokio-stream = "0.1"
 futures = "0.3"
 
 # Embedded libobs
-libobs = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
-libobs-wrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
-libobs-simple = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
-libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+libobs = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
+libobs-wrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
+libobs-simple = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
+# NOTE: libobs-bootstrapper is NOT a general dependency. It downloads prebuilt OBS binaries
+# at runtime (macOS/Windows) and hard-`compile_error!`s on Linux. On Linux, libobs is
+# provided by a system install or a relocatable bundle located via CROWD_CAST_OBS_* env
+# vars, so the crate is excluded from the Linux build. See the cfg(not(linux)) target deps
+# below.
 
-# Input capture
-rdev = { git = "https://github.com/p-doom/rdev" }
+# Input capture: rdev is declared per-platform below (non-Linux only). Linux uses evdev
+# directly (src/input/evdev_backend.rs) -- rdev's X11 listen path cannot emit true mouse
+# deltas, while evdev gives raw pre-accel deltas and works on X11 + Wayland.
 
 # HTTP client for pre-signed URL uploads
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -70,9 +87,41 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Unix signal handling
 libc = "0.2"
 
+# Runtime OBS binary bootstrapper. Excluded on Linux: the crate hard-`compile_error!`s
+# there, and Linux provisions libobs via a system install or relocatable bundle instead
+# (see src/capture/context.rs).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+libobs-bootstrapper = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
+# Input capture for macOS/Windows (Linux uses evdev instead).
+rdev = { git = "https://github.com/p-doom/rdev" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux evdev fallback for Wayland
 evdev = "0.12"
+# AT-SPI client for secure-input gating: detects focused password fields so their
+# keystrokes can be withheld from capture. Pure-Rust (zbus/D-Bus), no C linkage.
+# See src/input/secure/. zbus is re-exported as `atspi::zbus`.
+atspi = { version = "0.30", default-features = false, features = ["connection", "proxies", "tokio", "zbus"] }
+# Native X11 frontmost-window query (replaces shelling out to the `xdotool` binary).
+# x11rb's default RustConnection speaks the X11 wire protocol over the socket directly,
+# so this needs no system library (no libX11/libxcb) and no external binary installed.
+# Only the XWayland/X11 focus path uses it; the Wayland-native focus signal is separate.
+# See src/capture/frontmost.rs::get_frontmost_app_x11.
+# `randr` feature: RandR 1.5 GetMonitors for per-monitor rects (multi-monitor capture canvas /
+# monitor_layout); core protocol only gives the union screen size.
+x11rb = { version = "0.13", features = ["randr"] }
+# Wayland client used to enumerate outputs/monitors for full-screen capture
+# (src/capture/wayland_output.rs).
+wayland-client = "0.31"
+# Ed25519 verification for the in-app auto-updater (src/ui/updater_linux.rs). Verifies the
+# signed update manifest with the SAME raw-Ed25519 key as macOS Sparkle's SUPublicEDKey, so the
+# existing keypair is reused. Pure-Rust, no C linkage.
+ed25519-dalek = "2"
+# System tray via the freedesktop StatusNotifierItem protocol (src/ui/tray_linux.rs). Pure-Rust
+# over D-Bus (zbus) — works on X11 + Wayland, needs NO GTK main loop and NO libappindicator/
+# libayatana C runtime .so (unlike tray-icon/tray-item). The `blocking` feature runs the SNI
+# service on its own thread so our synchronous TrayApp loop needs no tokio context.
+ksni = { version = "0.3", features = ["blocking"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS-specific (for permissions)
@@ -112,7 +161,7 @@ libloading = "0.8"
 cc = "1"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
-cargo-obs-build = { git = "https://github.com/p-doom/libobs-rs", branch = "macos-support" }
+cargo-obs-build = { git = "https://github.com/p-doom/libobs-rs", branch = "linux-support" }
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
 pkg-config = "0.3"
@@ -121,7 +170,29 @@ pkg-config = "0.3"
 # Embeds the app manifest (Common Controls v6) required by native-windows-gui
 embed-resource = "2"
 
+# `cargo build --release` is BOTH the everyday iteration build and the shippable
+# artifact (install.sh ships target/release/crowd-cast-agent).
+#
+# LTO and codegen-units=1 were intentionally REMOVED. For this app they cost ~5 min
+# per incremental build but buy ~nothing: the heavy encode/capture work lives in
+# prebuilt libobs (C), not our Rust crate, so cross-crate Rust LTO has almost no hot
+# path to optimize — and once stripped the no-LTO binary is the same ~19-20M as the
+# LTO one. So we keep parallel codegen + incremental caching for ~3s incremental
+# rebuilds, plus strip=true for a small shipped binary.
 [profile.release]
-lto = true
-codegen-units = 1
+opt-level = 2
+lto = false
+codegen-units = 256
+incremental = true
 strip = true
+
+# Plain `cargo build` / `cargo run` — the fastest possible loop (even quicker than
+# --release). Our crate is built unoptimized; dependencies are optimized once and
+# cached so the debug binary stays usable at runtime.
+[profile.dev]
+opt-level = 0
+debug = 1            # line-table-only debuginfo: smaller & faster to emit than full
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

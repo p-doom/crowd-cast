@@ -1,17 +1,24 @@
 //! macOS Sparkle updater integration.
 
 use anyhow::{anyhow, Result};
+// Not all of these are used on every platform (the macOS-only post-update path uses `debug`/`warn`).
+#[allow(unused_imports)]
 use tracing::{debug, info, warn};
 
 #[cfg(target_os = "macos")]
 use crate::ui::current_app_bundle_path;
 
-/// Thin wrapper around the native macOS updater bridge.
+/// Thin wrapper around the platform updater: the native macOS Sparkle bridge, or the Linux
+/// self-updater (`updater_linux::LinuxUpdater`). Driven identically by the shared tray loop.
 #[derive(Debug, Default)]
 pub struct UpdaterController {
     available: bool,
     started: bool,
     reason: Option<String>,
+    /// Linux self-updater, behind `Arc` so its background-check worker can share it. `None`
+    /// on macOS/Windows.
+    #[cfg(target_os = "linux")]
+    linux: Option<std::sync::Arc<super::updater_linux::LinuxUpdater>>,
 }
 
 impl UpdaterController {
@@ -68,17 +75,33 @@ impl UpdaterController {
             }
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(target_os = "linux")]
         {
-            Self::unavailable("Auto-update is only implemented on macOS and Windows.")
+            let updater = super::updater_linux::LinuxUpdater::new();
+            let available = updater.is_available();
+            let reason = updater.reason().map(|s| s.to_string());
+            return Self {
+                available,
+                started: false,
+                reason,
+                linux: Some(std::sync::Arc::new(updater)),
+            };
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            Self::unavailable("Auto-update is only implemented on macOS, Windows, and Linux.")
         }
     }
 
+    #[allow(dead_code)] // unused on Linux (the Linux arm builds Self directly)
     fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             available: false,
             started: false,
             reason: Some(reason.into()),
+            #[cfg(target_os = "linux")]
+            linux: None,
         }
     }
 
@@ -124,9 +147,23 @@ impl UpdaterController {
                 }
             }
         }
+
+        #[cfg(target_os = "linux")]
+        {
+            // No native framework to init; the LinuxUpdater was built in new(). Mark started so
+            // is_available() is true and the tray loop begins driving checks.
+            self.started = true;
+            info!("Linux auto-updater initialized");
+            // If a prior self-update re-exec'd into this version, tell the user (mirror of macOS
+            // calling check_post_update_notification right after a successful Sparkle init).
+            if let Some(u) = &self.linux {
+                u.check_post_update_notification();
+            }
+        }
     }
 
     /// Check if the app was updated since last launch and show a notification.
+    #[cfg(all(target_os = "macos", has_sparkle))]
     fn check_post_update_notification(&self) {
         let Some(bundle_path) = crate::ui::current_app_bundle_path() else {
             return;
@@ -135,7 +172,11 @@ impl UpdaterController {
 
         // Read current version and build from the bundle
         let version = std::process::Command::new("/usr/libexec/PlistBuddy")
-            .args(["-c", "Print :CFBundleShortVersionString", &plist.to_string_lossy()])
+            .args([
+                "-c",
+                "Print :CFBundleShortVersionString",
+                &plist.to_string_lossy(),
+            ])
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -202,6 +243,11 @@ impl UpdaterController {
             return true;
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            return self.linux.as_ref().map_or(false, |u| u.can_check());
+        }
+
         #[allow(unreachable_code)]
         false
     }
@@ -231,6 +277,14 @@ impl UpdaterController {
             return Ok(());
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(u) = &self.linux {
+                u.check_manually()?;
+            }
+            return Ok(());
+        }
+
         #[allow(unreachable_code)]
         Err(anyhow!("Auto-update is not available on this platform."))
     }
@@ -249,6 +303,13 @@ impl UpdaterController {
         {
             super::updater_windows::check_without_ui();
         }
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(u) = &self.linux {
+                u.check_in_background();
+            }
+        }
     }
 
     pub fn take_prepare_for_update_request(&self) -> bool {
@@ -266,6 +327,14 @@ impl UpdaterController {
             return super::updater_windows::take_shutdown_request();
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            return self
+                .linux
+                .as_ref()
+                .map_or(false, |u| u.take_prepare_for_update_request());
+        }
+
         #[allow(unreachable_code)]
         false
     }
@@ -278,6 +347,13 @@ impl UpdaterController {
         #[cfg(all(target_os = "macos", has_sparkle))]
         unsafe {
             ffi::updater_set_busy(if busy { 1 } else { 0 });
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(u) = &self.linux {
+                u.set_busy(busy);
+            }
         }
     }
 }

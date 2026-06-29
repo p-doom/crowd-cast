@@ -259,22 +259,40 @@ pub fn get_display_uuid(display_id: u32) -> Option<String> {
     }
 }
 
-// Windows: detect monitor-layout changes (e.g. plugging in or switching to an
-// ultrawide) by comparing a signature of the monitor rectangles each poll, and
-// emit SwitchedToNew so the engine runs reset_video_and_recreate_sources, which
-// recomputes the canvas for the new layout. Without this the canvas stays sized
-// to whatever monitors existed at startup, and windows on a later-connected
-// monitor get fit into the wrong-size canvas (clipped / squished).
-#[cfg(target_os = "windows")]
+// Windows & Linux: detect monitor-layout changes (plug/unplug, mode or arrangement change, e.g.
+// switching to an ultrawide) by comparing a signature of the monitor rectangles each poll, and
+// emit SwitchedToNew so the engine reruns reset_video_and_recreate_sources — which recomputes the
+// canvas for the new layout. Without this the canvas stays sized to whatever monitors existed at
+// startup, and a window on a later-connected monitor gets fit into the wrong-size canvas.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub struct DisplayMonitor {
     last_signature: Vec<(i32, i32, i32, i32)>,
 }
 
+/// Stable signature of the current monitor layout (sorted per-monitor rectangles).
+/// Windows reads it via `window_geometry`; Linux via `monitor_layout` (wl_output on Wayland /
+/// RandR on X11). Empty if enumeration fails.
 #[cfg(target_os = "windows")]
+fn monitor_signature() -> Vec<(i32, i32, i32, i32)> {
+    super::window_geometry::monitor_signature()
+}
+
+#[cfg(target_os = "linux")]
+fn monitor_signature() -> Vec<(i32, i32, i32, i32)> {
+    let mut sig: Vec<(i32, i32, i32, i32)> = crate::capture::monitor_layout::monitor_rects()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.x, r.y, r.w, r.h))
+        .collect();
+    sig.sort_unstable();
+    sig
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 impl DisplayMonitor {
     pub fn new() -> Self {
         Self {
-            last_signature: super::window_geometry::monitor_signature(),
+            last_signature: monitor_signature(),
         }
     }
 
@@ -287,26 +305,23 @@ impl DisplayMonitor {
     }
 
     pub fn check_for_changes(&mut self) -> Option<DisplayChangeEvent> {
-        let current = super::window_geometry::monitor_signature();
-        // Ignore transient empty enumerations (seen mid-switch) so we don't reset
-        // spuriously; only act on a genuine, settled layout change.
+        let current = monitor_signature();
+        // Ignore transient empty enumerations (seen mid-reconfigure) so we don't reset
+        // spuriously; act only on a settled, genuinely different layout.
         if current.is_empty() || current == self.last_signature {
             return None;
         }
         let from = self.last_signature.len();
         let to = current.len();
         self.last_signature = current;
-        info!(
-            "Monitor layout changed ({} -> {} monitor(s)); recomputing capture canvas",
-            from, to
-        );
-        // Names/ids are synthetic on Windows (no per-display UUID is used here);
-        // the handler only needs this variant to reset video + recreate sources.
+        info!("Monitor layout changed ({from} -> {to} monitor(s)); recomputing capture canvas");
+        // Names/ids are synthetic here (no per-display UUID is used); the handler only needs
+        // this variant to reset video + recreate sources at the new canvas size.
         Some(DisplayChangeEvent::SwitchedToNew {
             from_id: 0,
-            from_name: format!("{} monitor(s)", from),
+            from_name: format!("{from} monitor(s)"),
             to_id: 0,
-            to_name: format!("{} monitor(s)", to),
+            to_name: format!("{to} monitor(s)"),
             to_uuid: String::new(),
         })
     }
@@ -316,18 +331,18 @@ impl DisplayMonitor {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 impl Default for DisplayMonitor {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// Other non-macOS platforms (e.g. Linux): no display-change detection yet.
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+// Other platforms (non-macOS, non-Windows, non-Linux): no display-change detection yet.
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub struct DisplayMonitor;
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl DisplayMonitor {
     pub fn new() -> Self {
         Self
@@ -350,7 +365,7 @@ impl DisplayMonitor {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl Default for DisplayMonitor {
     fn default() -> Self {
         Self::new()
