@@ -30,6 +30,11 @@ pub enum EngineCommand {
     SwitchToDisplay { display_id: u32 },
     /// Restart the process (exec) for fresh capture sources after unlock
     RestartProcess,
+    /// System resumed from a suspend (Windows/Linux): restart the recording fresh so the keylog
+    /// and video re-zero together. Sent by the OS power-event listeners (the primary, duration-
+    /// independent resume signal); the engine's wall-clock-gap check is the fallback. macOS uses
+    /// `RestartProcess` via its restart-on-unlock path instead, so it never sends this.
+    ResumeFromSuspend,
     /// Shutdown the engine
     Shutdown,
 }

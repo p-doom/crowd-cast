@@ -15,10 +15,36 @@ static BOOL shouldExit = NO;
 static BOOL screenUnlocked = NO;
 static CFAbsoluteTime trayInitTime = 0;
 static id unlockObserver = nil;
+static id wakeObserver = nil;
 static atomic_bool restartPrepared = false;
 static atomic_bool trayRestartRequested = false;
 static CFAbsoluteTime statusItemDetachedSince = 0;
 static BOOL statusItemWasAttached = NO;
+
+// Login-session lock state, used to decide whether a wake should restart immediately. Declared
+// here because it has no public header. Returns a dict with "CGSSessionScreenIsLocked" set when
+// the screen is locked.
+extern CFDictionaryRef CGSessionCopyCurrentDictionary(void);
+
+// YES if the screen is locked. Conservatively returns YES (treat as locked) when the state can't
+// be determined, so a wake-time restart is only ever issued when we are SURE the screen is
+// already available — never while it may still be locked.
+static BOOL screen_is_locked(void) {
+    CFDictionaryRef session = CGSessionCopyCurrentDictionary();
+    if (session == NULL) {
+        return YES;
+    }
+    BOOL locked = YES;
+    CFBooleanRef value = (CFBooleanRef)CFDictionaryGetValue(session, CFSTR("CGSSessionScreenIsLocked"));
+    if (value == NULL) {
+        // Key absent means "not locked" on a normal console session.
+        locked = NO;
+    } else {
+        locked = CFBooleanGetValue(value) ? YES : NO;
+    }
+    CFRelease(session);
+    return locked;
+}
 
 @interface TrayDelegate : NSObject <NSMenuDelegate, NSApplicationDelegate>
 @end
@@ -183,6 +209,36 @@ int tray_init(struct tray *tray) {
                         screenUnlocked = YES;
                     }];
 
+        // Also restart on wake itself, not just unlock. `com.apple.screenIsUnlocked` only fires
+        // if the screen actually locked on sleep — with "require password after sleep" off, a
+        // sleep→wake produces no unlock event, so a recording would straddle the suspend and drift.
+        // NSWorkspaceDidWakeNotification fires on every resume regardless of lock state; it feeds
+        // the SAME restart flag, and the 30s launch grace + the flag dedupe against a following
+        // unlock so we never double-restart.
+        wakeObserver = [[[NSWorkspace sharedWorkspace] notificationCenter]
+            addObserverForName:NSWorkspaceDidWakeNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+                        CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - trayInitTime;
+                        if (elapsed < 30.0) {
+                            NSLog(@"Woke from sleep — ignoring (%.1fs since launch, grace period)", elapsed);
+                            return;
+                        }
+                        // If the screen locked on sleep (the common case), DON'T restart here:
+                        // the `com.apple.screenIsUnlocked` observer fires on unlock and restarts
+                        // then, when the screen is available for ScreenCaptureKit to re-init.
+                        // Restarting while locked could leave capture unable to re-acquire. Only
+                        // act on the no-lock case (e.g. "require password after sleep" off), where
+                        // no unlock event will ever come and the screen is already available.
+                        if (screen_is_locked()) {
+                            NSLog(@"Woke from sleep — screen locked, deferring to unlock observer");
+                            return;
+                        }
+                        NSLog(@"Woke from sleep (screen not locked) — scheduling restart for fresh capture sources");
+                        screenUnlocked = YES;
+                    }];
+
         // Must be called on main thread - dispatch if needed
         if ([NSThread isMainThread]) {
             statusItem = create_status_item();
@@ -304,6 +360,11 @@ static void tray_teardown_on_main(void) {
     if (unlockObserver != nil) {
         [[NSDistributedNotificationCenter defaultCenter] removeObserver:unlockObserver];
         unlockObserver = nil;
+    }
+
+    if (wakeObserver != nil) {
+        [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:wakeObserver];
+        wakeObserver = nil;
     }
 
     if (statusItem != nil) {
