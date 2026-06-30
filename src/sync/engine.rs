@@ -53,6 +53,12 @@ const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// changes are rare (app switch / window resize), so this need not run every poll.
 const SOURCE_RES_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Wall-clock gap between consecutive poll ticks above which we treat the process as having been
+/// frozen by a system suspend (Windows/Linux) — far longer than any real poll interval or hitch,
+/// so only a genuine sleep/resume trips it. On trip, an in-progress recording is restarted fresh.
+#[cfg(not(target_os = "macos"))]
+const WAKE_RESTART_GAP: Duration = Duration::from_secs(60);
+
 /// Aspect ratio (width / height), or 0.0 when the height is unknown.
 fn aspect_ratio(width: u32, height: u32) -> f64 {
     if height == 0 {
@@ -2012,6 +2018,12 @@ unintended app video."
             }
         }
 
+        // Wall-clock anchor for resume-from-suspend detection (Windows/Linux). Initialized after
+        // all startup work (OBS install/bootstrap can take minutes on first run) so the first
+        // poll tick doesn't read that as a freeze. macOS uses its restart-on-unlock path instead.
+        #[cfg(not(target_os = "macos"))]
+        let mut last_poll_wall = std::time::SystemTime::now();
+
         loop {
             tokio::select! {
                 // Handle commands
@@ -2228,6 +2240,45 @@ unintended app video."
 
                 // Poll frontmost app and check for display changes
                 _ = poll_timer.tick() => {
+                    // Windows/Linux resume-from-suspend handling. The poll loop ticks every
+                    // poll_interval (~100ms); a tick that is wildly late in WALL-CLOCK terms means
+                    // the process was frozen — i.e. the system slept. A recording that straddles a
+                    // suspend has corrupt timestamps (unlike an idle pause, a suspend issues no
+                    // obs_output_pause, so the video isn't seamless and the keylog can't be safely
+                    // re-baselined against it). So on resume we start a FRESH recording: keylog and
+                    // video re-zero together, guaranteeing alignment, and start_recording re-prepares
+                    // capture sources that may have gone stale across the sleep. macOS handles this
+                    // via its restart-on-unlock path, so this is gated off there.
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let now = std::time::SystemTime::now();
+                        let gap = now.duration_since(last_poll_wall).unwrap_or(Duration::ZERO);
+                        last_poll_wall = now;
+                        if gap >= WAKE_RESTART_GAP && self.current_session.is_some() {
+                            warn!(
+                                "Detected {}s wall-clock gap (likely system resume); starting a fresh recording to keep keylog↔video aligned",
+                                gap.as_secs()
+                            );
+                            if let Err(e) = self.stop_recording().await {
+                                error!("Resume restart: stop_recording failed: {}", e);
+                            }
+                            self.reset_segment_timer();
+                            match self.start_recording().await {
+                                Ok(()) => self.reset_segment_timer(),
+                                Err(e) => {
+                                    error!("Resume restart: start_recording failed: {}", e);
+                                    self.send_status_force(EngineStatus::Error(format!(
+                                        "Restart after resume failed: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                            // The rest of this tick would operate on the just-replaced session;
+                            // skip it and let the next tick proceed against the fresh recording.
+                            continue;
+                        }
+                    }
+
                     self.poll_frontmost_app().await;
                     // Track the active window's real on-monitor position/scale
                     // (Windows monitor-level fit; no-op elsewhere).
