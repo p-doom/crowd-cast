@@ -478,8 +478,15 @@ pub struct SyncEngine {
     last_frontmost_app: Option<String>,
     /// Current recording session
     current_session: Option<RecordingSession>,
-    /// OBS timestamp at recording start (nanoseconds)
+    /// OBS timestamp at recording start (nanoseconds). Shifted forward on resume from a
+    /// pause so input-event timestamps stay aligned with the video PTS (see `pause_start_ns`).
     recording_start_ns: Option<u64>,
+    /// OBS frame-time clock captured at the moment recording was paused (nanoseconds), or None
+    /// when not paused. OBS's frame-time clock keeps advancing while a recording is paused, but
+    /// the file accrues no frames, so on resume we add (now - pause_start_ns) to
+    /// `recording_start_ns` — keeping `current_recording_elapsed_us()` matched to the seamless
+    /// video timeline rather than drifting ahead by the pause duration.
+    pause_start_ns: Option<u64>,
     /// Output directory for chunks
     output_dir: PathBuf,
     /// Display monitor for detecting display hotplug events (macOS)
@@ -648,6 +655,7 @@ unintended app video."
             last_frontmost_app: None,
             current_session: None,
             recording_start_ns: None,
+            pause_start_ns: None,
             output_dir,
             display_monitor: DisplayMonitor::new(),
             main_session_id: None,
@@ -2410,6 +2418,7 @@ unintended app video."
         );
 
         self.recording_start_ns = Some(session.start_time_ns);
+        self.pause_start_ns = None;
         self.current_session = Some(session);
 
         self.emit_metadata_event(0);
@@ -2628,6 +2637,7 @@ unintended app video."
 
         // Store the OBS timestamp for event synchronization
         self.recording_start_ns = Some(session.start_time_ns);
+        self.pause_start_ns = None;
         self.current_session = Some(session);
         self.clear_event_buffer();
         self.clear_pending_input_transition();
@@ -2781,6 +2791,11 @@ unintended app video."
             // the intent to pause should stick even if OBS is degraded.
         }
 
+        // Capture the frame-time clock at pause. On resume we add the elapsed pause to
+        // recording_start_ns, because OBS's clock advances while paused but the recording
+        // file does not — without this, post-resume event timestamps drift ahead of the video.
+        self.pause_start_ns = self.capture_ctx.get_video_frame_time().ok();
+
         self.is_paused = true;
         self.capture_enabled = false;
 
@@ -2838,6 +2853,25 @@ unintended app video."
         }
 
         self.is_paused = false;
+
+        // Pause-drift correction: OBS's frame-time clock kept advancing while paused, but the
+        // recording file accrued no frames, so the video timeline is seamless across the pause.
+        // Shift recording_start_ns forward by the pause duration so current_recording_elapsed_us()
+        // (which times every input event) stays matched to the video PTS instead of running ahead.
+        // Must happen before the emit_context_snapshot below, which timestamps the first event.
+        if let Some(pause_start) = self.pause_start_ns.take() {
+            if let Ok(now) = self.capture_ctx.get_video_frame_time() {
+                if let Some(start) = self.recording_start_ns.as_mut() {
+                    let pause_ns = now.saturating_sub(pause_start);
+                    *start = start.saturating_add(pause_ns);
+                    debug!(
+                        "Resumed after {} ms pause; shifted recording start to keep keylog↔video aligned",
+                        pause_ns / 1_000_000
+                    );
+                }
+            }
+        }
+
         self.emit_context_snapshot(should_capture, self.current_capture_timestamp_us());
         if let Some(app) = desired_target.as_deref() {
             self.schedule_capture_watchdog(app, 0);
