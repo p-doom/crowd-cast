@@ -17,6 +17,8 @@ mod data;
 mod input;
 mod installer;
 mod logging;
+#[cfg(target_os = "linux")]
+mod resume_linux;
 mod sync;
 mod ui;
 mod upload;
@@ -100,6 +102,31 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> windows::Win32
         }
         _ => BOOL(0),
     }
+}
+
+/// Windows power-event callback: on resume from suspend, ask the engine to restart the recording
+/// fresh so keylog and video re-zero together (a recording that straddled a suspend has corrupt
+/// timestamps). Registered via `PowerRegisterSuspendResumeNotification` with `DEVICE_NOTIFY_CALLBACK`.
+/// The engine's wall-clock-gap check is the fallback if registration ever fails. Must return
+/// ERROR_SUCCESS (0).
+#[cfg(windows)]
+unsafe extern "system" fn power_resume_callback(
+    _context: *const core::ffi::c_void,
+    event_type: u32,
+    _setting: *const core::ffi::c_void,
+) -> u32 {
+    // PBT_APMRESUMESUSPEND (0x0007): resume after a user-initiated suspend.
+    // PBT_APMRESUMEAUTOMATIC (0x0012): system woke itself (always delivered on resume).
+    const PBT_APMRESUMESUSPEND: u32 = 0x0007;
+    const PBT_APMRESUMEAUTOMATIC: u32 = 0x0012;
+    if event_type == PBT_APMRESUMESUSPEND || event_type == PBT_APMRESUMEAUTOMATIC {
+        if let Ok(guard) = WIN_CMD_SENDER.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.try_send(EngineCommand::ResumeFromSuspend);
+            }
+        }
+    }
+    0 // ERROR_SUCCESS
 }
 
 use config::Config;
@@ -514,6 +541,16 @@ fn main() -> Result<()> {
         });
     });
 
+    // Linux: listen for resume-from-suspend via logind and restart the recording fresh, so a
+    // recording that straddled a sleep doesn't drift (keylog↔video re-zero). Primary signal;
+    // the engine's wall-clock-gap check is the fallback. macOS uses its restart-on-unlock path;
+    // Windows uses the power callback registered below.
+    #[cfg(target_os = "linux")]
+    {
+        let resume_tx = cmd_tx.clone();
+        runtime.spawn(resume_linux::run(resume_tx));
+    }
+
     // Handle SIGINT (Ctrl+C) only. SIGTERM is intentionally NOT caught so that
     // macOS sleep/hibernate termination produces a non-zero exit, which triggers
     // KeepAlive/Crashed restart. Ctrl+C sets INTENTIONAL_EXIT so the process
@@ -541,6 +578,42 @@ fn main() -> Result<()> {
             if let Err(e) = SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(1)) {
                 warn!("Failed to install console Ctrl+C handler: {}", e);
             }
+        }
+
+        // Register for resume-from-suspend so a recording that slept gets restarted fresh
+        // (keylog↔video re-zero); the engine's wall-clock-gap check is the fallback if this
+        // registration fails. Callback mode needs no window. The subscribe-params struct is
+        // leaked so it lives for the process lifetime (the OS reads it past this call), as is
+        // the returned handle (we never unregister — the registration lasts the whole run).
+        unsafe {
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::System::Power::{
+                PowerRegisterSuspendResumeNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_CALLBACK;
+
+            // Leaked so the struct outlives this call — the OS retains the callback pointer.
+            let params = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+                Callback: Some(power_resume_callback),
+                Context: std::ptr::null_mut(),
+            }));
+            // Out-param (`*mut *mut c_void` per the API): the OS writes the registration handle
+            // here. We never unregister (the registration lasts the whole run), so it's unused.
+            let mut registration: *mut core::ffi::c_void = std::ptr::null_mut();
+            let status = PowerRegisterSuspendResumeNotification(
+                DEVICE_NOTIFY_CALLBACK,
+                HANDLE(params as *mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS as *mut core::ffi::c_void),
+                &mut registration as *mut *mut core::ffi::c_void,
+            );
+            if status.is_ok() {
+                info!("Registered for resume-from-suspend notifications");
+            } else {
+                warn!(
+                    "Failed to register suspend/resume notification ({:?}); relying on wall-clock-gap fallback",
+                    status
+                );
+            }
+            let _ = registration;
         }
     }
 

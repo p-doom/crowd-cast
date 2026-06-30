@@ -53,6 +53,12 @@ const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// changes are rare (app switch / window resize), so this need not run every poll.
 const SOURCE_RES_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Wall-clock gap between consecutive poll ticks above which we treat the process as having been
+/// frozen by a system suspend (Windows/Linux) — far longer than any real poll interval or hitch,
+/// so only a genuine sleep/resume trips it. On trip, an in-progress recording is restarted fresh.
+#[cfg(not(target_os = "macos"))]
+const WAKE_RESTART_GAP: Duration = Duration::from_secs(60);
+
 /// Aspect ratio (width / height), or 0.0 when the height is unknown.
 fn aspect_ratio(width: u32, height: u32) -> f64 {
     if height == 0 {
@@ -514,6 +520,11 @@ pub struct SyncEngine {
     notification_rx: Option<mpsc::UnboundedReceiver<NotificationAction>>,
     /// Last time an input event was recorded (buffered for upload)
     last_recorded_action_time: Instant,
+    /// When the recording was last restarted for a resume-from-suspend. Debounces the two resume
+    /// signals (the OS power event and the wall-clock-gap fallback) that can both fire for a single
+    /// resume. Windows/Linux only — macOS restarts the whole process on unlock instead.
+    #[cfg(not(target_os = "macos"))]
+    last_resume_restart_at: Option<Instant>,
     /// Whether we're currently auto-paused due to idle (vs user-initiated pause)
     idle_paused: bool,
     /// Idle timeout duration (cached from config, Duration::ZERO means disabled)
@@ -669,6 +680,8 @@ unintended app video."
             upload_rx: Some(upload_rx),
             notification_rx: Some(notification_rx),
             last_recorded_action_time: Instant::now(),
+            #[cfg(not(target_os = "macos"))]
+            last_resume_restart_at: None,
             idle_paused: false,
             idle_timeout,
             pause_uploads_on_idle,
@@ -2020,6 +2033,12 @@ unintended app video."
             }
         }
 
+        // Wall-clock anchor for resume-from-suspend detection (Windows/Linux). Initialized after
+        // all startup work (OBS install/bootstrap can take minutes on first run) so the first
+        // poll tick doesn't read that as a freeze. macOS uses its restart-on-unlock path instead.
+        #[cfg(not(target_os = "macos"))]
+        let mut last_poll_wall = std::time::SystemTime::now();
+
         loop {
             tokio::select! {
                 // Handle commands
@@ -2201,6 +2220,19 @@ unintended app video."
                             self.stop_recording().await.ok();
                             restart_process();
                         }
+                        EngineCommand::ResumeFromSuspend => {
+                            // Primary resume signal from the OS power-event listeners (Windows/
+                            // Linux). Restart the recording fresh so keylog and video re-zero
+                            // together. macOS never sends this (it uses RestartProcess on unlock),
+                            // so the body is gated off there.
+                            #[cfg(not(target_os = "macos"))]
+                            if self.current_session.is_some() {
+                                self.restart_recording_after_resume(
+                                    "System resumed from suspend (OS power event)",
+                                )
+                                .await;
+                            }
+                        }
                         EngineCommand::Shutdown => {
                             info!("Shutdown command received");
                             self.input_backend.stop();
@@ -2236,6 +2268,37 @@ unintended app video."
 
                 // Poll frontmost app and check for display changes
                 _ = poll_timer.tick() => {
+                    // Windows/Linux resume-from-suspend handling. The poll loop ticks every
+                    // poll_interval (~100ms); a tick that is wildly late in WALL-CLOCK terms means
+                    // the process was frozen — i.e. the system slept. A recording that straddles a
+                    // suspend has corrupt timestamps (unlike an idle pause, a suspend issues no
+                    // obs_output_pause, so the video isn't seamless and the keylog can't be safely
+                    // re-baselined against it). So on resume we start a FRESH recording: keylog and
+                    // video re-zero together, guaranteeing alignment, and start_recording re-prepares
+                    // capture sources that may have gone stale across the sleep. macOS handles this
+                    // via its restart-on-unlock path, so this is gated off there.
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let now = std::time::SystemTime::now();
+                        let gap = now.duration_since(last_poll_wall).unwrap_or(Duration::ZERO);
+                        last_poll_wall = now;
+                        if gap >= WAKE_RESTART_GAP && self.current_session.is_some() {
+                            // Fallback path. The OS power-event listener (EngineCommand::
+                            // ResumeFromSuspend — see src/resume_linux.rs and the Windows power
+                            // callback in main.rs) is the primary resume signal and catches
+                            // suspends of ANY length; this wall-clock gap only trips if that event
+                            // was missed (e.g. headless / no logind / registration failed).
+                            self.restart_recording_after_resume(&format!(
+                                "Detected {}s wall-clock gap (likely a missed system-resume event)",
+                                gap.as_secs()
+                            ))
+                            .await;
+                            // The rest of this tick would operate on the just-replaced session;
+                            // skip it and let the next tick proceed against the fresh recording.
+                            continue;
+                        }
+                    }
+
                     self.poll_frontmost_app().await;
                     // Track the active window's real on-monitor position/scale
                     // (Windows monitor-level fit; no-op elsewhere).
@@ -2514,6 +2577,44 @@ unintended app video."
         all_events.sort_by_key(|e| e.timestamp_us);
 
         Ok(all_events)
+    }
+
+    /// Restart the in-progress recording as a fresh segment after a system resume (Windows/Linux).
+    ///
+    /// A recording that straddled a suspend has corrupt timestamps: unlike an idle pause, a suspend
+    /// issues no `obs_output_pause`, so the video isn't seamless and the keylog (timestamped off the
+    /// OBS frame clock) can't be safely re-baselined against it. Starting fresh re-zeroes keylog and
+    /// video together (guaranteed alignment) and re-prepares capture sources that may have gone stale
+    /// across the sleep. macOS gets the same effect from its restart-on-unlock path, so this — and
+    /// both its callers — are gated off there.
+    #[cfg(not(target_os = "macos"))]
+    async fn restart_recording_after_resume(&mut self, reason: &str) {
+        // Debounce: the OS power event and the wall-clock-gap fallback can both fire for a single
+        // resume (within ~1s, given the ~100ms poll interval). A short window collapses those two
+        // into one restart; it's deliberately short so a genuine second suspend isn't swallowed
+        // (a missed resume would drift — the bug we're fixing — whereas an extra restart is benign).
+        if let Some(at) = self.last_resume_restart_at {
+            if at.elapsed() < Duration::from_secs(10) {
+                debug!("Ignoring duplicate resume signal ({reason}); restarted {:?} ago", at.elapsed());
+                return;
+            }
+        }
+        self.last_resume_restart_at = Some(Instant::now());
+        warn!("{reason}; starting a fresh recording to keep keylog↔video aligned");
+        if let Err(e) = self.stop_recording().await {
+            error!("Resume restart: stop_recording failed: {}", e);
+        }
+        self.reset_segment_timer();
+        match self.start_recording().await {
+            Ok(()) => self.reset_segment_timer(),
+            Err(e) => {
+                error!("Resume restart: start_recording failed: {}", e);
+                self.send_status_force(EngineStatus::Error(format!(
+                    "Restart after resume failed: {}",
+                    e
+                )));
+            }
+        }
     }
 
     /// Start recording
