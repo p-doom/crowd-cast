@@ -71,6 +71,13 @@ pub struct CaptureConfig {
     #[serde(default = "default_single_active_app_capture")]
     pub single_active_app_capture: bool,
 
+    /// macOS multi-monitor / multi-Space capture: place the focused app/display at its real
+    /// spatial position on a multi-monitor–normalized canvas (parity with Windows/Linux).
+    /// Kill-switch — set false to fall back to today's main-display-only capture. No effect
+    /// off macOS.
+    #[serde(default = "default_mac_multi_monitor_capture")]
+    pub mac_multi_monitor_capture: bool,
+
     /// When a non-target app is frontmost, blank the video instead of keeping the last target app.
     #[serde(default = "default_true")]
     pub blank_video_on_untracked_app: bool,
@@ -159,6 +166,12 @@ fn default_single_active_app_capture() -> bool {
     cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"))
 }
 
+fn default_mac_multi_monitor_capture() -> bool {
+    // Default on: parity with Windows/Linux, which normalize the multi-monitor canvas
+    // unconditionally (no flag). Kept as a kill-switch. No effect off macOS.
+    true
+}
+
 fn default_capture_watchdog_timeout_ms() -> u64 {
     1500
 }
@@ -203,6 +216,7 @@ impl Default for CaptureConfig {
             idle_timeout_secs: default_idle_timeout_secs(),
             pause_uploads_on_idle: true,
             single_active_app_capture: default_single_active_app_capture(),
+            mac_multi_monitor_capture: default_mac_multi_monitor_capture(),
             blank_video_on_untracked_app: true,
             capture_watchdog_timeout_ms: default_capture_watchdog_timeout_ms(),
             capture_watchdog_max_retries: default_capture_watchdog_max_retries(),
