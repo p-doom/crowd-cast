@@ -146,8 +146,95 @@ fn restart_process() -> ! {
     }
 }
 
+/// Cap on restarts within `RESTART_HISTORY_WINDOW` before we refuse to restart
+/// again. A misbehaving macOS status-item host (ControlCenter rebuilding the
+/// status bar) could otherwise drive a launch→exec restart storm; this bounds it.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const RESTART_CAP_PER_WINDOW: usize = 6;
+
+/// Sliding window over which `RESTART_CAP_PER_WINDOW` restarts are counted.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const RESTART_HISTORY_WINDOW: Duration = Duration::from_secs(3600);
+
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn restart_history_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+        .map(|p| p.data_dir().join("restart_history"))
+}
+
+/// Whether a restart is allowed under the per-hour cap, recording `now` when it
+/// is. Reads the restart-history marker file, drops timestamps older than the
+/// window, and if the remaining count is already at the cap returns `false`.
+/// Otherwise appends `now` and returns `true`. Persists across exec()s.
+///
+/// Fails OPEN: on any file-I/O or path error the restart is allowed (a missing
+/// tray icon from an occasional extra restart is fine; being unable to restart
+/// at all is worse). Never panics.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn restart_allowed_under_cap() -> bool {
+    let Some(path) = restart_history_path() else {
+        return true; // fail open
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cutoff = now.saturating_sub(RESTART_HISTORY_WINDOW.as_secs());
+
+    // Read existing timestamps (one per line), dropping anything unparseable or
+    // older than the window. A missing file simply yields an empty history.
+    let mut recent: Vec<u64> = std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| l.trim().parse::<u64>().ok())
+                .filter(|&ts| ts >= cutoff)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if recent.len() >= RESTART_CAP_PER_WINDOW {
+        warn!(
+            "restart cap reached ({} in last hour); skipping restart to avoid a restart storm",
+            recent.len()
+        );
+        return false;
+    }
+
+    recent.push(now);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let serialized = recent
+        .iter()
+        .map(|ts| ts.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Err(e) = std::fs::write(&path, serialized) {
+        // Fail open: we couldn't persist the new timestamp, but still allow the
+        // restart (the cap just won't count this one).
+        warn!("Failed to persist restart history: {}", e);
+    }
+    true
+}
+
 #[cfg(all(target_os = "macos", not(no_tray)))]
 fn restart_macos_process() -> ! {
+    // Bound the restart rate. If a wedged status-item host keeps requesting
+    // restarts, refuse once the per-hour cap is hit and keep the current
+    // process alive/recording instead of exec()ing into a storm. A missing
+    // tray icon is acceptable; an infinite exec loop is not.
+    if !restart_allowed_under_cap() {
+        // Park this thread instead of exec()ing. The engine's other threads
+        // (recording, upload, input) keep running; only the tray icon may be
+        // stale. This diverges (never returns) so the `restart_process()`
+        // caller does not fall through to the unconditional exec() below.
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
     unsafe {
         crate::ui::tray_ffi::tray_prepare_for_restart();
     }
