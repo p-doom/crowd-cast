@@ -221,20 +221,6 @@ fn restart_allowed_under_cap() -> bool {
 
 #[cfg(all(target_os = "macos", not(no_tray)))]
 fn restart_macos_process() -> ! {
-    // Bound the restart rate. If a wedged status-item host keeps requesting
-    // restarts, refuse once the per-hour cap is hit and keep the current
-    // process alive/recording instead of exec()ing into a storm. A missing
-    // tray icon is acceptable; an infinite exec loop is not.
-    if !restart_allowed_under_cap() {
-        // Park this thread instead of exec()ing. The engine's other threads
-        // (recording, upload, input) keep running; only the tray icon may be
-        // stale. This diverges (never returns) so the `restart_process()`
-        // caller does not fall through to the unconditional exec() below.
-        loop {
-            std::thread::sleep(Duration::from_secs(3600));
-        }
-    }
-
     unsafe {
         crate::ui::tray_ffi::tray_prepare_for_restart();
     }
@@ -2302,10 +2288,24 @@ unintended app video."
                             self.switch_to_display(display_id);
                         }
                         EngineCommand::RestartProcess => {
-                            info!("Restart requested — exec()ing for fresh capture sources");
-                            self.input_backend.stop();
-                            self.stop_recording().await.ok();
-                            restart_process();
+                            // Bound the restart rate. A wedged macOS status-item host (ControlCenter)
+                            // can drive a restart storm through this command (status-item-lost / screen
+                            // unlock → RestartProcess). If we've hit the per-hour cap, SKIP the restart
+                            // and keep recording. Checked BEFORE stop_recording so a capped request
+                            // never tears down the live session — a stale tray icon is acceptable,
+                            // stopping recording is not. Non-macOS / no_tray builds are never capped.
+                            #[cfg(all(target_os = "macos", not(no_tray)))]
+                            let restart_ok = restart_allowed_under_cap();
+                            #[cfg(not(all(target_os = "macos", not(no_tray))))]
+                            let restart_ok = true;
+                            if restart_ok {
+                                info!("Restart requested — exec()ing for fresh capture sources");
+                                self.input_backend.stop();
+                                self.stop_recording().await.ok();
+                                restart_process();
+                            } else {
+                                warn!("Restart cap reached; skipping restart and continuing to record (tray icon may be stale until the cap window clears).");
+                            }
                         }
                         EngineCommand::ResumeFromSuspend => {
                             // Primary resume signal from the OS power-event listeners (Windows/
