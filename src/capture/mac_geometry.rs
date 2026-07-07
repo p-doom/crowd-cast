@@ -266,6 +266,36 @@ pub fn window_display_for_pid(pid: u32) -> Option<DisplayTarget> {
     }
 }
 
+/// Describe a display for the recording metadata: UUID + name + global POINT bounds
+/// (`CGDisplayBounds`) + backing pixel size + is_main. `None` if its UUID or pixel size is
+/// unreadable.
+pub fn describe_display(display_id: u32) -> Option<crate::data::MonitorInfo> {
+    let (px_width, px_height) = display_pixel_size(display_id)?;
+    let uuid = crate::capture::get_display_uuid(display_id)?;
+    let cg = CGDisplay::new(display_id);
+    let b = cg.bounds();
+    Some(crate::data::MonitorInfo {
+        uuid,
+        name: crate::capture::get_display_name(display_id),
+        x: b.origin.x as i32,
+        y: b.origin.y as i32,
+        width: b.size.width as i32,
+        height: b.size.height as i32,
+        px_width,
+        px_height,
+        is_main: cg.is_main(),
+    })
+}
+
+/// The full monitor layout: describe every active display. Empty if enumeration fails.
+pub fn describe_all_displays() -> Vec<crate::data::MonitorInfo> {
+    CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(describe_display)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

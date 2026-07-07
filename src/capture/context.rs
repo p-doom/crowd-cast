@@ -100,6 +100,10 @@ pub struct CaptureContext {
     output_directory: PathBuf,
     /// Recording configuration
     recording_config: RecordingConfig,
+    /// The canvas (base) dimensions in pixels that OBS is currently compositing into, captured
+    /// whenever the video info is (re)built. Recorded in the segment metadata as the true frame
+    /// size (with multi-monitor on this is the normalized envelope, not the main display).
+    canvas_dims: (u32, u32),
     /// Target apps for capture (stored for recreation after display changes)
     target_apps: Vec<String>,
     /// Restore tokens for portal-backed display capture (Linux/Wayland), keyed by
@@ -226,6 +230,7 @@ impl CaptureContext {
             state: Arc::new(RwLock::new(CaptureState::default())),
             output_directory,
             recording_config: RecordingConfig::default(),
+            canvas_dims: (0, 0),
             target_apps: Vec::new(),
             restore_tokens: HashMap::new(),
             single_active_app_capture: false,
@@ -385,6 +390,7 @@ impl CaptureContext {
         // macOS/fallback: main display downscaled to max_output_height).
         let ((base_width, base_height), (output_width, output_height)) =
             self.canvas_and_output_dimensions();
+        self.canvas_dims = (base_width, base_height);
 
         info!(
             "Video config: {}x{} (canvas) -> {}x{} (output), {} fps",
@@ -965,6 +971,7 @@ impl CaptureContext {
         // Linux multi-monitor per-app envelope, else main display downscaled.
         let ((base_width, base_height), (output_width, output_height)) =
             self.canvas_and_output_dimensions();
+        self.canvas_dims = (base_width, base_height);
 
         info!(
             "Resetting video: {}x{} (canvas) -> {}x{} (output), {} fps",
@@ -1060,6 +1067,54 @@ impl CaptureContext {
     /// Set the recording configuration
     pub fn set_recording_config(&mut self, config: RecordingConfig) {
         self.recording_config = config;
+    }
+
+    /// The current recording canvas (base) dimensions in pixels — what OBS composites into,
+    /// captured when the video info was last (re)built. With macOS multi-monitor on this is the
+    /// normalized envelope; otherwise the display resolution. `(0, 0)` before initialize.
+    pub fn canvas_dimensions(&self) -> (u32, u32) {
+        self.canvas_dims
+    }
+
+    /// Layout metadata for the segment: the display currently captured (which physical monitor
+    /// the video shows) and the full monitor arrangement. `(None, empty)` when the macOS
+    /// multi-monitor path is inactive (flag off / non-macOS / not single-active).
+    pub fn capture_layout_metadata(
+        &self,
+    ) -> (
+        Option<crate::data::MonitorInfo>,
+        Vec<crate::data::MonitorInfo>,
+    ) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
+                let all = super::mac_geometry::describe_all_displays();
+                let active = self
+                    .active_capture_app
+                    .as_ref()
+                    .and_then(|app| self.last_display_uuid.get(app))
+                    .and_then(|uuid| all.iter().find(|m| &m.uuid == uuid).cloned());
+                return (active, all);
+            }
+        }
+        (None, Vec::new())
+    }
+
+    /// UUID of the display the active app is currently captured on (macOS multi-monitor) — a
+    /// cheap lookup (no display enumeration) for detecting a follow-focus display switch so the
+    /// metadata timeline can be re-emitted even when the two displays share a resolution. `None`
+    /// when the multi-monitor path is inactive.
+    pub fn active_display_uuid(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
+                return self
+                    .active_capture_app
+                    .as_ref()
+                    .and_then(|app| self.last_display_uuid.get(app).cloned());
+            }
+        }
+        None
     }
 
     /// Generate output path for a new recording session

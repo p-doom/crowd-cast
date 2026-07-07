@@ -664,6 +664,9 @@ pub struct SyncEngine {
     /// Native resolution of the captured source at the last metadata emit, used to
     /// detect changes so a fresh metadata event is logged when it changes
     last_logged_source_dims: Option<(u32, u32)>,
+    /// UUID of the display captured at the last metadata emit (macOS multi-monitor), so a
+    /// follow-focus switch to a same-resolution display still re-emits the layout timeline.
+    last_logged_active_display: Option<String>,
     /// Last time the captured source resolution was checked for changes
     last_source_res_check: Instant,
 }
@@ -783,6 +786,7 @@ unintended app video."
             low_disk_warned: false,
             last_disk_check: Instant::now(),
             last_logged_source_dims: None,
+            last_logged_active_display: None,
             last_source_res_check: Instant::now(),
         })
     }
@@ -1622,7 +1626,20 @@ unintended app video."
                 }
             }
         }
-        let (dw, dh) = self.display_resolution;
+        // Multi-monitor layout (macOS): the display currently captured + the full arrangement.
+        // Empty/None off the feature, so this is inert on other platforms / flag off.
+        let (active_display, displays) = self.capture_ctx.capture_layout_metadata();
+
+        let (mut dw, mut dh) = self.display_resolution;
+        // When the macOS multi-monitor path is active, the recorded frame is the normalized
+        // envelope CANVAS, not the main display — report the true canvas as display_width/height.
+        if !displays.is_empty() {
+            let (cw, ch) = self.capture_ctx.canvas_dimensions();
+            if cw > 0 && ch > 0 {
+                dw = cw;
+                dh = ch;
+            }
+        }
         let (ow, oh) = crate::capture::calculate_output_dimensions(dw, dh, 1080);
         let (sw, sh) = self
             .capture_ctx
@@ -1631,6 +1648,7 @@ unintended app video."
             .flatten()
             .unwrap_or((0, 0));
         self.last_logged_source_dims = Some((sw, sh));
+        self.last_logged_active_display = active_display.as_ref().map(|m| m.uuid.clone());
         let utc_now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.event_buffer.push(InputEvent {
             timestamp_us,
@@ -1645,6 +1663,8 @@ unintended app video."
                 source_height: sh,
                 source_aspect: aspect_ratio(sw, sh),
                 timestamp_utc: utc_now,
+                active_display,
+                displays,
             }),
         });
     }
@@ -1667,7 +1687,12 @@ unintended app video."
         if w == 0 || h == 0 {
             return;
         }
-        if self.last_logged_source_dims != Some((w, h)) {
+        // Re-emit when the source resolution changed OR the follow-focus active display changed
+        // (the latter catches a switch between two same-resolution monitors, which the source-dim
+        // check alone would miss).
+        let dims_changed = self.last_logged_source_dims != Some((w, h));
+        let display_changed = self.capture_ctx.active_display_uuid() != self.last_logged_active_display;
+        if dims_changed || display_changed {
             self.emit_metadata_event(self.current_capture_timestamp_us());
         }
     }
