@@ -53,6 +53,11 @@ pub struct ScreenCaptureSource {
     /// Target app/window identifier this source captures (None for display capture).
     /// Used to key persisted portal restore tokens on Linux/Wayland.
     app_id: Option<String>,
+    /// macOS: the display UUID this SCK source is currently pinned to. `update_display_uuid`
+    /// uses it to skip a redundant `obs_source_update` (which restarts the SCStream) when the
+    /// requested UUID is unchanged. macOS-only — only ScreenCaptureKit capture is display-keyed.
+    #[cfg(target_os = "macos")]
+    display_uuid: Option<String>,
 }
 
 impl ScreenCaptureSource {
@@ -83,7 +88,7 @@ impl ScreenCaptureSource {
 
         let source = context
             .source_builder::<ScreenCaptureSourceBuilder, _>(name)?
-            .set_display_uuid(display_uuid)
+            .set_display_uuid(display_uuid.clone())
             .set_show_cursor(true)
             .set_audio_capture(capture_audio)
             .add_to_scene(scene)
@@ -96,6 +101,7 @@ impl ScreenCaptureSource {
             name: name.to_string(),
             is_active: true,
             app_id: None,
+            display_uuid: Some(display_uuid),
         })
     }
 
@@ -275,6 +281,7 @@ impl ScreenCaptureSource {
             name: name.to_string(),
             is_active: true,
             app_id: Some(bundle_id.to_string()),
+            display_uuid: Some(display_uuid.to_string()),
         })
     }
 
@@ -620,6 +627,14 @@ impl ScreenCaptureSource {
     /// Used after display reconnection to point the source at the new display.
     #[cfg(target_os = "macos")]
     pub fn update_display_uuid(&mut self, display_uuid: &str) -> Result<()> {
+        // Idempotent: obs_source_update on an SCK source restarts its SCStream (brief black
+        // frame), so skip it when the source is already pinned to this display. Without this,
+        // the follow-focus retarget would needlessly restart the stream on the first poll after
+        // every (re)build (source is created pinned to main) and on app switches.
+        if self.display_uuid.as_deref() == Some(display_uuid) {
+            return Ok(());
+        }
+
         let runtime = self.source.runtime();
 
         ScreenCaptureSourceUpdater::create_update(runtime, &mut self.source)
@@ -629,6 +644,7 @@ impl ScreenCaptureSource {
             .update()
             .context("Failed to update display UUID")?;
 
+        self.display_uuid = Some(display_uuid.to_string());
         debug!(
             "Updated display UUID for source '{}' to {}",
             self.name, display_uuid

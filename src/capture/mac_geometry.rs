@@ -6,8 +6,9 @@
 //!    active display, each normalized so its shorter edge is [`TARGET_SHORT_EDGE`] (FHD ×1.0,
 //!    4K ×0.5, 1920×1200 ×0.9, …). Displays are overlaid at the canvas origin (only one app on
 //!    one display is ever shown), never tiled — matching the Windows/Linux model.
-//! 2. [`main_display_norm`] / [`norm_for_pixel_size`]: the scale factor to draw a captured
-//!    display-sized frame at, so it lands normalized to its display's short edge.
+//! 2. [`norm_for_pixel_size`] / [`window_display_for_pid`]: the scale factor (and, for
+//!    follow-focus, the display) to draw a captured display-sized frame at, so it lands
+//!    normalized to its display's short edge.
 //!
 //! **macOS differs from Windows/Linux in the FIT, not the canvas.** ScreenCaptureKit
 //! *Application* capture hands libobs a **full-display-sized frame** with the app composited in
@@ -98,11 +99,171 @@ pub fn capture_canvas_size() -> Option<(u32, u32)> {
     normalized_canvas(&active_display_pixel_sizes())
 }
 
-/// Normalization factor for the MAIN display. Phase B pins the SCK source to the main display,
-/// so the active frame is normalized by the main display's short edge. `None` if unreadable.
-pub fn main_display_norm() -> Option<f32> {
-    let (w, h) = display_pixel_size(CGDisplay::main().id)?;
-    norm_for_pixel_size(w, h)
+// ---------------------------------------------------------------------------
+// Phase C: follow-focus across displays.
+//
+// Resolve which display the focused window of a given app (by pid) sits on, so the SCK source
+// can be retargeted to that display and normalized by it. All CoreGraphics C functions — no
+// Objective-C, so no arm64 objc_msgSend variadic hazard. Uses the real `kCGWindow*` CFString
+// constants (extern statics) + CGRectMakeWithDictionaryRepresentation, so there are no per-poll
+// CFString allocations and the dictionary-key match is guaranteed.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> *const c_void;
+    fn CGGetDisplaysWithPoint(
+        point: CGPoint,
+        max_displays: u32,
+        displays: *mut u32,
+        matching_count: *mut u32,
+    ) -> i32;
+    // Returns CoreFoundation `Boolean` (unsigned char) — model as u8 (declaring `-> bool` is UB
+    // for any byte other than 0/1) and compare `!= 0`.
+    fn CGRectMakeWithDictionaryRepresentation(dict: *const c_void, rect: *mut CGRect) -> u8;
+    // The real CoreGraphics CFString key constants (CFStringRef). Reading these avoids
+    // fabricating/allocating CFStrings on every poll.
+    static kCGWindowOwnerPID: *const c_void;
+    static kCGWindowBounds: *const c_void;
+    static kCGWindowLayer: *const c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, idx: isize) -> *const c_void;
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    // `Boolean` (unsigned char) — see note above; model as u8.
+    fn CFNumberGetValue(number: *const c_void, the_type: i32, value: *mut c_void) -> u8;
+    fn CFRelease(cf: *const c_void);
+}
+
+const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+const K_CF_NUMBER_SINT32: i32 = 3;
+
+/// A display to retarget an SCK source to: its CGDirectDisplayID, UUID (for `set_display_uuid`),
+/// and normalization factor (1080 / short PIXEL edge).
+pub struct DisplayTarget {
+    pub id: u32,
+    pub uuid: String,
+    pub norm: f32,
+}
+
+/// Bundle a display id into a `DisplayTarget` (uuid + norm). `None` if either is unreadable.
+fn display_target(display_id: u32) -> Option<DisplayTarget> {
+    let (w, h) = display_pixel_size(display_id)?;
+    let norm = norm_for_pixel_size(w, h)?;
+    let uuid = crate::capture::get_display_uuid(display_id)?;
+    Some(DisplayTarget {
+        id: display_id,
+        uuid,
+        norm,
+    })
+}
+
+/// The main display as a retarget target (the default placement before a window is resolved).
+pub fn main_display_target() -> Option<DisplayTarget> {
+    display_target(CGDisplay::main().id)
+}
+
+/// The display whose bounds contain a global (points) coordinate.
+fn display_for_point(x: f64, y: f64) -> Option<u32> {
+    unsafe {
+        let mut ids = [0u32; 8];
+        let mut count = 0u32;
+        let err = CGGetDisplaysWithPoint(CGPoint { x, y }, 8, ids.as_mut_ptr(), &mut count);
+        (err == 0 && count > 0).then_some(ids[0])
+    }
+}
+
+fn read_i32(dict: *const c_void, key: *const c_void) -> Option<i32> {
+    unsafe {
+        let v = CFDictionaryGetValue(dict, key);
+        if v.is_null() {
+            return None;
+        }
+        let mut out: i32 = 0;
+        (CFNumberGetValue(v, K_CF_NUMBER_SINT32, &mut out as *mut i32 as *mut c_void) != 0)
+            .then_some(out)
+    }
+}
+
+/// The display the focused window of process `pid` sits on, as a retarget target. Picks the
+/// app's FRONTMOST on-screen, layer-0 (non-menubar/overlay) window — CGWindowList is ordered
+/// front-to-back, so the first pid match is the focused window (good for follow-focus). `None`
+/// if the process has no such window right now (caller keeps the current placement).
+pub fn window_display_for_pid(pid: u32) -> Option<DisplayTarget> {
+    unsafe {
+        let arr = CGWindowListCopyWindowInfo(
+            K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+            0,
+        );
+        if arr.is_null() {
+            return None;
+        }
+        let count = CFArrayGetCount(arr);
+        let mut center: Option<(f64, f64)> = None;
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(arr, i);
+            if dict.is_null() {
+                continue;
+            }
+            match read_i32(dict, kCGWindowOwnerPID) {
+                Some(p) if p as u32 == pid => {}
+                _ => continue,
+            }
+            // Only layer-0 (normal app windows); skip menubar/overlay layers. Fail CLOSED — an
+            // unreadable layer is skipped rather than assumed to be a real window.
+            if !matches!(read_i32(dict, kCGWindowLayer), Some(0)) {
+                continue;
+            }
+            let bounds = CFDictionaryGetValue(dict, kCGWindowBounds);
+            if bounds.is_null() {
+                continue;
+            }
+            let mut rect = CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            };
+            if CGRectMakeWithDictionaryRepresentation(bounds, &mut rect) == 0 {
+                continue;
+            }
+            if rect.size.width < 40.0 || rect.size.height < 40.0 {
+                continue; // ignore tiny helper windows
+            }
+            center = Some((
+                rect.origin.x + rect.size.width / 2.0,
+                rect.origin.y + rect.size.height / 2.0,
+            ));
+            break; // frontmost matching window
+        }
+        CFRelease(arr);
+        let (cx, cy) = center?;
+        display_target(display_for_point(cx, cy)?)
+    }
 }
 
 #[cfg(test)]

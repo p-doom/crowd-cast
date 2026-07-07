@@ -120,6 +120,14 @@ pub struct CaptureContext {
     /// when false, behaves exactly like the pre-feature main-display-only path.
     #[cfg(target_os = "macos")]
     mac_multi_monitor_capture: bool,
+    /// macOS follow-focus: the display UUID each tracked app's SCK source is currently pointed
+    /// at (bundle_id → uuid). PER-APP: single-active mode keeps a persistent source per target
+    /// app (only the active scene is shown), so a single slot would be clobbered on every app
+    /// switch and re-fire the (SCStream-restarting) retarget on a source that never moved. Keyed
+    /// by app so each app's last-known-good display survives another app taking a turn as active.
+    /// Reset with `last_monitor_fit` on every source rebuild.
+    #[cfg(target_os = "macos")]
+    last_display_uuid: HashMap<String, String>,
 }
 
 impl CaptureContext {
@@ -226,6 +234,8 @@ impl CaptureContext {
             last_monitor_fit: None,
             #[cfg(target_os = "macos")]
             mac_multi_monitor_capture: false,
+            #[cfg(target_os = "macos")]
+            last_display_uuid: HashMap::new(),
         })
     }
 
@@ -555,6 +565,13 @@ impl CaptureContext {
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         {
             self.last_monitor_fit = None;
+        }
+        // macOS follow-focus: a rebuilt source starts pinned to the main display (see
+        // new_application_capture), so the retarget cache must also be invalidated or the next
+        // poll would skip re-pointing it to the focused window's display.
+        #[cfg(target_os = "macos")]
+        {
+            self.last_display_uuid.clear();
         }
         // Drop any prior Mutter ScreenCast manager (closes its sessions / frees the old
         // nodes) before we rebuild.
@@ -1612,16 +1629,23 @@ impl CaptureContext {
         }
     }
 
-    /// macOS multi-monitor per-app fit. ScreenCaptureKit *Application* capture hands us a
-    /// full-DISPLAY-sized frame with the app composited in place (confirmed in Step 0: the
-    /// source's width/height equalled the target display's PIXELS on both a scale-1.0 external
-    /// and a scale-2.0 Retina display). So — unlike Windows/Linux, which offset a window-cropped
-    /// buffer by its on-monitor position — the fit is `scale = norm, pos = (0,0)` with NO
-    /// per-window offset (the offset is already baked into the display-sized frame). Phase B
-    /// pins the SCK source to the MAIN display, so we normalize by the main display; per-display
-    /// retargeting (following focus across monitors) is a later phase. De-duped via
-    /// `last_monitor_fit`; gated on the kill-switch flag AND single-active mode; a no-op until a
-    /// scene exists. Safe to call every poll.
+    /// macOS multi-monitor per-app fit + follow-focus. ScreenCaptureKit *Application* capture
+    /// hands us a full-DISPLAY-sized frame with the app composited in place (Step 0: the source's
+    /// width/height equalled the target display's PIXELS on both a scale-1.0 external and a
+    /// scale-2.0 Retina display), so the fit is `scale = norm, pos = (0,0)` with NO per-window
+    /// offset — unlike Windows/Linux, which offset a window-cropped buffer by its on-monitor
+    /// position.
+    ///
+    /// Follow-focus: when the active app's focused window is on a different display than the
+    /// source is currently pointed at, retarget the source to that display (`update_display_uuid`,
+    /// which restarts the SCStream — deduped via `last_display_uuid` so it only fires on an actual
+    /// display change, not every poll) and normalize by that display. The active app's window is
+    /// resolved via CGWindowList only when the app is the frontmost app (single-active tracks
+    /// frontmost); when it isn't, the current placement is kept to avoid churning as focus flicks
+    /// to non-target apps, and the main display is the default only for the first placement.
+    ///
+    /// De-duped via `last_monitor_fit`; gated on the kill-switch flag AND single-active mode; a
+    /// no-op until a scene exists. Safe to call every poll.
     #[cfg(target_os = "macos")]
     pub fn apply_monitor_fit_to_active(&mut self) {
         use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
@@ -1634,31 +1658,78 @@ impl CaptureContext {
         let Some(app) = self.active_capture_app.clone() else {
             return;
         };
-        let Some(norm) = super::mac_geometry::main_display_norm() else {
-            return;
+
+        // Which display is the active app's focused window on? Only trust CGWindowList when the
+        // active app is the frontmost app; otherwise keep the current placement (no churn). Fall
+        // back to the main display only for the very first placement of this app.
+        let resolved = get_frontmost_app()
+            .filter(|f| f.bundle_id == app)
+            .and_then(|f| super::mac_geometry::window_display_for_pid(f.pid));
+        let target = match resolved {
+            Some(t) => t,
+            None => {
+                // Can't resolve the window now (active app not frontmost, or a transient
+                // window/Space gap). If this app already has a placement, keep it (avoid churn
+                // and a wrong reset to main); only default to main for its very first placement.
+                if self.last_display_uuid.contains_key(&app) {
+                    return;
+                }
+                match super::mac_geometry::main_display_target() {
+                    Some(t) => t,
+                    None => return,
+                }
+            }
         };
-        // pos is always (0,0): SCK composites the app into a full-display-sized frame, so the
-        // display normalization is the entire transform (no per-window offset).
+
+        // Retarget the SCK source to the focused window's display when it changed for THIS app
+        // (deduped per-app; update_display_uuid is itself idempotent, so a no-op target never
+        // restarts the stream). A display change also changes `norm`, so invalidate the fit cache
+        // — but ONLY after a successful retarget, so a failed retarget doesn't apply the new
+        // display's norm to a source still pointed at the old display.
+        if self.last_display_uuid.get(&app).map(String::as_str) != Some(target.uuid.as_str()) {
+            match self.app_scenes.get_mut(&app) {
+                Some((_, source)) => match source.update_display_uuid(&target.uuid) {
+                    Ok(()) => {
+                        debug!(
+                            "macOS follow-focus: retargeted '{}' to display {} ({})",
+                            app, target.id, target.uuid
+                        );
+                        self.last_display_uuid.insert(app.clone(), target.uuid.clone());
+                        self.last_monitor_fit = None;
+                    }
+                    Err(e) => {
+                        // Leave caches unchanged so the next poll retries; do NOT fall through to
+                        // apply target.norm — the source is still on its previous display, whose
+                        // (still-correct) transform remains in effect.
+                        debug!("macOS follow-focus retarget failed for '{}': {}", app, e);
+                        return;
+                    }
+                },
+                None => return, // no scene for this app yet
+            }
+        }
+
+        // Apply the transform: normalized by the target display, positioned at the canvas origin.
+        let norm = target.norm;
         let key = (app.clone(), norm.to_bits(), 0f32.to_bits(), 0f32.to_bits());
         if self.last_monitor_fit.as_ref() == Some(&key) {
             return;
         }
-
         let info = ObsTransformInfoBuilder::new()
             .set_pos(Vec2::new(0.0, 0.0))
             .set_scale(Vec2::new(norm, norm))
             .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
             .set_bounds_type(ObsBoundsType::None)
             .build(0, 0);
-
-        let applied = {
-            let Some((scene, source)) = self.app_scenes.get(&app) else {
-                return;
-            };
-            scene.set_transform_info(source.source(), &info).is_ok()
+        let applied = match self.app_scenes.get(&app) {
+            Some((scene, source)) => scene.set_transform_info(source.source(), &info).is_ok(),
+            None => false,
         };
         if applied {
-            debug!("macOS monitor-fit '{}': scale {:.3} pos (0,0)", app, norm);
+            debug!(
+                "macOS monitor-fit '{}': scale {:.3} pos (0,0) [display {}]",
+                app, norm, target.id
+            );
             self.last_monitor_fit = Some(key);
         }
     }
