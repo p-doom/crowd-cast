@@ -14,6 +14,8 @@ mod context;
 #[cfg(target_os = "linux")]
 pub(crate) mod focus;
 mod frontmost;
+#[cfg(target_os = "macos")]
+mod mac_geometry;
 #[cfg(target_os = "linux")]
 pub(crate) mod gnome_screencast;
 #[cfg(target_os = "linux")]

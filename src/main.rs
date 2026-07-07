@@ -444,6 +444,7 @@ fn main() -> Result<()> {
     // Prime the capture mode + target list before initialize so the canvas can choose the
     // multi-monitor per-app envelope vs the display-capture canvas (setup_capture re-sets these).
     capture_ctx.set_single_active_app_capture(config.capture.single_active_app_capture);
+    capture_ctx.set_mac_multi_monitor_capture(config.capture.mac_multi_monitor_capture);
     let target_apps = config.capture.target_apps.clone();
     capture_ctx.set_target_apps(&target_apps);
 

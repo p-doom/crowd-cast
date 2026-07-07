@@ -116,6 +116,33 @@ pub struct MouseScrollEvent {
     pub y: f64,
 }
 
+/// A connected display's identity + geometry, for reconstructing the multi-monitor spatial
+/// context of a recording. Bounds are in POINTS in the global virtual-desktop space (top-left
+/// origin of the main display, matching CoreGraphics `CGDisplayBounds`); `px_*` are the backing
+/// pixel resolution. The active display's scale factor applied to the video is
+/// `1080 / min(px_width, px_height)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    /// Stable per-physical-display UUID (CoreGraphics), for joining across segments/sessions.
+    pub uuid: String,
+    /// Best-effort human-readable name (heuristic on macOS).
+    pub name: String,
+    /// Global top-left X of the display in points (virtual-desktop space).
+    pub x: i32,
+    /// Global top-left Y of the display in points.
+    pub y: i32,
+    /// Display width in points.
+    pub width: i32,
+    /// Display height in points.
+    pub height: i32,
+    /// Backing pixel width of the display's current mode.
+    pub px_width: u32,
+    /// Backing pixel height of the display's current mode.
+    pub px_height: u32,
+    /// Whether this is the main (menu-bar) display.
+    pub is_main: bool,
+}
+
 /// Recording geometry at a point in time: the canvas the frame is composited
 /// into, the encoded output, and the native size of the captured source (which
 /// may be larger than the canvas, e.g. a window on an external/ultrawide monitor,
@@ -153,6 +180,20 @@ pub struct MetadataEvent {
 
     /// UTC timestamp when this metadata was recorded (ISO 8601)
     pub timestamp_utc: String,
+
+    /// The display currently being captured — which physical monitor the video is showing — or
+    /// `None` when the macOS multi-monitor path is inactive (flag off / non-macOS / not
+    /// single-active). Also present in `displays`. The video (canvas = `display_width` x
+    /// `display_height`) shows this display's content scaled by `1080 / min(px_width, px_height)`
+    /// at the canvas origin.
+    #[serde(default)]
+    pub active_display: Option<MonitorInfo>,
+
+    /// Every connected display's identity + geometry (the full monitor arrangement), so the
+    /// recording's spatial/resolution context can be reconstructed. Empty when the multi-monitor
+    /// path is inactive.
+    #[serde(default)]
+    pub displays: Vec<MonitorInfo>,
 }
 
 /// Marker emitted when secure-input gating begins withholding key events.
@@ -509,6 +550,60 @@ mod tests {
 
         match decoded.event {
             EventType::ContextChanged(ctx) => assert_eq!(ctx.app_id, UNCAPTURED_APP_ID),
+            other => panic!("unexpected event after roundtrip: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn metadata_with_layout_msgpack_roundtrip() {
+        let dell = MonitorInfo {
+            uuid: "2B9D6C00-59FE-494A-BABC-ADA897FBDD01".to_string(),
+            name: "External Display 2".to_string(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1200,
+            px_width: 1920,
+            px_height: 1200,
+            is_main: true,
+        };
+        let builtin = MonitorInfo {
+            uuid: "37D8832A-2D66-02CA-B9F7-8F30A301B230".to_string(),
+            name: "Built-in Display".to_string(),
+            x: -1470,
+            y: 1091,
+            width: 1470,
+            height: 956,
+            px_width: 2940,
+            px_height: 1912,
+            is_main: false,
+        };
+        let event = InputEvent {
+            timestamp_us: 7,
+            event: EventType::Metadata(MetadataEvent {
+                display_width: 1728,
+                display_height: 1080,
+                display_aspect: 1.6,
+                output_width: 1728,
+                output_height: 1080,
+                output_aspect: 1.6,
+                source_width: 1920,
+                source_height: 1200,
+                source_aspect: 1.6,
+                timestamp_utc: "2026-07-07T00:00:00Z".to_string(),
+                active_display: Some(dell.clone()),
+                displays: vec![dell.clone(), builtin],
+            }),
+        };
+        let bytes = rmp_serde::to_vec(&event).unwrap();
+        let decoded: InputEvent = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded.event {
+            EventType::Metadata(m) => {
+                assert_eq!(m.display_width, 1728);
+                assert_eq!(m.active_display, Some(dell));
+                assert_eq!(m.displays.len(), 2);
+                assert_eq!(m.displays[1].px_width, 2940);
+            }
             other => panic!("unexpected event after roundtrip: {:?}", other),
         }
     }
