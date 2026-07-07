@@ -32,11 +32,13 @@ Infrastructure for capturing paired screencast and keyboard/mouse input data.
 
 > [![Download for macOS](https://img.shields.io/badge/Download%20for%20macOS-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/CrowdCast.dmg)
 > [![Download for Windows](https://img.shields.io/badge/Download%20for%20Windows-0078D6?style=for-the-badge&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTAgMy40NDkgOS43NSAyLjF2OS40NTFIMFptMTAuOTQ5LTEuNTAxTDI0IDB2MTEuNEgxMC45NDlaTTAgMTIuNmg5Ljc1djkuNDUxTDAgMjAuNjk5Wm0xMC45NDkgMEgyNFYyNGwtMTMuMDUxLTEuODAxWiIvPjwvc3ZnPg%3D%3D&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/crowd-cast-setup.exe)
+> [![Download for Linux](https://img.shields.io/badge/Download%20for%20Linux-E95420?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh)
 
 Download the installer for your platform and follow the instructions in the setup wizard.
 
 - **macOS**: open `CrowdCast.dmg` and grant permissions by following the setup wizard.
 - **Windows**: run `crowd-cast-setup.exe`. The agent runs from a single executable; OBS is fetched automatically on first launch and no special permissions are required. If SmartScreen shows "Windows protected your PC", click More info, then Run anyway.
+- **Linux**: run `curl -fsSL https://github.com/p-doom/crowd-cast/releases/latest/download/install-linux.sh | bash` (the Download for Linux button links to this script). It installs into `~/.local` and downloads libobs during setup. Supported sessions: GNOME on Wayland and sway.
 
 <!-- Download links use /releases/latest/download/<asset> with stable filenames so they never need per-release edits. Each resolves to the newest release containing that asset. -->
 
