@@ -1090,28 +1090,33 @@ impl CaptureContext {
             if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
                 let all = super::mac_geometry::describe_all_displays();
                 let active = self
-                    .active_capture_app
-                    .as_ref()
-                    .and_then(|app| self.last_display_uuid.get(app))
-                    .and_then(|uuid| all.iter().find(|m| &m.uuid == uuid).cloned());
+                    .active_display_uuid()
+                    .and_then(|uuid| all.iter().find(|m| m.uuid == uuid).cloned());
                 return (active, all);
             }
         }
         (None, Vec::new())
     }
 
-    /// UUID of the display the active app is currently captured on (macOS multi-monitor) — a
-    /// cheap lookup (no display enumeration) for detecting a follow-focus display switch so the
-    /// metadata timeline can be re-emitted even when the two displays share a resolution. `None`
-    /// when the multi-monitor path is inactive.
+    /// UUID of the display the active app is currently captured on (macOS multi-monitor), for
+    /// reporting the active display and detecting a follow-focus switch (even between two
+    /// same-resolution monitors). Prefers the retarget cache; before the first poll retargets
+    /// (and right after a source rebuild, which clears the cache) the source is pinned to the
+    /// main display, so we report the main display's UUID rather than nothing — this is the
+    /// single source of truth shared by `capture_layout_metadata` and the re-emit change check,
+    /// so they can never disagree. `None` when the multi-monitor path is inactive or no app is
+    /// active (blank scene).
     pub fn active_display_uuid(&self) -> Option<String> {
         #[cfg(target_os = "macos")]
         {
             if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
-                return self
-                    .active_capture_app
-                    .as_ref()
-                    .and_then(|app| self.last_display_uuid.get(app).cloned());
+                let app = self.active_capture_app.as_ref()?;
+                return match self.last_display_uuid.get(app) {
+                    Some(uuid) => Some(uuid.clone()),
+                    // Source is created pinned to the main display (see new_application_capture);
+                    // report that until the first poll's fit retargets it.
+                    None => super::get_main_display_uuid().ok(),
+                };
             }
         }
         None

@@ -1648,7 +1648,10 @@ unintended app video."
             .flatten()
             .unwrap_or((0, 0));
         self.last_logged_source_dims = Some((sw, sh));
-        self.last_logged_active_display = active_display.as_ref().map(|m| m.uuid.clone());
+        // Track via active_display_uuid() (the same source log_source_resolution_changes compares
+        // against) rather than the resolved active_display's uuid, so the re-emit change check
+        // can never disagree with what was logged (e.g. a cached display no longer in the list).
+        self.last_logged_active_display = self.capture_ctx.active_display_uuid();
         let utc_now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.event_buffer.push(InputEvent {
             timestamp_us,
