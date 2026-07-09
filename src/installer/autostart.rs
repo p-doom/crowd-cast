@@ -187,6 +187,48 @@ fn is_autostart_enabled_macos() -> bool {
     get_launch_agent_path().map(|p| p.exists()).unwrap_or(false)
 }
 
+/// Upgrade an EXISTING LaunchAgent plist (written by an older build) in place so
+/// launchd also relaunches the agent after a clean nonzero exit, not only after
+/// a crash: `KeepAlive.Crashed` covers signal deaths ONLY, so a startup failure
+/// that `exit(1)`s (e.g. relaunching into post-wake display flux) used to leave
+/// the agent dead until the next login. Patches ONLY the KeepAlive dict via
+/// exact-string replacement — ProgramArguments and everything else are left
+/// untouched, so a dev build running from a different path can never repoint
+/// the user's autostart. The wizard-written template already includes the key;
+/// this heals installs from before it did. The patched plist takes effect at
+/// the next launchd load (login/reboot) — no bootout of the running job.
+/// Call at startup; a no-op when autostart is off or the plist is current.
+#[cfg(target_os = "macos")]
+pub fn refresh_launch_agent_keepalive() -> Result<()> {
+    let plist_path = get_launch_agent_path()?;
+    if !plist_path.exists() {
+        return Ok(()); // autostart not enabled — nothing to refresh
+    }
+    let content = std::fs::read_to_string(&plist_path)
+        .with_context(|| format!("Failed to read LaunchAgent plist at {:?}", plist_path))?;
+    if content.contains("<key>SuccessfulExit</key>") {
+        return Ok(()); // already current
+    }
+    let old_keepalive = "    <key>KeepAlive</key>\n    <dict>\n        <key>Crashed</key>\n        <true/>\n    </dict>";
+    let new_keepalive = "    <key>KeepAlive</key>\n    <dict>\n        <key>Crashed</key>\n        <true/>\n        <key>SuccessfulExit</key>\n        <false/>\n    </dict>";
+    if !content.contains(old_keepalive) {
+        // Unexpected layout (hand-edited?) — leave it alone rather than guess.
+        info!("LaunchAgent plist has an unexpected KeepAlive layout; not patching");
+        return Ok(());
+    }
+    let patched = content.replace(old_keepalive, new_keepalive);
+    std::fs::write(&plist_path, patched)
+        .with_context(|| format!("Failed to write LaunchAgent plist at {:?}", plist_path))?;
+    info!("Upgraded LaunchAgent KeepAlive to also relaunch on nonzero exit");
+    Ok(())
+}
+
+/// Non-macOS stub (LaunchAgent plists are macOS-only).
+#[cfg(not(target_os = "macos"))]
+pub fn refresh_launch_agent_keepalive() -> Result<()> {
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
     use std::fs;
@@ -222,6 +264,8 @@ fn enable_autostart_macos(config: &AutostartConfig) -> Result<()> {
     <dict>
         <key>Crashed</key>
         <true/>
+        <key>SuccessfulExit</key>
+        <false/>
     </dict>
     <key>ProcessType</key>
     <string>Interactive</string>

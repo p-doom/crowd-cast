@@ -441,6 +441,12 @@ fn main() -> Result<()> {
         };
     info!("OBS binaries ready");
 
+    // Heal pre-1096 LaunchAgent plists so launchd also relaunches after a clean
+    // nonzero exit (KeepAlive.Crashed alone only covers signal deaths). Best-effort.
+    if let Err(e) = installer::autostart::refresh_launch_agent_keepalive() {
+        warn!("Could not refresh LaunchAgent KeepAlive: {}", e);
+    }
+
     // Prime the capture mode + target list before initialize so the canvas can choose the
     // multi-monitor per-app envelope vs the display-capture canvas (setup_capture re-sets these).
     capture_ctx.set_single_active_app_capture(config.capture.single_active_app_capture);
@@ -448,18 +454,55 @@ fn main() -> Result<()> {
     let target_apps = config.capture.target_apps.clone();
     capture_ctx.set_target_apps(&target_apps);
 
-    // Initialize libobs context
-    if let Err(e) = capture_ctx.initialize() {
-        error!("Failed to initialize libobs: {}", e);
-        std::process::exit(1);
+    // Initialize libobs + capture sources. On macOS this is retried with backoff:
+    // the agent is commonly (re)launched right after a wake-time crash, while the
+    // display list is still settling — the exact window in which SCK setup fails.
+    // A clean exit(1) here would be FINAL (launchd's KeepAlive/Crashed only
+    // relaunches signal deaths, not nonzero exits), so dying on the first attempt
+    // turned a transient wake glitch into "agent gone until next login". Retrying
+    // rides out the flux instead. Non-macOS keeps single-attempt semantics —
+    // Linux capture setup can involve an interactive portal dialog, which must
+    // not be re-prompted in a loop.
+    #[cfg(target_os = "macos")]
+    const STARTUP_RETRY_DELAYS_SECS: &[u64] = &[2, 5, 10, 20, 30];
+    #[cfg(not(target_os = "macos"))]
+    const STARTUP_RETRY_DELAYS_SECS: &[u64] = &[];
+
+    let mut startup_attempt = 0usize;
+    loop {
+        let step_err = match capture_ctx.initialize() {
+            Err(e) => Some(("initialize libobs", e)),
+            Ok(()) => {
+                match capture_ctx.setup_capture(&target_apps, &config.capture.restore_tokens) {
+                    Err(e) => Some(("setup capture", e)),
+                    Ok(_) => None,
+                }
+            }
+        };
+        match step_err {
+            None => break,
+            Some((step, e)) => {
+                if startup_attempt < STARTUP_RETRY_DELAYS_SECS.len() {
+                    let delay = STARTUP_RETRY_DELAYS_SECS[startup_attempt];
+                    startup_attempt += 1;
+                    warn!(
+                        "Failed to {} ({}); displays may still be settling — retrying in {}s \
+                         (attempt {}/{})",
+                        step,
+                        e,
+                        delay,
+                        startup_attempt,
+                        STARTUP_RETRY_DELAYS_SECS.len()
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(delay));
+                } else {
+                    error!("Failed to {}: {}", step, e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
     info!("libobs context initialized");
-
-    // Set up capture sources (per-app window capture for target apps, or display capture).
-    if let Err(e) = capture_ctx.setup_capture(&target_apps, &config.capture.restore_tokens) {
-        error!("Failed to setup capture: {}", e);
-        std::process::exit(1);
-    }
     if target_apps.is_empty() {
         info!("Capture sources configured (display capture since no apps selected)");
     } else {

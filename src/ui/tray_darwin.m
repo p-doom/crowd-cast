@@ -133,11 +133,13 @@ static void check_status_item_health(void) {
     }
 
     // Throttle: this runs from the tray loop on every iteration (~60Hz) and
-    // again from tray_update. Running the actual health logic that often burns
-    // main-thread CPU for no benefit, so gate it to at most once per ~2s.
+    // again from tray_update. The health queries hit WindowServer synchronously
+    // on the main thread — at 60Hz against a wedged status-bar host that
+    // starves the run loop (the 1.0.5 ANR / CPU burn). 1Hz keeps detection
+    // snappy while the run loop breathes between calls.
     static CFAbsoluteTime lastRun = 0;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (lastRun != 0 && now - lastRun < 2.0) {
+    if (lastRun != 0 && now - lastRun < 1.0) {
         return;
     }
     lastRun = now;
@@ -162,12 +164,14 @@ static void check_status_item_health(void) {
     // moment while ControlCenter builds the backing scene. On newer macOS,
     // ControlCenter can transiently detach the window while it rebuilds the
     // status bar, then reattach within a few seconds — restarting on such a
-    // blip caused a launch→exec restart storm. Only restart if an item that
-    // was previously attached stays detached across many consecutive samples
-    // (>15s, i.e. genuinely and persistently gone). In-process recreation has
-    // proven unreliable on Tahoe, so ask Rust to restart with a fresh process
+    // blip is wasted churn. Only restart if an item that was previously
+    // attached stays detached across many consecutive samples (>8s: past the
+    // transient-blip envelope, but fast enough that a wake-broken tray heals
+    // in seconds, not tens of seconds). Restart pacing beyond this threshold
+    // is the engine's exponential backoff. In-process recreation has proven
+    // unreliable on Tahoe, so ask Rust to restart with a fresh process
     // identity.
-    if (statusItemWasAttached && now - statusItemDetachedSince > 15.0) {
+    if (statusItemWasAttached && now - statusItemDetachedSince > 8.0) {
         request_tray_restart(@"Status item is not attached to the menu bar");
     }
 }
