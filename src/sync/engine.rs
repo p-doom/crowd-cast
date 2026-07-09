@@ -160,7 +160,7 @@ fn restart_process() -> ! {
 /// starting at [`RESTART_BACKOFF_BASE`]. History ages out after a quiet window,
 /// resetting the backoff.
 #[cfg(all(target_os = "macos", not(no_tray)))]
-const RESTART_BACKOFF_BASE: u64 = 30;
+const RESTART_BACKOFF_BASE: u64 = 15;
 
 /// Ceiling for the backoff gap between watchdog restarts (15 minutes).
 #[cfg(all(target_os = "macos", not(no_tray)))]
