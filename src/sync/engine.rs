@@ -146,15 +146,61 @@ fn restart_process() -> ! {
     }
 }
 
-/// Cap on restarts within `RESTART_HISTORY_WINDOW` before we refuse to restart
-/// again. A misbehaving macOS status-item host (ControlCenter rebuilding the
-/// status bar) could otherwise drive a launch→exec restart storm; this bounds it.
+/// Exponential-backoff schedule for tray-watchdog restarts. The pre-#108
+/// watchdog retried forever with no spacing (the self-healing that kept the
+/// tray alive across wake glitches) but on a persistently-detaching status-item
+/// host that became a restart storm and an ANR. A hard cap (6/hour) fixed the
+/// storm but ABANDONED the tray for the rest of the window when a rough wake
+/// burned the budget — users saw the icon gone for up to an hour. Backoff keeps
+/// both properties: restarts never stop (a wake detach is fixed by exactly one
+/// restart, and even a stubborn detach heals within [`RESTART_BACKOFF_MAX`]),
+/// while the steady-state storm rate (~4/hour) is far below even the old cap.
+/// The first restart in a quiet window fires immediately; each subsequent one
+/// within [`RESTART_HISTORY_WINDOW`] must wait twice as long as the last,
+/// starting at [`RESTART_BACKOFF_BASE`]. History ages out after a quiet window,
+/// resetting the backoff.
 #[cfg(all(target_os = "macos", not(no_tray)))]
-const RESTART_CAP_PER_WINDOW: usize = 6;
+const RESTART_BACKOFF_BASE: u64 = 30;
 
-/// Sliding window over which `RESTART_CAP_PER_WINDOW` restarts are counted.
+/// Ceiling for the backoff gap between watchdog restarts (15 minutes).
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const RESTART_BACKOFF_MAX: u64 = 900;
+
+/// Sliding window over which restart history is kept for backoff computation.
 #[cfg(all(target_os = "macos", not(no_tray)))]
 const RESTART_HISTORY_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Wait (bounded) for the display configuration to hold still after a change
+/// event. Settled = two consecutive reads of the active display list, 800ms
+/// apart, that are identical, non-empty, and whose main display has a
+/// resolvable UUID (the exact input SCK source creation needs). Gives up after
+/// ~8s and lets the caller proceed — failing open is no worse than the
+/// pre-gate behavior of recreating straight into the flux.
+#[cfg(target_os = "macos")]
+async fn wait_for_displays_to_settle() {
+    use core_graphics::display::CGDisplay;
+
+    let read_displays = || CGDisplay::active_displays().unwrap_or_default();
+
+    let mut prev = read_displays();
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let cur = read_displays();
+        let main_resolvable =
+            !cur.is_empty() && crate::capture::get_display_uuid(CGDisplay::main().id).is_some();
+        if main_resolvable && cur == prev {
+            return;
+        }
+        debug!(
+            "display set still settling ({} -> {} displays, main uuid ok: {})",
+            prev.len(),
+            cur.len(),
+            main_resolvable
+        );
+        prev = cur;
+    }
+    warn!("display set did not settle within ~8s; proceeding with source recreate anyway");
+}
 
 #[cfg(all(target_os = "macos", not(no_tray)))]
 fn restart_history_path() -> Option<PathBuf> {
@@ -162,16 +208,20 @@ fn restart_history_path() -> Option<PathBuf> {
         .map(|p| p.data_dir().join("restart_history"))
 }
 
-/// Whether a restart is allowed under the per-hour cap, recording `now` when it
-/// is. Reads the restart-history marker file, drops timestamps older than the
-/// window, and if the remaining count is already at the cap returns `false`.
-/// Otherwise appends `now` and returns `true`. Persists across exec()s.
+/// Whether a restart is allowed under the exponential backoff, recording `now`
+/// when it is. Reads the restart-history marker file, drops timestamps older
+/// than the window, and requires the gap since the most recent restart to be at
+/// least `RESTART_BACKOFF_BASE * 2^(n-1)` (capped at [`RESTART_BACKOFF_MAX`])
+/// where `n` is the number of restarts in the window. The first restart in a
+/// quiet window fires immediately. Never refuses forever — a denied restart is
+/// merely deferred until the gap elapses (the watchdog keeps polling and the
+/// detach threshold stays crossed, so it retries). Persists across exec()s.
 ///
 /// Fails OPEN: on any file-I/O or path error the restart is allowed (a missing
 /// tray icon from an occasional extra restart is fine; being unable to restart
 /// at all is worse). Never panics.
 #[cfg(all(target_os = "macos", not(no_tray)))]
-fn restart_allowed_under_cap() -> bool {
+fn restart_allowed_with_backoff() -> bool {
     let Some(path) = restart_history_path() else {
         return true; // fail open
     };
@@ -194,12 +244,20 @@ fn restart_allowed_under_cap() -> bool {
         })
         .unwrap_or_default();
 
-    if recent.len() >= RESTART_CAP_PER_WINDOW {
-        warn!(
-            "restart cap reached ({} in last hour); skipping restart to avoid a restart storm",
-            recent.len()
-        );
-        return false;
+    if let Some(&last) = recent.iter().max() {
+        let n = recent.len() as u32;
+        let required_gap = RESTART_BACKOFF_BASE
+            .saturating_mul(1u64 << (n - 1).min(63))
+            .min(RESTART_BACKOFF_MAX);
+        let elapsed = now.saturating_sub(last);
+        if elapsed < required_gap {
+            warn!(
+                "restart backoff: {} restart(s) in the last hour, {}s since the last one \
+                 (< required {}s); deferring restart (will retry once the gap elapses)",
+                n, elapsed, required_gap
+            );
+            return false;
+        }
     }
 
     recent.push(now);
@@ -213,7 +271,7 @@ fn restart_allowed_under_cap() -> bool {
         .join("\n");
     if let Err(e) = std::fs::write(&path, serialized) {
         // Fail open: we couldn't persist the new timestamp, but still allow the
-        // restart (the cap just won't count this one).
+        // restart (the backoff just won't count this one).
         warn!("Failed to persist restart history: {}", e);
     }
     true
@@ -2316,14 +2374,19 @@ unintended app video."
                             self.switch_to_display(display_id);
                         }
                         EngineCommand::RestartProcess => {
-                            // Bound the restart rate. A wedged macOS status-item host (ControlCenter)
-                            // can drive a restart storm through this command (status-item-lost / screen
-                            // unlock → RestartProcess). If we've hit the per-hour cap, SKIP the restart
-                            // and keep recording. Checked BEFORE stop_recording so a capped request
-                            // never tears down the live session — a stale tray icon is acceptable,
-                            // stopping recording is not. Non-macOS / no_tray builds are never capped.
+                            // Bound the restart RATE, never the total. A wedged macOS status-item
+                            // host (ControlCenter) can drive a restart storm through this command
+                            // (status-item-lost / screen unlock → RestartProcess); exponential
+                            // backoff spaces the retries out (30s → 1m → … → 15m ceiling) instead
+                            // of abandoning the tray like the old hard cap did. A deferred request
+                            // is retried automatically: the watchdog keeps polling and the detach
+                            // threshold stays crossed, so RestartProcess fires again once the gap
+                            // elapses. Checked BEFORE stop_recording so a deferred request never
+                            // tears down the live session — a briefly stale tray icon is
+                            // acceptable, stopping recording is not. Non-macOS / no_tray builds
+                            // are never deferred.
                             #[cfg(all(target_os = "macos", not(no_tray)))]
-                            let restart_ok = restart_allowed_under_cap();
+                            let restart_ok = restart_allowed_with_backoff();
                             #[cfg(not(all(target_os = "macos", not(no_tray))))]
                             let restart_ok = true;
                             if restart_ok {
@@ -2332,7 +2395,22 @@ unintended app video."
                                 self.stop_recording().await.ok();
                                 restart_process();
                             } else {
-                                warn!("Restart cap reached; skipping restart and continuing to record (tray icon may be stale until the cap window clears).");
+                                // The watchdog re-sends RestartProcess every ~2s while the item
+                                // stays detached; log the deferral at most once per minute.
+                                #[cfg(all(target_os = "macos", not(no_tray)))]
+                                {
+                                    use std::sync::atomic::{AtomicU64, Ordering};
+                                    static LAST_DEFER_WARN: AtomicU64 = AtomicU64::new(0);
+                                    let now_s = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    let last = LAST_DEFER_WARN.load(Ordering::Relaxed);
+                                    if now_s.saturating_sub(last) >= 60 {
+                                        LAST_DEFER_WARN.store(now_s, Ordering::Relaxed);
+                                        warn!("Restart deferred by backoff; continuing to record (tray icon may be stale until the next retry).");
+                                    }
+                                }
                             }
                         }
                         EngineCommand::ResumeFromSuspend => {
@@ -3306,6 +3384,16 @@ unintended app video."
         let Some(event) = self.display_monitor.check_for_changes() else {
             return;
         };
+
+        // Settle-gate: at wake the display list flaps for a few seconds, and
+        // recreating SCK sources mid-flux is what crashed the mac-capture plugin
+        // (CFUUIDCreateString on a display UUID that doesn't resolve at that
+        // instant — the "gone after wake" incident). Wait for the display set to
+        // hold still before tearing sources down; recording keeps running while
+        // we wait. Bounded and fail-open: after ~8s we proceed regardless, which
+        // is no worse than the old behavior.
+        #[cfg(target_os = "macos")]
+        wait_for_displays_to_settle().await;
 
         let restart_recording = self.current_session.is_some();
 
