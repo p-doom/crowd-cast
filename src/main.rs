@@ -783,5 +783,5 @@ fn print_help() {
         "                  Override log directory (default: ~/Library/Logs/crowd-cast on macOS)"
     );
     println!();
-    println!("For more information, visit: https://github.com/crowd-cast/crowd-cast");
+    println!("For more information, visit: https://github.com/p-doom/crowd-cast");
 }

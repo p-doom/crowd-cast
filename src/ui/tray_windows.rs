@@ -24,6 +24,7 @@ const ID_UPLOADS: &str = "cc.uploads";
 const ID_SIGN: &str = "cc.sign";
 const ID_SETTINGS: &str = "cc.settings";
 const ID_UPDATES: &str = "cc.updates";
+const ID_REPORT_BUG: &str = "cc.reportbug";
 const ID_QUIT: &str = "cc.quit";
 
 pub struct WindowsTray {
@@ -34,7 +35,7 @@ pub struct WindowsTray {
     pending_menu: Option<Menu>,
     tray: Option<TrayIcon>,
     // Item handles we mutate on update(). Items we never change (panic, settings,
-    // quit, separators) are owned by the menu and don't need handles here.
+    // report bug, quit, separators) are owned by the menu and don't need handles here.
     status_item: MenuItem,
     account_item: MenuItem,
     start_item: MenuItem,
@@ -61,6 +62,7 @@ impl WindowsTray {
         let sign_item = MenuItem::with_id(ID_SIGN, "Sign in with Google", true, None);
         let settings_item = MenuItem::with_id(ID_SETTINGS, "Settings", true, None);
         let updates_item = MenuItem::with_id(ID_UPDATES, "Check for Updates", false, None);
+        let report_bug_item = MenuItem::with_id(ID_REPORT_BUG, "Report Bug…", true, None);
         let quit_item = MenuItem::with_id(ID_QUIT, "Quit", true, None);
 
         let sep1 = PredefinedMenuItem::separator();
@@ -79,6 +81,7 @@ impl WindowsTray {
             &sign_item,
             &settings_item,
             &updates_item,
+            &report_bug_item,
             &sep3,
             &quit_item,
         ])
@@ -163,6 +166,7 @@ impl PlatformTray for WindowsTray {
                 ID_SIGN => PlatformTrayPoll::Action(TrayAction::SignIn),
                 ID_SETTINGS => PlatformTrayPoll::Action(TrayAction::Settings),
                 ID_UPDATES => PlatformTrayPoll::Action(TrayAction::CheckForUpdates),
+                ID_REPORT_BUG => PlatformTrayPoll::Action(TrayAction::ReportBug),
                 ID_QUIT => PlatformTrayPoll::Action(TrayAction::Quit),
                 _ => PlatformTrayPoll::None,
             };

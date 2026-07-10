@@ -17,6 +17,7 @@ pub enum TrayAction {
     SignIn,
     Settings,
     CheckForUpdates,
+    ReportBug,
     Quit,
 }
 

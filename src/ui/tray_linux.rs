@@ -217,6 +217,17 @@ impl ksni::Tray for TrayModel {
             }
             .into(),
         );
+        items.push(
+            StandardItem {
+                label: "Report Bug…".into(),
+                enabled: true,
+                activate: Box::new(|m: &mut Self| {
+                    let _ = m.tx.send(TrayAction::ReportBug);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
 
         items.push(MenuItem::Separator);
 
