@@ -194,6 +194,23 @@ pub struct MetadataEvent {
     /// path is inactive.
     #[serde(default)]
     pub displays: Vec<MonitorInfo>,
+
+    /// Which OS produced the recording (`std::env::consts::OS`: "macos"/"windows"/"linux").
+    /// Empty for recordings made before this field existed.
+    ///
+    /// NOTE: keylogs are msgpack-encoded as POSITIONAL arrays, so field order is the wire
+    /// format — this is positional index 12 and must stay after `displays`.
+    #[serde(default)]
+    pub platform: String,
+
+    /// How the video was captured: "display" (full-screen display capture),
+    /// "single_active_app" (follow-focus per-app capture; the standard config), or
+    /// "multi_source_app" (legacy multi-source per-app capture). Empty for recordings
+    /// made before this field existed.
+    ///
+    /// NOTE: positional index 13 in the msgpack wire format — must stay after `platform`.
+    #[serde(default)]
+    pub capture_mode: String,
 }
 
 /// Marker emitted when secure-input gating begins withholding key events.
@@ -593,6 +610,8 @@ mod tests {
                 timestamp_utc: "2026-07-07T00:00:00Z".to_string(),
                 active_display: Some(dell.clone()),
                 displays: vec![dell.clone(), builtin],
+                platform: "macos".to_string(),
+                capture_mode: "single_active_app".to_string(),
             }),
         };
         let bytes = rmp_serde::to_vec(&event).unwrap();
@@ -603,9 +622,88 @@ mod tests {
                 assert_eq!(m.active_display, Some(dell));
                 assert_eq!(m.displays.len(), 2);
                 assert_eq!(m.displays[1].px_width, 2940);
+                assert_eq!(m.platform, "macos");
+                assert_eq!(m.capture_mode, "single_active_app");
             }
             other => panic!("unexpected event after roundtrip: {:?}", other),
         }
+    }
+
+    /// Keylogs are msgpack POSITIONAL arrays (no field names), so `platform` and
+    /// `capture_mode` are defined by their trailing indices: 12 and 13. This test
+    /// pins that wire contract and the backward-compat decode of old (12-element)
+    /// metadata arrays.
+    #[test]
+    fn metadata_platform_capture_mode_positional_wire_format() {
+        let event = MetadataEvent {
+            display_width: 1920,
+            display_height: 1080,
+            display_aspect: 1.7777777777777777,
+            output_width: 1920,
+            output_height: 1080,
+            output_aspect: 1.7777777777777777,
+            source_width: 1920,
+            source_height: 1080,
+            source_aspect: 1.7777777777777777,
+            timestamp_utc: "2026-07-09T00:00:00Z".to_string(),
+            active_display: None,
+            displays: Vec::new(),
+            platform: "linux".to_string(),
+            capture_mode: "display".to_string(),
+        };
+
+        // Typed roundtrip: the new fields survive encode/decode.
+        let bytes = rmp_serde::to_vec(&event).unwrap();
+        let decoded: MetadataEvent = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.platform, "linux");
+        assert_eq!(decoded.capture_mode, "display");
+
+        // Positional contract: decode the same bytes as a bare 14-tuple and assert
+        // platform sits at index 12 and capture_mode at index 13.
+        type MetadataTuple = (
+            u32,
+            u32,
+            f64,
+            u32,
+            u32,
+            f64,
+            u32,
+            u32,
+            f64,
+            String,
+            Option<MonitorInfo>,
+            Vec<MonitorInfo>,
+            String,
+            String,
+        );
+        let tuple: MetadataTuple = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(tuple.12, "linux", "platform must be positional index 12");
+        assert_eq!(
+            tuple.13, "display",
+            "capture_mode must be positional index 13"
+        );
+
+        // Backward compat: a pre-fix 12-element array (no platform/capture_mode)
+        // still decodes, with both new fields defaulting to "".
+        let old_bytes = rmp_serde::to_vec(&(
+            event.display_width,
+            event.display_height,
+            event.display_aspect,
+            event.output_width,
+            event.output_height,
+            event.output_aspect,
+            event.source_width,
+            event.source_height,
+            event.source_aspect,
+            event.timestamp_utc.clone(),
+            event.active_display.clone(),
+            event.displays.clone(),
+        ))
+        .unwrap();
+        let old: MetadataEvent = rmp_serde::from_slice(&old_bytes).unwrap();
+        assert_eq!(old.display_width, 1920);
+        assert_eq!(old.platform, "");
+        assert_eq!(old.capture_mode, "");
     }
 }
 
