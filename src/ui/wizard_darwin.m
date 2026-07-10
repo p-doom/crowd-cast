@@ -1456,6 +1456,38 @@ void wizard_open_notifications_settings(void) {
 }
 
 // ============================================================================
+// Post-Setup Sign-In Prompt
+// ============================================================================
+
+int show_post_setup_signin_prompt(void) {
+    // Called from Rust on the main thread before the tray run loop starts;
+    // runModal spins its own modal run loop, so no dispatch is needed. Guard
+    // anyway: NSAlert off the main thread is invalid, so misuse quietly counts
+    // as "skip" instead of crashing.
+    if (![NSThread isMainThread]) {
+        NSLog(@"[CrowdCast] show_post_setup_signin_prompt called off the main thread; skipping");
+        return 0;
+    }
+
+    [NSApplication sharedApplication];  // ensure NSApp exists (idempotent)
+    [NSApp activateIgnoringOtherApps:YES];
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Sign in to CrowdCast";
+    alert.informativeText =
+        @"Sign in with your Google account so your contributions are credited "
+         "to you. You can also do this later from the menu-bar icon.";
+    alert.alertStyle = NSAlertStyleInformational;
+    [alert addButtonWithTitle:@"Sign In"];  // first button = default (Return key)
+    [alert addButtonWithTitle:@"Skip for Now"];
+
+    // Float above other windows -- the agent has no regular windows of its own.
+    alert.window.level = NSFloatingWindowLevel;
+
+    return ([alert runModal] == NSAlertFirstButtonReturn) ? 1 : 0;
+}
+
+// ============================================================================
 // System Restart Alert
 // ============================================================================
 

@@ -104,6 +104,15 @@ void show_app_selection_panel(
 void app_selection_free_result(AppSelectionResult *result);
 
 // ============================================================================
+// Post-Setup Sign-In Prompt (shown once, right after the wizard completes)
+// ============================================================================
+
+// Show a modal alert offering Google sign-in. Must be called on the main
+// thread (before the tray run loop starts); blocks until dismissed.
+// Returns: 1 if the user chose "Sign In", 0 for "Skip for Now".
+int show_post_setup_signin_prompt(void);
+
+// ============================================================================
 // System Restart Alert (shown when SCK is broken at system level)
 // ============================================================================
 

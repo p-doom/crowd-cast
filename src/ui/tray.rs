@@ -35,6 +35,13 @@ pub fn was_quit_requested() -> bool {
     QUIT_REQUESTED.load(Ordering::SeqCst)
 }
 
+/// Signal the tray loop that a sign-in completed on a background thread, so it
+/// refreshes the account display. Used by the post-setup sign-in prompt in
+/// `main.rs`, whose OAuth flow typically finishes after the tray has started.
+pub fn notify_sign_in_completed() {
+    SIGN_IN_COMPLETED.store(true, Ordering::SeqCst);
+}
+
 // ---------------------------------------------------------------------------
 // Prepare-for-update logic (pure business logic, no platform dependency)
 // ---------------------------------------------------------------------------
