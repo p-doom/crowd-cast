@@ -22,6 +22,7 @@ static START_REQUESTED: AtomicBool = AtomicBool::new(false);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PANIC_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CHECK_FOR_UPDATES_REQUESTED: AtomicBool = AtomicBool::new(false);
+static REPORT_BUG_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TOGGLE_UPLOADS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SIGN_IN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -45,6 +46,10 @@ unsafe extern "C" fn on_panic(_item: *mut TrayMenuItem) {
 
 unsafe extern "C" fn on_check_for_updates(_item: *mut TrayMenuItem) {
     CHECK_FOR_UPDATES_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+unsafe extern "C" fn on_report_bug(_item: *mut TrayMenuItem) {
+    REPORT_BUG_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 unsafe extern "C" fn on_toggle_uploads(_item: *mut TrayMenuItem) {
@@ -109,9 +114,10 @@ const MENU_UPLOADS: usize = 7;
 const MENU_SIGN_ACTION: usize = 8;
 // 9 = settings (text never changes)
 const MENU_UPDATES: usize = 10;
-// 11 = separator
-// 12 = quit
-// 13 = NULL terminator
+// 11 = report bug (text never changes)
+// 12 = separator
+// 13 = quit
+// 14 = NULL terminator
 
 // ---------------------------------------------------------------------------
 // MacOSTray
@@ -144,8 +150,9 @@ impl MacOSTray {
             CString::new("Sign in with Google")?,    // 8
             CString::new("Settings")?,               // 9
             CString::new("Check for Updates")?,      // 10
-            CString::new("-")?,                      // 11: separator
-            CString::new("Quit")?,                   // 12
+            CString::new("Report Bug…")?,            // 11
+            CString::new("-")?,                      // 12: separator
+            CString::new("Quit")?,                   // 13
         ];
 
         let mut menu_items = vec![
@@ -237,23 +244,31 @@ impl MacOSTray {
                 cb: Some(on_check_for_updates),
                 submenu: std::ptr::null_mut(),
             },
-            // 11: Separator
+            // 11: Report Bug
             TrayMenuItem {
                 text: menu_strings[11].as_ptr(),
+                disabled: 0,
+                checked: 0,
+                cb: Some(on_report_bug),
+                submenu: std::ptr::null_mut(),
+            },
+            // 12: Separator
+            TrayMenuItem {
+                text: menu_strings[12].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
-            // 12: Quit
+            // 13: Quit
             TrayMenuItem {
-                text: menu_strings[12].as_ptr(),
+                text: menu_strings[13].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_quit),
                 submenu: std::ptr::null_mut(),
             },
-            // 13: NULL terminator
+            // 14: NULL terminator
             TrayMenuItem {
                 text: std::ptr::null(),
                 disabled: 0,
@@ -287,6 +302,7 @@ impl PlatformTray for MacOSTray {
         STOP_REQUESTED.store(false, Ordering::SeqCst);
         PANIC_REQUESTED.store(false, Ordering::SeqCst);
         CHECK_FOR_UPDATES_REQUESTED.store(false, Ordering::SeqCst);
+        REPORT_BUG_REQUESTED.store(false, Ordering::SeqCst);
         SETTINGS_REQUESTED.store(false, Ordering::SeqCst);
         TOGGLE_UPLOADS_REQUESTED.store(false, Ordering::SeqCst);
         SIGN_IN_REQUESTED.store(false, Ordering::SeqCst);
@@ -346,6 +362,9 @@ impl PlatformTray for MacOSTray {
         }
         if CHECK_FOR_UPDATES_REQUESTED.swap(false, Ordering::SeqCst) {
             return PlatformTrayPoll::Action(TrayAction::CheckForUpdates);
+        }
+        if REPORT_BUG_REQUESTED.swap(false, Ordering::SeqCst) {
+            return PlatformTrayPoll::Action(TrayAction::ReportBug);
         }
 
         PlatformTrayPoll::None

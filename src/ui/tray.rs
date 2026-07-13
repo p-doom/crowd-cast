@@ -80,6 +80,74 @@ fn next_prepare_for_update_action(
 }
 
 // ---------------------------------------------------------------------------
+// Bug report helpers
+// ---------------------------------------------------------------------------
+
+/// Issue tracker targeted by the "Report Bug…" menu item.
+const BUG_REPORT_ISSUES_URL: &str = "https://github.com/p-doom/crowd-cast/issues/new";
+
+/// Build the prefilled GitHub new-issue URL for the "Report Bug…" menu item.
+/// Pure function (all environment data passed in) so URL encoding is testable.
+fn build_bug_report_url(version: &str, os: &str, arch: &str, log_dir: &str) -> String {
+    let title = format!("[Bug] <describe the issue> (agent v{}, {})", version, os);
+    let body = format!(
+        "## Description\n\n\
+         <!-- What happened? What did you expect to happen? -->\n\n\
+         ## Environment\n\n\
+         - Agent version: {}\n\
+         - Platform: {} ({})\n\
+         - Log directory: `{}`\n\n\
+         Please attach recent log files from the log directory above.\n",
+        version, os, arch, log_dir
+    );
+    format!(
+        "{}?title={}&body={}",
+        BUG_REPORT_ISSUES_URL,
+        urlencoding::encode(&title),
+        urlencoding::encode(&body),
+    )
+}
+
+/// Gather the current agent/environment details and build the issue URL.
+fn bug_report_url() -> String {
+    // Prefer the full build version stamped in by CI (matches the updater's
+    // version handling); fall back to the Cargo version for dev builds.
+    let version = option_env!("CROWD_CAST_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+    let log_dir = crate::logging::get_log_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unavailable".to_string());
+    build_bug_report_url(
+        version,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        &log_dir,
+    )
+}
+
+/// Open a URL in the user's default browser. Failures are logged, never fatal.
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    // NOTE: do NOT use `cmd /C start <url>` — cmd treats `&` as a command
+    // separator and would truncate the URL at `&body=`. rundll32 takes the
+    // full URL as a single argument with no shell parsing (same approach as
+    // the OAuth flow in src/auth/oauth.rs).
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    if let Err(e) = result {
+        warn!("Failed to open {} in browser: {}", url, e);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    warn!("No URL opener available on this platform; visit {}", url);
+}
+
+// ---------------------------------------------------------------------------
 // Auth display helper
 // ---------------------------------------------------------------------------
 
@@ -336,6 +404,10 @@ impl TrayApp {
                         }
                         self.last_update_check = std::time::Instant::now();
                     }
+                    TrayAction::ReportBug => {
+                        info!("Bug report requested via tray");
+                        open_url(&bug_report_url());
+                    }
                 },
             }
 
@@ -576,10 +648,47 @@ fn create_platform_tray(icon_paths: &TrayIconPaths) -> Result<Box<dyn PlatformTr
 #[cfg(test)]
 mod tests {
     use super::{
-        next_prepare_for_update_action, status_blocks_immediate_update,
+        build_bug_report_url, next_prepare_for_update_action, status_blocks_immediate_update,
         status_needs_prepare_for_update, PrepareForUpdateAction,
     };
     use crate::sync::EngineStatus;
+
+    #[test]
+    fn bug_report_url_encodes_title_and_body() {
+        let url = build_bug_report_url(
+            "1.0.6.1099",
+            "macos",
+            "aarch64",
+            "/Users/test/Library/Logs/crowd-cast",
+        );
+
+        assert!(url.starts_with("https://github.com/p-doom/crowd-cast/issues/new?title="));
+        // Exactly one raw `&` (the title/body query separator); everything else
+        // (spaces, newlines, `#`, backticks) must be percent-encoded.
+        assert_eq!(url.matches('&').count(), 1);
+        assert!(url.contains("&body="));
+        for raw in [' ', '\n', '#', '`', '<', '>'] {
+            assert!(!url.contains(raw), "unencoded {:?} in {}", raw, url);
+        }
+
+        // The body must survive a decode round-trip with all metadata intact.
+        let body_encoded = url.split("&body=").nth(1).unwrap();
+        let body = urlencoding::decode(body_encoded).unwrap();
+        assert!(body.contains("Agent version: 1.0.6.1099"));
+        assert!(body.contains("Platform: macos (aarch64)"));
+        assert!(body.contains("`/Users/test/Library/Logs/crowd-cast`"));
+
+        let title_encoded = url
+            .split("?title=")
+            .nth(1)
+            .unwrap()
+            .split("&body=")
+            .next()
+            .unwrap();
+        let title = urlencoding::decode(title_encoded).unwrap();
+        assert!(title.contains("agent v1.0.6.1099"));
+        assert!(title.contains("macos"));
+    }
 
     #[test]
     fn update_blocking_statuses_match_policy() {

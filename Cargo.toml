@@ -4,7 +4,7 @@ version = "1.0.6"
 edition = "2021"
 description = "crowd-cast data collection agent - captures paired screencast and input data"
 license = "MIT"
-repository = "https://github.com/crowd-cast/crowd-cast"
+repository = "https://github.com/p-doom/crowd-cast"
 
 [features]
 # Opt-in build of offline release tooling (the appcast manifest signer). Off by default so normal
