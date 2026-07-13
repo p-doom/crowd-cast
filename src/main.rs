@@ -133,6 +133,12 @@ use config::Config;
 use installer::{needs_setup, reconcile_autostart, run_wizard_gui, AutostartConfig};
 use sync::{create_engine_channels, EngineCommand, SyncEngine};
 
+/// One-shot marker the post-wizard re-exec sets on its replacement process (see the
+/// wizard-completion branch in `main`). The replacement run reads and immediately
+/// removes it, so children and later relaunches never inherit it — this is what makes
+/// the post-setup sign-in prompt fire exactly once.
+const POST_SETUP_ENV: &str = "CROWD_CAST_POST_SETUP";
+
 /// Main entry point, runs tray on main thread (required for macOS)
 fn main() -> Result<()> {
     // On Windows, declare Per-Monitor-V2 DPI awareness before any graphics or
@@ -323,6 +329,12 @@ fn main() -> Result<()> {
     let force_setup = args.iter().any(|a| a == "--setup" || a == "-s");
     let missing_permissions = !installer::all_permissions_granted();
 
+    // True only on the run re-exec'd by a just-completed setup wizard (the marker is
+    // set in the wizard-completion branch below). Consumed immediately so OBS/dialog
+    // child processes and later relaunches never inherit it.
+    let post_setup_run = std::env::var(POST_SETUP_ENV).is_ok();
+    std::env::remove_var(POST_SETUP_ENV);
+
     // Create tokio runtime for async operations
     let runtime = tokio::runtime::Runtime::new()?;
 
@@ -402,11 +414,16 @@ fn main() -> Result<()> {
             .filter(|a| a != "--setup" && a != "-s")
             .collect();
 
-        // Use Unix exec to replace this process with a fresh one
+        // Use Unix exec to replace this process with a fresh one. The marker env var
+        // tells the replacement run that setup JUST completed, so it shows the
+        // one-time Google sign-in prompt (and consumes the marker right away).
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(&exe).args(&filtered_args).exec();
+            let err = std::process::Command::new(&exe)
+                .args(&filtered_args)
+                .env(POST_SETUP_ENV, "1")
+                .exec();
             // exec() only returns on error
             error!("exec failed: {}", err);
         }
@@ -414,6 +431,7 @@ fn main() -> Result<()> {
         // Fallback for non-Unix or if exec fails
         std::process::Command::new(&exe)
             .args(&filtered_args)
+            .env(POST_SETUP_ENV, "1")
             .spawn()?;
         std::process::exit(0);
     }
@@ -585,6 +603,12 @@ fn main() -> Result<()> {
         });
     });
 
+    // One-time post-setup sign-in prompt, before the tray starts. The dialog blocks
+    // only this (main) thread; the engine just spawned keeps recording behind it.
+    if post_setup_run {
+        prompt_post_setup_signin(&auth_manager, &runtime);
+    }
+
     // Linux: listen for resume-from-suspend via logind and restart the recording fresh, so a
     // recording that straddled a sleep doesn't drift (keylog↔video re-zero). Primary signal;
     // the engine's wall-clock-gap check is the fallback. macOS uses its restart-on-unlock path;
@@ -750,6 +774,108 @@ fn reconcile_start_on_login(config: &mut Config) {
         Ok(_) => info!("Autostart reconciled (start_on_login={})", desired),
         Err(e) => warn!("Failed to reconcile autostart: {}", e),
     }
+}
+
+/// One-time Google sign-in prompt shown on the run right after a completed setup
+/// wizard (see `POST_SETUP_ENV`).
+///
+/// The wizard itself never mentions login, so without this the only sign-in
+/// affordance is the tray menu item and participants record indefinitely under an
+/// anonymous ID. Always skippable — a hard gate would strand users whose OAuth flow
+/// fails and dead-end builds compiled without a Google client ID (where
+/// `auth_manager` is `None` and no prompt appears at all) — and it never repeats:
+/// the tray item remains the ongoing affordance.
+fn prompt_post_setup_signin(
+    auth_manager: &Option<Arc<tokio::sync::Mutex<auth::AuthManager>>>,
+    runtime: &Arc<tokio::runtime::Runtime>,
+) {
+    let Some(auth) = auth_manager else {
+        info!("Post-setup sign-in prompt skipped: Google OAuth not configured in this build");
+        return;
+    };
+
+    let already_signed_in = runtime.block_on(async { auth.lock().await.is_authenticated() });
+    if already_signed_in {
+        return;
+    }
+
+    if !show_post_setup_signin_dialog() {
+        // On Linux no dialog is shown and the platform fn logs its own pointer.
+        #[cfg(not(target_os = "linux"))]
+        info!("User chose to continue anonymously; sign-in available anytime from the tray menu");
+        return;
+    }
+
+    info!("Post-setup prompt accepted: starting Google sign-in flow...");
+    // Same pattern as the tray's sign-in handler (ui/tray.rs handle_sign_in): run the
+    // OAuth flow (browser + blocking localhost callback) on a background thread so an
+    // abandoned login can never stall engine or tray startup.
+    let auth = auth.clone();
+    let rt = runtime.clone();
+    std::thread::spawn(move || {
+        let result = rt.block_on(async {
+            let mut mgr = auth.lock().await;
+            mgr.login().await
+        });
+        match result {
+            Ok(state) => {
+                info!("Post-setup sign-in successful: {}", state.email);
+                // Tell the tray loop to refresh its account display (the tray may
+                // already be running by the time the user finishes in the browser).
+                ui::notify_sign_in_completed();
+            }
+            Err(e) => {
+                error!(
+                    "Post-setup sign-in failed: {} (you can sign in later from the tray menu)",
+                    e
+                );
+            }
+        }
+    });
+}
+
+/// Show the post-setup sign-in dialog. Returns true if the user chose to sign in.
+/// Blocking modal NSAlert (see wizard_darwin.m); must run on the main thread, which
+/// is where `main` calls it (pre-tray).
+#[cfg(target_os = "macos")]
+fn show_post_setup_signin_dialog() -> bool {
+    extern "C" {
+        fn show_post_setup_signin_prompt() -> std::os::raw::c_int;
+    }
+    unsafe { show_post_setup_signin_prompt() == 1 }
+}
+
+/// Show the post-setup sign-in dialog. Returns true if the user chose to sign in.
+/// Plain MessageBoxW via nwg — no `nwg::init()` required. Native message boxes have
+/// fixed Yes/No button labels, so the sign-in-vs-anonymous meaning is carried by the
+/// message text (macOS gets real "Sign In" / "Continue Anonymously" buttons).
+#[cfg(target_os = "windows")]
+fn show_post_setup_signin_dialog() -> bool {
+    use native_windows_gui as nwg;
+    let choice = nwg::message(&nwg::MessageParams {
+        title: "Sign in to CrowdCast",
+        content: "Sign in with your Google account so your contributions are credited to you?\n\n\
+                  Yes: sign in now.\n\
+                  No: continue anonymously (recordings stay linked to a random ID only; \
+                  you can sign in any time from the tray icon).",
+        buttons: nwg::MessageButtons::YesNo,
+        icons: nwg::MessageIcons::Question,
+    });
+    choice == nwg::MessageChoice::Yes
+}
+
+/// Linux: no native dialog. GTK must never be initialized inside this libobs-owning
+/// process (libobs's Wayland path runs a GLib loop on the default main context — see
+/// the `--settings-panel-out` comment above), so a dialog would need the
+/// clean-subprocess dance, which is disproportionate for a one-time prompt. Log the
+/// pointer instead; the tray's "Sign in with Google" item is the affordance.
+#[cfg(target_os = "linux")]
+fn show_post_setup_signin_dialog() -> bool {
+    info!(
+        "Setup complete: recording anonymously. Sign in with Google from the tray menu \
+         to have your contributions credited to you"
+    );
+    false
 }
 
 fn print_help() {
