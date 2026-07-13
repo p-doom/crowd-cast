@@ -1476,8 +1476,8 @@ int show_post_setup_signin_prompt(void) {
     alert.messageText = @"Sign in to CrowdCast";
     alert.informativeText =
         @"Sign in with your Google account so your contributions are credited "
-         "to you — or continue anonymously, and your recordings stay linked to "
-         "a random ID only. You can sign in later from the menu-bar icon.";
+         "to you. Or continue anonymously: your recordings stay linked to a "
+         "random ID only. You can sign in later from the menu-bar icon.";
     alert.alertStyle = NSAlertStyleInformational;
     [alert addButtonWithTitle:@"Sign In"];  // first button = default (Return key)
     [alert addButtonWithTitle:@"Continue Anonymously"];

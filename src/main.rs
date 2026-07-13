@@ -806,7 +806,7 @@ fn prompt_post_setup_signin(
         return;
     }
 
-    info!("Post-setup prompt accepted — starting Google sign-in flow...");
+    info!("Post-setup prompt accepted: starting Google sign-in flow...");
     // Same pattern as the tray's sign-in handler (ui/tray.rs handle_sign_in): run the
     // OAuth flow (browser + blocking localhost callback) on a background thread so an
     // abandoned login can never stall engine or tray startup.
@@ -826,7 +826,7 @@ fn prompt_post_setup_signin(
             }
             Err(e) => {
                 error!(
-                    "Post-setup sign-in failed: {} — you can sign in later from the tray menu",
+                    "Post-setup sign-in failed: {} (you can sign in later from the tray menu)",
                     e
                 );
             }
@@ -855,8 +855,8 @@ fn show_post_setup_signin_dialog() -> bool {
     let choice = nwg::message(&nwg::MessageParams {
         title: "Sign in to CrowdCast",
         content: "Sign in with your Google account so your contributions are credited to you?\n\n\
-                  Yes — sign in now.\n\
-                  No — continue anonymously (recordings stay linked to a random ID only; \
+                  Yes: sign in now.\n\
+                  No: continue anonymously (recordings stay linked to a random ID only; \
                   you can sign in any time from the tray icon).",
         buttons: nwg::MessageButtons::YesNo,
         icons: nwg::MessageIcons::Question,
@@ -872,7 +872,7 @@ fn show_post_setup_signin_dialog() -> bool {
 #[cfg(target_os = "linux")]
 fn show_post_setup_signin_dialog() -> bool {
     info!(
-        "Setup complete — recording anonymously. Sign in with Google from the tray menu \
+        "Setup complete: recording anonymously. Sign in with Google from the tray menu \
          to have your contributions credited to you"
     );
     false
