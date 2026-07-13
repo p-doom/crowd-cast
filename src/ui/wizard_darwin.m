@@ -1476,10 +1476,11 @@ int show_post_setup_signin_prompt(void) {
     alert.messageText = @"Sign in to CrowdCast";
     alert.informativeText =
         @"Sign in with your Google account so your contributions are credited "
-         "to you. You can also do this later from the menu-bar icon.";
+         "to you — or continue anonymously, and your recordings stay linked to "
+         "a random ID only. You can sign in later from the menu-bar icon.";
     alert.alertStyle = NSAlertStyleInformational;
     [alert addButtonWithTitle:@"Sign In"];  // first button = default (Return key)
-    [alert addButtonWithTitle:@"Skip for Now"];
+    [alert addButtonWithTitle:@"Continue Anonymously"];
 
     // Float above other windows -- the agent has no regular windows of its own.
     alert.window.level = NSFloatingWindowLevel;

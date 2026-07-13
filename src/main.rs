@@ -802,7 +802,7 @@ fn prompt_post_setup_signin(
     if !show_post_setup_signin_dialog() {
         // On Linux no dialog is shown and the platform fn logs its own pointer.
         #[cfg(not(target_os = "linux"))]
-        info!("Post-setup sign-in skipped by user; available anytime from the tray menu");
+        info!("User chose to continue anonymously; sign-in available anytime from the tray menu");
         return;
     }
 
@@ -846,14 +846,18 @@ fn show_post_setup_signin_dialog() -> bool {
 }
 
 /// Show the post-setup sign-in dialog. Returns true if the user chose to sign in.
-/// Plain MessageBoxW via nwg — no `nwg::init()` required.
+/// Plain MessageBoxW via nwg — no `nwg::init()` required. Native message boxes have
+/// fixed Yes/No button labels, so the sign-in-vs-anonymous meaning is carried by the
+/// message text (macOS gets real "Sign In" / "Continue Anonymously" buttons).
 #[cfg(target_os = "windows")]
 fn show_post_setup_signin_dialog() -> bool {
     use native_windows_gui as nwg;
     let choice = nwg::message(&nwg::MessageParams {
         title: "Sign in to CrowdCast",
-        content: "Sign in with your Google account so your contributions are credited to you.\n\n\
-                  Choose \"No\" to skip — you can sign in any time from the tray icon.",
+        content: "Sign in with your Google account so your contributions are credited to you?\n\n\
+                  Yes — sign in now.\n\
+                  No — continue anonymously (recordings stay linked to a random ID only; \
+                  you can sign in any time from the tray icon).",
         buttons: nwg::MessageButtons::YesNo,
         icons: nwg::MessageIcons::Question,
     });
@@ -868,8 +872,8 @@ fn show_post_setup_signin_dialog() -> bool {
 #[cfg(target_os = "linux")]
 fn show_post_setup_signin_dialog() -> bool {
     info!(
-        "Setup complete — sign in with Google from the tray menu so your contributions \
-         are credited to you"
+        "Setup complete — recording anonymously. Sign in with Google from the tray menu \
+         to have your contributions credited to you"
     );
     false
 }
