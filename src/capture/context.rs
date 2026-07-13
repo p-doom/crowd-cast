@@ -1290,6 +1290,21 @@ impl CaptureContext {
         self.active_capture_app.as_deref()
     }
 
+    /// The capture mode this context routes to, mirroring `setup_capture` exactly:
+    /// "single_active_app" (follow-focus per-app), "display" (full-screen display
+    /// capture; no target apps), or "multi_source_app" (legacy multi-source per-app).
+    /// Uses `use_single_active_app_capture()` rather than raw config because that
+    /// method includes the platform-capability gate.
+    pub fn capture_mode(&self) -> &'static str {
+        if self.use_single_active_app_capture() {
+            "single_active_app"
+        } else if self.target_apps.is_empty() {
+            "display"
+        } else {
+            "multi_source_app"
+        }
+    }
+
     /// Check if an app needs a scene created (wasn't running at startup).
     pub fn needs_scene_for_app(&self, bundle_id: &str) -> bool {
         let canonical = Self::canonical_app_id(bundle_id);

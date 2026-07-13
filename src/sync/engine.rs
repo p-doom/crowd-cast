@@ -1726,6 +1726,8 @@ unintended app video."
                 timestamp_utc: utc_now,
                 active_display,
                 displays,
+                platform: std::env::consts::OS.to_string(),
+                capture_mode: self.capture_ctx.capture_mode().to_string(),
             }),
         });
     }
