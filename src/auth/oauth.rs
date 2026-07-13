@@ -289,11 +289,64 @@ impl AuthManager {
         let code =
             extract_query_param(path, "code").context("No 'code' parameter in OAuth callback")?;
 
-        // Send a success response to the browser
-        let html = r#"<html><body style="font-family:system-ui;text-align:center;padding-top:80px;">
-            <h2>Signed in successfully!</h2>
-            <p>You can close this tab and return to CrowdCast.</p>
-            </body></html>"#;
+        // Send a success page to the browser: a black-and-white confirmation card
+        // matching pdoom.org's styling, with opt-in links onward (dashboard, docs)
+        // rather than a redirect. Must be fully self-contained (inline CSS, no
+        // external assets): it is served once over this throwaway localhost socket.
+        let html = r##"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>crowd-cast &mdash; signed in</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #fff; --fg: #000; --muted: #999;
+    --accent: #000; --accent-fg: #fff; --border: #eee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000; --fg: #fff; --muted: #999;
+      --accent: #fff; --accent-fg: #000; --border: #333;
+    }
+  }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    display: flex; align-items: center; justify-content: center; min-height: 100vh;
+  }
+  .card {
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 44px 48px; max-width: 380px; text-align: center;
+  }
+  .check {
+    width: 52px; height: 52px; border-radius: 50%; background: var(--accent);
+    color: var(--accent-fg); font-size: 28px; line-height: 52px; margin: 0 auto 20px;
+  }
+  .name { font-family: 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace; }
+  h1 { font-size: 20px; margin: 0 0 8px; font-weight: 600; }
+  p  { font-size: 14px; color: var(--muted); margin: 0 0 26px; line-height: 1.5; }
+  .btn {
+    display: block; background: var(--accent); color: var(--accent-fg);
+    text-decoration: none; font-size: 14px; font-weight: 600;
+    padding: 12px 0; border-radius: 8px; margin-bottom: 14px;
+  }
+  .links { font-size: 13px; }
+  .links a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--border); }
+  .close { font-size: 12px; color: var(--muted); margin-top: 22px; margin-bottom: 0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">&#10003;</div>
+    <h1>Signed in to <span class="name">crowd-cast</span></h1>
+    <p>Your contributions are now linked to you.</p>
+    <a class="btn" href="https://pdoom.org/crowd_cast_dashboard.html">View contributions</a>
+    <div class="links"><a href="https://pdoom.org/docs/crowd-cast/">Read the docs</a></div>
+    <p class="close">You can close this tab and return to crowd-cast.</p>
+  </div>
+</body>
+</html>"##;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
             html.len(),
