@@ -3581,11 +3581,13 @@ unintended app video."
 
     /// Poll the frontmost application and update capture state
     async fn poll_frontmost_app(&mut self) {
-        // Ignore the agent's own window being foreground (e.g. the user opened the
-        // tray menu, which on Windows makes the agent the foreground window). That
-        // isn't the user leaving their tracked app, so don't switch capture off or
-        // flip the status to "not capturing" while interacting with the tray; keep
-        // the current capture state until a real app is frontmost again.
+        // Ignore the agent's own app being frontmost (our Settings/wizard window
+        // has focus): that's the user in our UI, not leaving their tracked app,
+        // so hold the poll's capture/status state. Windows tray and menu clicks
+        // never reach here: the provider masks our hidden tray window and keeps
+        // reporting the previous app (filter_self in frontmost.rs), which also
+        // protects the frontmost_capture_state callers that bypass this poll
+        // guard (segment rotation, recording start/resume, app switches).
         if get_frontmost_app()
             .map(|a| crate::config::is_agent_self(&a.bundle_id))
             .unwrap_or(false)
