@@ -282,58 +282,105 @@ fn get_frontmost_app_x11() -> Option<AppInfo> {
 #[cfg(target_os = "windows")]
 static LAST_NON_SELF: std::sync::Mutex<Option<AppInfo>> = std::sync::Mutex::new(None);
 
+/// Window classes of the shell's taskbar / tray surfaces. Focusing these is
+/// part of interacting with the tray, not leaving the tracked app: on Windows
+/// 11 a NEW tray icon lives in the hidden-icons overflow by default, and
+/// opening that flyout foregrounds explorer's
+/// `TopLevelWindowForOverflowXamlIsland` before our icon can even be clicked.
+/// That flipped the status to "no capture sources" ahead of the menu, so the
+/// self-masking alone still showed the issue #118 symptom whenever the icon
+/// sat in the overflow. Dismissing the flyout lands focus on `Shell_TrayWnd`
+/// (measured), `NotifyIconOverflowWindow` is the Windows 10 overflow, and
+/// `Shell_SecondaryTrayWnd` is the taskbar on secondary monitors.
+#[cfg(target_os = "windows")]
+const TRAY_SHELL_CLASSES: [&str; 4] = [
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "NotifyIconOverflowWindow",
+    "TopLevelWindowForOverflowXamlIsland",
+];
+
+/// Traits of the current foreground window that decide masking, resolved
+/// alongside the owning app.
+#[cfg(target_os = "windows")]
+struct ForegroundTraits {
+    /// IsWindowVisible: separates our hidden tray event window from our real
+    /// windows (Settings panel, wizard).
+    visible: bool,
+    /// The window is one of the shell's taskbar / tray-overflow surfaces
+    /// (TRAY_SHELL_CLASSES).
+    tray_shell: bool,
+}
+
 #[cfg(target_os = "windows")]
 fn get_frontmost_app_windows() -> Option<AppInfo> {
-    let (current, foreground_visible) = match resolve_foreground_app() {
-        Some((app, visible)) => (Some(app), visible),
-        None => (None, false),
+    let (current, traits) = match resolve_foreground_app() {
+        Some((app, traits)) => (Some(app), traits),
+        None => (
+            None,
+            ForegroundTraits {
+                visible: false,
+                tray_shell: false,
+            },
+        ),
     };
     let mut last = LAST_NON_SELF
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    filter_self(current, std::process::id(), foreground_visible, &mut last)
+    filter_self(current, std::process::id(), &traits, &mut last)
 }
 
-/// Mask tray and menu interactions as "no change" so status, capture target,
-/// and keylog context hold steady, while the agent's real windows still report
-/// truthfully.
+/// Mask tray interactions as "no change" so status, capture target, and keylog
+/// context hold steady, while the agent's real windows still report truthfully.
 ///
-/// The distinction is the foreground window's visibility. tray-icon creates its
-/// event window without WS_VISIBLE and never shows it, and muda calls
-/// SetForegroundWindow on exactly that hidden window to display the tray menu
-/// (the standard TrackPopupMenu pattern). So:
+/// Three foreground cases are masked to the remembered last non-tray app:
 ///
-/// - Our PID + an INVISIBLE window: the user is on the tray icon or its menu.
-///   Report the remembered last non-self app; a transient interaction with the
-///   tray must not read as leaving the tracked app. Accepted trade-off: input
-///   made while the menu is open is attributed to the previous app. That is a
-///   few seconds of menu clicks; attributing it to crowd-cast is what caused
-///   the false status flip.
+/// - Our PID + an INVISIBLE window: the user is on our tray icon or its menu.
+///   tray-icon creates its event window without WS_VISIBLE and muda calls
+///   SetForegroundWindow on exactly that hidden window to display the menu
+///   (the standard TrackPopupMenu pattern).
+/// - The shell's taskbar / tray-overflow surfaces (TRAY_SHELL_CLASSES): these
+///   belong to explorer, and reaching an overflow-hidden tray icon (the
+///   Windows 11 default placement for new icons) foregrounds them before and
+///   after our menu. Without masking them, checking the status still flips the
+///   status whenever the icon is in the overflow.
+///
+/// Not masked:
+///
 /// - Our PID + a VISIBLE window (Settings panel, setup wizard, update dialog):
 ///   report ourselves. These can hold focus for minutes, and the config-level
 ///   self-exclusion deliberately keeps the agent's own UI out of the dataset
 ///   (capture off, UNCAPTURED context). Masking here would silently attribute
 ///   minutes of our own UI's input to the previous app.
-/// - Matches on PID, not exe name: an exe-name match would also swallow other
-///   crowd-cast processes (e.g. a second instance) and is spoofable by any
-///   unrelated binary with the same name.
-/// - Reports `None` if we are foreground before any other app was ever resolved
-///   (tray clicked right after launch): the engine already treats a `None`
-///   frontmost as unknown, same as a failed resolution today.
+///
+/// Details:
+///
+/// - Self is matched on PID, not exe name: an exe-name match would also swallow
+///   other crowd-cast processes (e.g. a second instance) and is spoofable by
+///   any unrelated binary with the same name.
+/// - Reports `None` when masked before any other app was ever resolved (tray
+///   clicked right after launch): the engine already treats a `None` frontmost
+///   as unknown, same as a failed resolution today.
 /// - A failed resolution (`current == None`) keeps the memory: a transient
 ///   provider failure shouldn't erase what we knew.
+/// - Accepted trade-off: input made while the menu / overflow is open is
+///   attributed to the previous app. That is a few seconds of tray clicks;
+///   attributing it to crowd-cast or explorer is what caused the false flip.
 #[cfg(target_os = "windows")]
 fn filter_self(
     current: Option<AppInfo>,
     own_pid: u32,
-    foreground_visible: bool,
+    traits: &ForegroundTraits,
     last: &mut Option<AppInfo>,
 ) -> Option<AppInfo> {
     match current {
-        Some(app) if app.pid == own_pid && !foreground_visible => last.clone(),
+        Some(app) if app.pid == own_pid && !traits.visible => last.clone(),
         // A visible window of ours: report self; deliberately do NOT store it in
-        // `last`, which must only ever hold non-self apps.
+        // `last`, which must only ever hold non-self, non-tray apps.
         Some(app) if app.pid == own_pid => Some(app),
+        // Taskbar / tray-overflow surface: transient tray interaction, hold the
+        // previous app (and keep it out of `last`).
+        Some(_) if traits.tray_shell => last.clone(),
         Some(app) => {
             *last = Some(app.clone());
             Some(app)
@@ -343,11 +390,11 @@ fn filter_self(
 }
 
 /// Resolve the foreground window's owning application (this process included)
-/// and whether that window is visible. Self-masking happens in the caller via
-/// `filter_self`, which uses the visibility to tell the hidden tray/menu window
-/// apart from real agent windows.
+/// plus the traits `filter_self` masks on: visibility (our hidden tray/menu
+/// window vs. our real windows) and whether the window is one of the shell's
+/// tray surfaces.
 #[cfg(target_os = "windows")]
-fn resolve_foreground_app() -> Option<(AppInfo, bool)> {
+fn resolve_foreground_app() -> Option<(AppInfo, ForegroundTraits)> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -356,6 +403,7 @@ fn resolve_foreground_app() -> Option<(AppInfo, bool)> {
         fn GetForegroundWindow() -> *mut std::ffi::c_void;
         fn GetWindowThreadProcessId(hwnd: *mut std::ffi::c_void, process_id: *mut u32) -> u32;
         fn IsWindowVisible(hwnd: *mut std::ffi::c_void) -> i32;
+        fn GetClassNameW(hwnd: *mut std::ffi::c_void, buffer: *mut u16, max_count: i32) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -379,6 +427,13 @@ fn resolve_foreground_app() -> Option<(AppInfo, bool)> {
         }
 
         let visible = IsWindowVisible(hwnd) != 0;
+
+        let mut class_buf = [0u16; 128];
+        let class_len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32);
+        let tray_shell = class_len > 0 && {
+            let class = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+            TRAY_SHELL_CLASSES.iter().any(|c| class == *c)
+        };
 
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
@@ -420,7 +475,10 @@ fn resolve_foreground_app() -> Option<(AppInfo, bool)> {
                 name,
                 pid,
             },
-            visible,
+            ForegroundTraits {
+                visible,
+                tray_shell,
+            },
         ))
     }
 }
@@ -445,8 +503,21 @@ mod filter_self_tests {
     use super::*;
 
     const OWN_PID: u32 = 4242;
-    const HIDDEN: bool = false;
-    const VISIBLE: bool = true;
+    /// Our hidden tray event window (tray icon / menu focus).
+    const OWN_HIDDEN: ForegroundTraits = ForegroundTraits {
+        visible: false,
+        tray_shell: false,
+    };
+    /// A normal visible window (ours or another app's).
+    const PLAIN_VISIBLE: ForegroundTraits = ForegroundTraits {
+        visible: true,
+        tray_shell: false,
+    };
+    /// The shell's taskbar / tray-overflow surface (explorer's, visible).
+    const TRAY_SHELL: ForegroundTraits = ForegroundTraits {
+        visible: true,
+        tray_shell: true,
+    };
 
     fn app(stem: &str, pid: u32) -> AppInfo {
         AppInfo {
@@ -461,7 +532,7 @@ mod filter_self_tests {
         let mut last = None;
         let firefox = app("firefox", 100);
         assert_eq!(
-            filter_self(Some(firefox.clone()), OWN_PID, VISIBLE, &mut last),
+            filter_self(Some(firefox.clone()), OWN_PID, &PLAIN_VISIBLE, &mut last),
             Some(firefox.clone())
         );
         assert_eq!(last, Some(firefox));
@@ -474,7 +545,7 @@ mod filter_self_tests {
         let mut last = Some(firefox.clone());
         let ours = app("crowd-cast-agent", OWN_PID);
         assert_eq!(
-            filter_self(Some(ours), OWN_PID, HIDDEN, &mut last),
+            filter_self(Some(ours), OWN_PID, &OWN_HIDDEN, &mut last),
             Some(firefox.clone())
         );
         // The memory must survive the masked read so a held-open menu keeps
@@ -491,7 +562,7 @@ mod filter_self_tests {
         let mut last = Some(firefox.clone());
         let ours = app("crowd-cast-agent", OWN_PID);
         assert_eq!(
-            filter_self(Some(ours.clone()), OWN_PID, VISIBLE, &mut last),
+            filter_self(Some(ours.clone()), OWN_PID, &PLAIN_VISIBLE, &mut last),
             Some(ours)
         );
         // `last` must never hold a self entry.
@@ -499,10 +570,46 @@ mod filter_self_tests {
     }
 
     #[test]
+    fn tray_shell_surface_reports_the_previous_app() {
+        // The overflow flyout / taskbar case: explorer's tray surface has
+        // focus (the default route to a fresh install's tray icon).
+        let firefox = app("firefox", 100);
+        let mut last = Some(firefox.clone());
+        let shell = app("explorer", 616);
+        assert_eq!(
+            filter_self(Some(shell), OWN_PID, &TRAY_SHELL, &mut last),
+            Some(firefox.clone())
+        );
+        // explorer's tray surface must not overwrite the remembered app.
+        assert_eq!(last, Some(firefox));
+    }
+
+    #[test]
+    fn tray_shell_before_any_app_reports_none() {
+        let mut last = None;
+        let shell = app("explorer", 616);
+        assert_eq!(filter_self(Some(shell), OWN_PID, &TRAY_SHELL, &mut last), None);
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn explorer_file_window_is_not_masked() {
+        // A real File Explorer window (class CabinetWClass, not a tray
+        // surface) is a normal untracked app and must pass through.
+        let mut last = Some(app("firefox", 100));
+        let explorer = app("explorer", 616);
+        assert_eq!(
+            filter_self(Some(explorer.clone()), OWN_PID, &PLAIN_VISIBLE, &mut last),
+            Some(explorer.clone())
+        );
+        assert_eq!(last, Some(explorer));
+    }
+
+    #[test]
     fn self_hidden_window_before_any_app_reports_none() {
         let mut last = None;
         let ours = app("crowd-cast-agent", OWN_PID);
-        assert_eq!(filter_self(Some(ours), OWN_PID, HIDDEN, &mut last), None);
+        assert_eq!(filter_self(Some(ours), OWN_PID, &OWN_HIDDEN, &mut last), None);
         assert_eq!(last, None);
     }
 
@@ -510,7 +617,7 @@ mod filter_self_tests {
     fn failed_resolution_reports_none_but_keeps_memory() {
         let firefox = app("firefox", 100);
         let mut last = Some(firefox.clone());
-        assert_eq!(filter_self(None, OWN_PID, HIDDEN, &mut last), None);
+        assert_eq!(filter_self(None, OWN_PID, &OWN_HIDDEN, &mut last), None);
         assert_eq!(last, Some(firefox));
     }
 
@@ -521,7 +628,7 @@ mod filter_self_tests {
         let mut last = Some(app("firefox", 100));
         let other = app("crowd-cast-agent", 9999);
         assert_eq!(
-            filter_self(Some(other.clone()), OWN_PID, HIDDEN, &mut last),
+            filter_self(Some(other.clone()), OWN_PID, &PLAIN_VISIBLE, &mut last),
             Some(other.clone())
         );
         assert_eq!(last, Some(other));
