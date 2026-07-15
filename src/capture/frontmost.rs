@@ -268,8 +268,86 @@ fn get_frontmost_app_x11() -> Option<AppInfo> {
 // Windows Implementation
 // ============================================================================
 
+/// Last app reported for a foreground window not owned by this process.
+///
+/// Clicking the crowd-cast tray icon or opening its menu makes THIS process the
+/// foreground window on Windows (unlike macOS status items and Linux SNI menus,
+/// which don't take focus). Reporting ourselves reads downstream as the user
+/// leaving their tracked app: the status flips to "no capture sources" and the
+/// video blanks, so the act of checking the status corrupts the status
+/// (issue #118). Remembering the previous app lets the provider report
+/// "no change" instead. A Mutex rather than a thread_local because the engine
+/// poll and the startup/context paths call in from different threads and must
+/// share this memory.
+#[cfg(target_os = "windows")]
+static LAST_NON_SELF: std::sync::Mutex<Option<AppInfo>> = std::sync::Mutex::new(None);
+
 #[cfg(target_os = "windows")]
 fn get_frontmost_app_windows() -> Option<AppInfo> {
+    let (current, foreground_visible) = match resolve_foreground_app() {
+        Some((app, visible)) => (Some(app), visible),
+        None => (None, false),
+    };
+    let mut last = LAST_NON_SELF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    filter_self(current, std::process::id(), foreground_visible, &mut last)
+}
+
+/// Mask tray and menu interactions as "no change" so status, capture target,
+/// and keylog context hold steady, while the agent's real windows still report
+/// truthfully.
+///
+/// The distinction is the foreground window's visibility. tray-icon creates its
+/// event window without WS_VISIBLE and never shows it, and muda calls
+/// SetForegroundWindow on exactly that hidden window to display the tray menu
+/// (the standard TrackPopupMenu pattern). So:
+///
+/// - Our PID + an INVISIBLE window: the user is on the tray icon or its menu.
+///   Report the remembered last non-self app; a transient interaction with the
+///   tray must not read as leaving the tracked app. Accepted trade-off: input
+///   made while the menu is open is attributed to the previous app. That is a
+///   few seconds of menu clicks; attributing it to crowd-cast is what caused
+///   the false status flip.
+/// - Our PID + a VISIBLE window (Settings panel, setup wizard, update dialog):
+///   report ourselves. These can hold focus for minutes, and the config-level
+///   self-exclusion deliberately keeps the agent's own UI out of the dataset
+///   (capture off, UNCAPTURED context). Masking here would silently attribute
+///   minutes of our own UI's input to the previous app.
+/// - Matches on PID, not exe name: an exe-name match would also swallow other
+///   crowd-cast processes (e.g. a second instance) and is spoofable by any
+///   unrelated binary with the same name.
+/// - Reports `None` if we are foreground before any other app was ever resolved
+///   (tray clicked right after launch): the engine already treats a `None`
+///   frontmost as unknown, same as a failed resolution today.
+/// - A failed resolution (`current == None`) keeps the memory: a transient
+///   provider failure shouldn't erase what we knew.
+#[cfg(target_os = "windows")]
+fn filter_self(
+    current: Option<AppInfo>,
+    own_pid: u32,
+    foreground_visible: bool,
+    last: &mut Option<AppInfo>,
+) -> Option<AppInfo> {
+    match current {
+        Some(app) if app.pid == own_pid && !foreground_visible => last.clone(),
+        // A visible window of ours: report self; deliberately do NOT store it in
+        // `last`, which must only ever hold non-self apps.
+        Some(app) if app.pid == own_pid => Some(app),
+        Some(app) => {
+            *last = Some(app.clone());
+            Some(app)
+        }
+        None => None,
+    }
+}
+
+/// Resolve the foreground window's owning application (this process included)
+/// and whether that window is visible. Self-masking happens in the caller via
+/// `filter_self`, which uses the visibility to tell the hidden tray/menu window
+/// apart from real agent windows.
+#[cfg(target_os = "windows")]
+fn resolve_foreground_app() -> Option<(AppInfo, bool)> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -277,6 +355,7 @@ fn get_frontmost_app_windows() -> Option<AppInfo> {
     extern "system" {
         fn GetForegroundWindow() -> *mut std::ffi::c_void;
         fn GetWindowThreadProcessId(hwnd: *mut std::ffi::c_void, process_id: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: *mut std::ffi::c_void) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -298,6 +377,8 @@ fn get_frontmost_app_windows() -> Option<AppInfo> {
         if hwnd.is_null() {
             return None;
         }
+
+        let visible = IsWindowVisible(hwnd) != 0;
 
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
@@ -333,11 +414,14 @@ fn get_frontmost_app_windows() -> Option<AppInfo> {
         // case-insensitive: Windows reports the on-disk case (e.g. "Notepad")
         // which users can't reliably predict when configuring target_apps.
         // `name` keeps the original case for display.
-        Some(AppInfo {
-            bundle_id: name.to_ascii_lowercase(),
-            name,
-            pid,
-        })
+        Some((
+            AppInfo {
+                bundle_id: name.to_ascii_lowercase(),
+                name,
+                pid,
+            },
+            visible,
+        ))
     }
 }
 
@@ -353,5 +437,93 @@ mod tests {
             assert!(!app.bundle_id.is_empty());
             assert!(!app.name.is_empty());
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod filter_self_tests {
+    use super::*;
+
+    const OWN_PID: u32 = 4242;
+    const HIDDEN: bool = false;
+    const VISIBLE: bool = true;
+
+    fn app(stem: &str, pid: u32) -> AppInfo {
+        AppInfo {
+            bundle_id: stem.to_ascii_lowercase(),
+            name: stem.to_string(),
+            pid,
+        }
+    }
+
+    #[test]
+    fn non_self_app_passes_through_and_is_remembered() {
+        let mut last = None;
+        let firefox = app("firefox", 100);
+        assert_eq!(
+            filter_self(Some(firefox.clone()), OWN_PID, VISIBLE, &mut last),
+            Some(firefox.clone())
+        );
+        assert_eq!(last, Some(firefox));
+    }
+
+    #[test]
+    fn self_hidden_window_reports_the_previous_app() {
+        // The tray/menu case: our hidden event window has focus.
+        let firefox = app("firefox", 100);
+        let mut last = Some(firefox.clone());
+        let ours = app("crowd-cast-agent", OWN_PID);
+        assert_eq!(
+            filter_self(Some(ours), OWN_PID, HIDDEN, &mut last),
+            Some(firefox.clone())
+        );
+        // The memory must survive the masked read so a held-open menu keeps
+        // reporting the same app across many polls.
+        assert_eq!(last, Some(firefox));
+    }
+
+    #[test]
+    fn self_visible_window_reports_self_and_keeps_memory() {
+        // The Settings panel / wizard case: a real window of ours has focus.
+        // Reporting self lets the config-level self-exclusion keep our own UI's
+        // input out of the dataset instead of misattributing it.
+        let firefox = app("firefox", 100);
+        let mut last = Some(firefox.clone());
+        let ours = app("crowd-cast-agent", OWN_PID);
+        assert_eq!(
+            filter_self(Some(ours.clone()), OWN_PID, VISIBLE, &mut last),
+            Some(ours)
+        );
+        // `last` must never hold a self entry.
+        assert_eq!(last, Some(firefox));
+    }
+
+    #[test]
+    fn self_hidden_window_before_any_app_reports_none() {
+        let mut last = None;
+        let ours = app("crowd-cast-agent", OWN_PID);
+        assert_eq!(filter_self(Some(ours), OWN_PID, HIDDEN, &mut last), None);
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn failed_resolution_reports_none_but_keeps_memory() {
+        let firefox = app("firefox", 100);
+        let mut last = Some(firefox.clone());
+        assert_eq!(filter_self(None, OWN_PID, HIDDEN, &mut last), None);
+        assert_eq!(last, Some(firefox));
+    }
+
+    #[test]
+    fn other_process_with_our_exe_name_is_not_masked() {
+        // Identity is the PID: a second crowd-cast instance (or an unrelated
+        // binary named like our exe) must be reported, not swallowed.
+        let mut last = Some(app("firefox", 100));
+        let other = app("crowd-cast-agent", 9999);
+        assert_eq!(
+            filter_self(Some(other.clone()), OWN_PID, HIDDEN, &mut last),
+            Some(other.clone())
+        );
+        assert_eq!(last, Some(other));
     }
 }
