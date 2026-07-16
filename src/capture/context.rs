@@ -293,11 +293,12 @@ impl CaptureContext {
     /// Compute the recording canvas (base) and encoded output dimensions.
     ///
     /// On Windows the canvas is the bounding box of all monitors, each normalized
-    /// to a 1080px shortest edge (so a window's monitor-level scale renders it at a
-    /// consistent resolution regardless of orientation); the output equals the
-    /// canvas since it is already in 1080-short-edge space. On Linux in single-active
-    /// per-app mode the canvas is the multi-monitor 1080-short-edge envelope (see
-    /// [`super::monitor_layout`]). On macOS (and as a fallback) the canvas is the main
+    /// to a 1080px shortest edge, and the output equals the canvas (uncapped — which is
+    /// why short-edge is harmless there: a portrait monitor just makes a taller canvas).
+    /// On Linux in single-active per-app mode the canvas is the multi-monitor
+    /// 1080px-HEIGHT envelope (see [`super::monitor_layout`]) and the output is capped at
+    /// `max_output_height` — height normalization keeps the cap from ever engaging.
+    /// On macOS (multi-monitor mode) likewise; as a fallback the canvas is the main
     /// display and the output is downscaled to `max_output_height`.
     fn canvas_and_output_dimensions(&self) -> ((u32, u32), (u32, u32)) {
         #[cfg(target_os = "windows")]
@@ -309,7 +310,7 @@ impl CaptureContext {
             warn!("Could not enumerate monitors for canvas sizing; falling back to primary display");
         }
 
-        // Linux single-active per-app mode: the multi-monitor 1080-short-edge envelope, so a
+        // Linux single-active per-app mode: the multi-monitor 1080-height envelope, so a
         // window on any monitor fits its normalized slot. Falls through to display resolution
         // if monitor enumeration fails.
         #[cfg(target_os = "linux")]
@@ -327,7 +328,7 @@ impl CaptureContext {
         }
 
         // macOS multi-monitor mode: the per-axis-max envelope of every display, each normalized
-        // to a 1080px short edge (PIXELS — SCK reports backing pixels; see mac_geometry). Gated on
+        // to a 1080px HEIGHT (PIXELS — SCK reports backing pixels; see mac_geometry). Gated on
         // the kill-switch flag AND single-active-app mode — matching the Linux gate and the
         // apply_monitor_fit_to_active gate — because only the single-active path applies the
         // compensating per-source transform (scale=norm). Display-capture / non-single-active
