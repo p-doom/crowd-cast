@@ -106,7 +106,7 @@ pub fn x11_screen_size() -> Option<(u32, u32)> {
 /// `GetMonitors` — used for the multi-monitor capture-canvas envelope and for resolving which
 /// monitor a captured window sits on (`monitor_layout`). `x11_screen_size` is the union
 /// bounding box of all monitors (one X screen spans them all), so it can't drive the per-monitor
-/// 1080-short-edge normalization; this can. `None` if RandR is unavailable or reports no active
+/// 1080-height normalization; this can. `None` if RandR is unavailable or reports no active
 /// monitor, so the caller fails closed rather than guessing.
 pub fn x11_monitor_rects() -> Option<Vec<(i32, i32, i32, i32)>> {
     use x11rb::protocol::randr::ConnectionExt as _;

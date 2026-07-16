@@ -1462,8 +1462,9 @@ impl CaptureContext {
     }
 
     /// Multi-monitor per-app placement: draw the active app's captured window at its real
-    /// on-monitor position, scaled by its monitor's 1080-short-edge normalization (4K window
-    /// 0.5×, FHD 1.0×, ultrawide 0.75×, …), matching the Windows behaviour. Window + monitor
+    /// on-monitor position, scaled by its monitor's 1080-HEIGHT normalization (4K window
+    /// 0.5×, FHD 1.0×, ultrawide 0.75×, …; see monitor_layout.rs — Windows uses short-edge
+    /// because its output is uncapped). Window + monitor
     /// geometry comes from the GNOME focus extension (logical coords) or X11/RandR (physical);
     /// the scene scale is derived from the captured buffer size, so HiDPI / fractional scaling
     /// needs no trusted scale factor. De-duped via `last_monitor_fit`; a no-op until the source

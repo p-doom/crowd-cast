@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn envelope_takes_per_axis_max_not_area() {
         // 4K (8.29 MP, normalizes to 1920x1080) + 32:9 ultrawide 5120x1440 (7.37 MP, smaller
-        // area but wider: short edge 1440 -> ×0.75 -> 3840x1080). Canvas must be wide enough for
+        // area but wider: height 1440 -> ×0.75 -> 3840x1080). Canvas must be wide enough for
         // the ultrawide AND tall enough for the 4K — per-axis max, not the largest by area.
         let c =
             normalized_canvas(&[Rect::new(0, 0, 3840, 2160), Rect::new(0, 0, 5120, 1440)]).unwrap();

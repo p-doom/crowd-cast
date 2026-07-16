@@ -63,8 +63,10 @@ impl DisplayMonitor {
     }
 
     /// PIXEL dimensions for each display id, in the same order. `(0, 0)` when a display's
-    /// mode is momentarily unreadable — a flap to/from the sentinel emits a (harmless,
-    /// idempotent) extra reinit rather than being silently swallowed.
+    /// mode is momentarily unreadable — a flap to/from the sentinel emits an extra reinit
+    /// rather than being silently swallowed. While recording that costs two segment
+    /// boundaries (stop/start), which is acceptable: mode reads only realistically fail
+    /// during display-config changes, where a reinit is wanted anyway.
     fn get_display_dims(ids: &[u32]) -> Vec<(u32, u32)> {
         ids.iter()
             .map(|&id| super::mac_geometry::display_pixel_size(id).unwrap_or((0, 0)))
