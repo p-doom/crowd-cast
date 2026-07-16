@@ -677,6 +677,9 @@ pub struct SyncEngine {
     pending_app_switch: Option<PendingAppSwitch>,
     /// Pending active-source readiness watchdog
     pending_capture_watchdog: Option<PendingCaptureWatchdog>,
+    /// Last time the macOS canvas convergence check ran (throttled to ~1s).
+    #[cfg(target_os = "macos")]
+    last_canvas_convergence_check: Option<std::time::Instant>,
     /// Segment rotation timer — fires every `segment_duration_secs` to split
     /// the recording into manageable chunks. Stored as a struct field so that
     /// every code path that starts/stops recording (including display recovery)
@@ -827,6 +830,8 @@ unintended app video."
             capture_watchdog_timeout,
             pending_app_switch: None,
             pending_capture_watchdog: None,
+            #[cfg(target_os = "macos")]
+            last_canvas_convergence_check: None,
             segment_timer: None,
             pending_input_transition: None,
             last_emitted_context: None,
@@ -3386,6 +3391,37 @@ unintended app video."
     async fn check_display_changes(&mut self) {
         // Check if display configuration changed (macOS only, no-op on other platforms)
         let Some(event) = self.display_monitor.check_for_changes() else {
+            // No change event — but verify the canvas still matches the live display set.
+            // Change detection compares against its own last snapshot; if that snapshot and
+            // the canvas were built from mode reads taken at different instants during
+            // display-attach flux (observed live: a monitor reattaching mid-rotation), the
+            // canvas is wrong while the detector sees "no change" forever. Converge instead
+            // of trusting history. Throttled to ~1s; skipped mid-reinit windows by the same
+            // settle-gated reinit path it triggers.
+            #[cfg(target_os = "macos")]
+            {
+                let now = std::time::Instant::now();
+                let due = self
+                    .last_canvas_convergence_check
+                    .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if due {
+                    self.last_canvas_convergence_check = Some(now);
+                    if let Some(expected) = self.capture_ctx.expected_canvas() {
+                        let actual = self.capture_ctx.canvas_dimensions();
+                        if actual != (0, 0) && expected != actual {
+                            warn!(
+                                "Canvas diverged from display set ({}x{} in use vs {}x{} expected); reinitializing",
+                                actual.0, actual.1, expected.0, expected.1
+                            );
+                            wait_for_displays_to_settle().await;
+                            let restart_recording = self.current_session.is_some();
+                            self.reinitialize_capture_for_display_change(restart_recording)
+                                .await;
+                        }
+                    }
+                }
+            }
             return;
         };
 
@@ -3456,34 +3492,38 @@ unintended app video."
                     from_name, from_id, to_name, to_id
                 );
 
-                if restart_recording {
-                    self.stop_recording().await.ok();
-                }
-
-                match self.capture_ctx.reset_video_and_recreate_sources() {
-                    Ok(()) => {
-                        info!(
-                            "Reset video and recreated sources for display '{}'",
-                            to_name
-                        );
-                        if let Ok(res) = get_main_display_resolution() {
-                            self.display_resolution = res;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to reset video for display '{}': {}", to_name, e);
-                    }
-                }
-
-                if restart_recording {
-                    if let Err(e) = self.start_recording().await {
-                        error!("Failed to restart recording after display change: {}", e);
-                    }
-                }
+                self.reinitialize_capture_for_display_change(restart_recording)
+                    .await;
             }
 
             DisplayChangeEvent::AllDisconnected => {
                 info!("All displays disconnected, waiting for reconnection...");
+            }
+        }
+    }
+
+    /// Stop-if-recording -> reset video/canvas + recreate sources -> restart. Shared by the
+    /// display-change events and the macOS canvas convergence check.
+    async fn reinitialize_capture_for_display_change(&mut self, restart_recording: bool) {
+        if restart_recording {
+            self.stop_recording().await.ok();
+        }
+
+        match self.capture_ctx.reset_video_and_recreate_sources() {
+            Ok(()) => {
+                info!("Reset video and recreated sources");
+                if let Ok(res) = get_main_display_resolution() {
+                    self.display_resolution = res;
+                }
+            }
+            Err(e) => {
+                error!("Failed to reset video: {}", e);
+            }
+        }
+
+        if restart_recording {
+            if let Err(e) = self.start_recording().await {
+                error!("Failed to restart recording after display change: {}", e);
             }
         }
     }

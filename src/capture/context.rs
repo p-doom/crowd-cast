@@ -1077,6 +1077,23 @@ impl CaptureContext {
         self.canvas_dims
     }
 
+    /// The canvas the CURRENT display set calls for, per the same gating as `initialize`/
+    /// `reset_video` (macOS multi-monitor + single-active only — `None` otherwise, or when
+    /// enumeration fails). Lets the engine verify the in-use canvas still matches reality:
+    /// during display-attach flux the DisplayMonitor's dims snapshot and the canvas
+    /// computation can read a display's mode at different instants (observed live: a monitor
+    /// reattaching mid-rotation), leaving the canvas built from a transient value while the
+    /// change detector's memory holds the settled one — no further event ever fires. Comparing
+    /// expected vs actual closes every such divergence path.
+    #[cfg(target_os = "macos")]
+    pub fn expected_canvas(&self) -> Option<(u32, u32)> {
+        if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
+            super::mac_geometry::capture_canvas_size()
+        } else {
+            None
+        }
+    }
+
     /// Layout metadata for the segment: the display currently captured (which physical monitor
     /// the video shows) and the full monitor arrangement. `(None, empty)` when the macOS
     /// multi-monitor path is inactive (flag off / non-macOS / not single-active).
