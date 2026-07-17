@@ -3,7 +3,7 @@
 //!
 //! Two jobs:
 //! 1. [`capture_canvas_size`]: the recording canvas = the per-axis bounding envelope of every
-//!    monitor, each normalized so its HEIGHT is [`TARGET_HEIGHT`] (FHD ×1.0, 4K ×0.5,
+//!    monitor, each normalized so its SHORT edge is [`TARGET_SHORT_EDGE`] (FHD ×1.0, 4K ×0.5,
 //!    3440×1440 ×0.75). Sized so *any* single monitor, normalized, fits — monitors are overlaid
 //!    at the canvas origin (only one app on one monitor is ever shown), never tiled.
 //! 2. [`fit_for_window`]: for a captured window, the scale + top-left position to draw it at so
@@ -13,14 +13,12 @@
 //!    than a reported scale factor, so HiDPI / fractional scaling is handled without trusting
 //!    Mutter's scale convention.
 //!
-//! **Height, NOT short edge.** Unlike Windows (whose output equals its canvas, uncapped), the
-//! Linux output is downscaled to `max_output_height`, so a portrait-rotated monitor normalized
-//! by its short edge (its WIDTH) would inflate the envelope's height past 1080 and get the
-//! whole canvas — every monitor's content — crushed to fit the cap. Height normalization keeps
-//! the envelope at exactly 1080 tall, so the cap never engages and a portrait monitor costs
-//! only its own (naturally narrow) width. Same rule and rationale as macOS (mac_geometry.rs);
-//! the field case that surfaced it was a macOS ultrawide recorded at 0.42× effective scale
-//! because an idle portrait monitor sat in the layout.
+//! **INVARIANT: the normalized envelope is NEVER output-capped** — the output must equal this
+//! canvas (`canvas_and_output_dimensions`), the same rule as Windows and macOS. A portrait
+//! monitor legitimately makes the envelope taller than 1080 (1440×2560 → 1080×1920); applying
+//! `max_output_height` to that envelope downscales EVERY monitor's content to fit (this
+//! happened on macOS in the field: an ultrawide recorded at 0.42× because an idle portrait
+//! monitor inflated the envelope and the cap crushed the canvas).
 //!
 //! Monitor rectangles come from `wl_output` (Wayland) or RandR (X11). The per-window monitor
 //! rectangle used by [`fit_for_window`] is supplied by the caller — on GNOME from the focus
@@ -28,10 +26,10 @@
 //! must be in the same units as the window rectangle passed alongside it.
 #![cfg(target_os = "linux")]
 
-/// Normalize every monitor (and window) so its HEIGHT maps to this many pixels. Height rather
-/// than short edge: see the module docs — short-edge normalization lets a portrait monitor
-/// inflate the canvas envelope and (via the output cap) degrade every monitor's resolution.
-pub const TARGET_HEIGHT: f64 = 1080.0;
+/// Normalize every monitor (and window) so its SHORT edge maps to this many pixels: every
+/// monitor keeps 1080p-class quality regardless of orientation. The envelope this produces
+/// must never be output-capped (see the module docs).
+pub const TARGET_SHORT_EDGE: f64 = 1080.0;
 
 /// A rectangle in a single coordinate space (Wayland logical or X11/physical pixels). For
 /// monitors fed to the canvas envelope only `w`/`h` matter; `x`/`y` are used to place a window
@@ -48,15 +46,14 @@ impl Rect {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         Self { x, y, w, h }
     }
-    fn height(&self) -> f64 {
-        self.h.max(0) as f64
+    fn short_edge(&self) -> f64 {
+        (self.w.min(self.h)).max(0) as f64
     }
 }
 
 /// Scale + top-left position (in canvas pixels) at which to draw a captured window's source so
-/// it lands at its real on-monitor location, normalized to its monitor's height. Mirrors the
-/// Windows `MonitorFit` (which normalizes by short edge — safe there because the Windows output
-/// is not capped; see the module docs).
+/// it lands at its real on-monitor location, normalized to its monitor's short edge. Mirrors
+/// the Windows `MonitorFit`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MonitorFit {
     pub scale: f32,
@@ -65,18 +62,19 @@ pub struct MonitorFit {
 }
 
 /// Recording canvas size: per-axis max over all monitors of each monitor's size normalized so
-/// its HEIGHT is [`TARGET_HEIGHT`] (every normalized height is exactly 1080, so the envelope
-/// only ever grows in width). Even dimensions for the encoder. `None` if no monitor reports a
-/// usable size (caller fails closed — never a guessed canvas).
+/// its SHORT edge is [`TARGET_SHORT_EDGE`]. A portrait monitor may make the envelope taller
+/// than 1080 — fine, the output equals the canvas (never capped; see module docs). Even
+/// dimensions for the encoder. `None` if no monitor reports a usable size (caller fails
+/// closed — never a guessed canvas).
 pub fn normalized_canvas(monitors: &[Rect]) -> Option<(u32, u32)> {
     let mut max_w = 0u32;
     let mut max_h = 0u32;
     for m in monitors {
-        let height = m.height();
-        if height <= 0.0 || m.w <= 0 {
+        let short = m.short_edge();
+        if short <= 0.0 {
             continue;
         }
-        let scale = TARGET_HEIGHT / height;
+        let scale = TARGET_SHORT_EDGE / short;
         max_w = max_w.max((m.w as f64 * scale).ceil() as u32);
         max_h = max_h.max((m.h as f64 * scale).ceil() as u32);
     }
@@ -91,7 +89,7 @@ pub fn normalized_canvas(monitors: &[Rect]) -> Option<(u32, u32)> {
 /// (logical-to-physical, e.g. 1.0 at 100%, 2.0 at 200%; X11 is always 1.0).
 ///
 /// `window` and `monitor` are in the *same* coordinate space: logical pixels on GNOME, physical
-/// on X11. `norm` (= `TARGET_HEIGHT / monitor height`) maps those pixels onto the
+/// on X11. `norm` (= `TARGET_SHORT_EDGE / monitor short edge`) maps those pixels onto the
 /// normalized canvas; the scene-item scale is `norm / monitor_scale`, the extra division
 /// converting to the *physical* captured buffer the transform is applied to (buffer ≈
 /// logical × monitor_scale).
@@ -102,8 +100,8 @@ pub fn normalized_canvas(monitors: &[Rect]) -> Option<(u32, u32)> {
 /// jumped size (encoding artifacts) and at the wrong scale overflowed the canvas (cropped). The
 /// monitor scale is stable. `None` if the monitor geometry is unusable.
 pub fn fit_for_window(window: Rect, monitor: Rect, monitor_scale: f64) -> Option<MonitorFit> {
-    let height = monitor.height();
-    if height <= 0.0 {
+    let short = monitor.short_edge();
+    if short <= 0.0 {
         return None;
     }
     let scale_factor = if monitor_scale > 0.0 {
@@ -111,7 +109,7 @@ pub fn fit_for_window(window: Rect, monitor: Rect, monitor_scale: f64) -> Option
     } else {
         1.0
     };
-    let norm = TARGET_HEIGHT / height;
+    let norm = TARGET_SHORT_EDGE / short;
     let scale = (norm / scale_factor) as f32;
     let pos_x = ((window.x - monitor.x) as f64 * norm) as f32;
     let pos_y = ((window.y - monitor.y) as f64 * norm) as f32;
@@ -183,47 +181,47 @@ mod tests {
     }
 
     #[test]
-    fn fourk_normalizes_to_1080_height() {
-        // 3840x2160 height 2160 -> ×0.5 -> 1920x1080.
+    fn fourk_normalizes_to_1080_short_edge() {
+        // 3840x2160 short edge 2160 -> ×0.5 -> 1920x1080.
         let c = normalized_canvas(&[Rect::new(0, 0, 3840, 2160)]).unwrap();
         assert_eq!(c, (1920, 1080));
     }
 
     #[test]
-    fn portrait_normalizes_by_height_not_short_edge() {
-        // A portrait-rotated 1440x2560: HEIGHT 2560 ×0.421875 -> 607.5 -> ceil-even 608x1080.
-        // Under the old short-edge rule this was 1080x1920, inflating the envelope height and
-        // getting the whole canvas crushed by the output cap (max_output_height).
+    fn portrait_normalizes_by_short_edge_keeping_quality() {
+        // A portrait-rotated 1440x2560: short edge 1440 ×0.75 -> 1080x1920. The envelope may
+        // exceed 1080 tall; the output equals the canvas (never capped), so portrait monitors
+        // keep 1080p-class quality.
         let c = normalized_canvas(&[Rect::new(0, 0, 1440, 2560)]).unwrap();
-        assert_eq!(c, (608, 1080));
+        assert_eq!(c, (1080, 1920));
     }
 
     #[test]
-    fn mixed_orientation_envelope_not_inflated() {
-        // Ultrawide + portrait: the portrait monitor must not stretch the envelope past 1080
-        // tall (which would trigger the output cap and downscale the ultrawide's content).
+    fn mixed_orientation_envelope_takes_both_axes() {
+        // Ultrawide (2580x1080) + portrait (1080x1920): per-axis max = 2580x1920. The output
+        // must equal this canvas — capping it is the bug that crushed every monitor's content.
         let c =
             normalized_canvas(&[Rect::new(0, 0, 3440, 1440), Rect::new(0, 0, 1440, 2560)]).unwrap();
-        assert_eq!(c, (2580, 1080));
+        assert_eq!(c, (2580, 1920));
     }
 
     #[test]
-    fn fit_portrait_monitor_uses_height_norm() {
-        // Window filling a portrait 1440x2560 monitor at scale 1: norm = 1080/2560, matching
-        // the canvas rule so the footprint (607.5x1080) fits the 608x1080 canvas slot.
+    fn fit_portrait_monitor_uses_short_edge_norm() {
+        // Window filling a portrait 1440x2560 monitor at scale 1: norm = 1080/1440 = 0.75,
+        // matching the canvas rule so the footprint (1080x1920) fits the canvas slot exactly.
         let fit = fit_for_window(
             Rect::new(0, 0, 1440, 2560),
             Rect::new(0, 0, 1440, 2560),
             1.0,
         )
         .unwrap();
-        assert!((fit.scale - 0.421875).abs() < 1e-4, "scale {}", fit.scale);
+        assert!((fit.scale - 0.75).abs() < 1e-4, "scale {}", fit.scale);
     }
 
     #[test]
     fn envelope_takes_per_axis_max_not_area() {
         // 4K (8.29 MP, normalizes to 1920x1080) + 32:9 ultrawide 5120x1440 (7.37 MP, smaller
-        // area but wider: height 1440 -> ×0.75 -> 3840x1080). Canvas must be wide enough for
+        // area but wider: short edge 1440 -> ×0.75 -> 3840x1080). Canvas must be wide enough for
         // the ultrawide AND tall enough for the 4K — per-axis max, not the largest by area.
         let c =
             normalized_canvas(&[Rect::new(0, 0, 3840, 2160), Rect::new(0, 0, 5120, 1440)]).unwrap();

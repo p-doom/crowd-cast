@@ -1322,8 +1322,8 @@ unintended app video."
             #[cfg(target_os = "linux")]
             self.gnome_follow_focus(frontmost_app.as_deref(), should_capture);
             // Multi-monitor per-app placement: position + scale the active app's window for the
-            // monitor it sits on (1080-HEIGHT normalized; see monitor_layout.rs — Windows uses
-            // short-edge because its output is uncapped, Linux/macOS must not).
+            // monitor it sits on (1080-short-edge normalized; see monitor_layout.rs — same rule
+            // as Windows, output == canvas so nothing is re-capped downstream).
             // Session-agnostic (GNOME extension geometry / X11 RandR); de-duped and a no-op off
             // single-active mode or until the source has dimensions.
             #[cfg(target_os = "linux")]
@@ -3647,8 +3647,8 @@ unintended app video."
             #[cfg(target_os = "linux")]
             self.gnome_follow_focus(frontmost_app.as_deref(), should_capture);
             // Multi-monitor per-app placement: position + scale the active app's window for the
-            // monitor it sits on (1080-HEIGHT normalized; see monitor_layout.rs — Windows uses
-            // short-edge because its output is uncapped, Linux/macOS must not).
+            // monitor it sits on (1080-short-edge normalized; see monitor_layout.rs — same rule
+            // as Windows, output == canvas so nothing is re-capped downstream).
             // Session-agnostic (GNOME extension geometry / X11 RandR); de-duped and a no-op off
             // single-active mode or until the source has dimensions.
             #[cfg(target_os = "linux")]

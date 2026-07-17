@@ -292,14 +292,14 @@ impl CaptureContext {
 
     /// Compute the recording canvas (base) and encoded output dimensions.
     ///
-    /// On Windows the canvas is the bounding box of all monitors, each normalized
-    /// to a 1080px shortest edge, and the output equals the canvas (uncapped — which is
-    /// why short-edge is harmless there: a portrait monitor just makes a taller canvas).
-    /// On Linux in single-active per-app mode the canvas is the multi-monitor
-    /// 1080px-HEIGHT envelope (see [`super::monitor_layout`]) and the output is capped at
-    /// `max_output_height` — height normalization keeps the cap from ever engaging.
-    /// On macOS (multi-monitor mode) likewise; as a fallback the canvas is the main
-    /// display and the output is downscaled to `max_output_height`.
+    /// On all three platforms the canvas is the bounding envelope of every monitor,
+    /// each normalized to a 1080px shortest edge, and **the output equals the canvas**:
+    /// a normalized envelope is already in 1080-short-edge space, so capping it would
+    /// downscale every monitor's content whenever a portrait monitor makes the envelope
+    /// taller than 1080 (the field incident: an ultrawide recorded at 0.42× effective
+    /// scale). `max_output_height` applies only to the raw main-display FALLBACK paths,
+    /// which are not normalized (e.g. a 5K main display alone would otherwise encode at
+    /// 5120×2880).
     fn canvas_and_output_dimensions(&self) -> ((u32, u32), (u32, u32)) {
         #[cfg(target_os = "windows")]
         {
@@ -310,16 +310,15 @@ impl CaptureContext {
             warn!("Could not enumerate monitors for canvas sizing; falling back to primary display");
         }
 
-        // Linux single-active per-app mode: the multi-monitor 1080-height envelope, so a
-        // window on any monitor fits its normalized slot. Falls through to display resolution
+        // Linux single-active per-app mode: the multi-monitor 1080-short-edge envelope, so a
+        // window on any monitor fits its normalized slot. Output equals the canvas — the
+        // envelope is already normalized; capping it crushes everything (see doc above). Falls through to display resolution
         // if monitor enumeration fails.
         #[cfg(target_os = "linux")]
         if self.use_single_active_app_capture() {
             if let Some((w, h)) = super::monitor_layout::capture_canvas_size() {
                 debug!("Multi-monitor capture canvas: {}x{}", w, h);
-                let output =
-                    calculate_output_dimensions(w, h, self.recording_config.max_output_height);
-                return ((w, h), output);
+                return ((w, h), (w, h));
             }
             warn!(
                 "Could not enumerate monitors for the multi-monitor capture canvas. \
@@ -328,7 +327,7 @@ impl CaptureContext {
         }
 
         // macOS multi-monitor mode: the per-axis-max envelope of every display, each normalized
-        // to a 1080px HEIGHT (PIXELS — SCK reports backing pixels; see mac_geometry). Gated on
+        // to a 1080px short edge (PIXELS — SCK reports backing pixels; see mac_geometry). Gated on
         // the kill-switch flag AND single-active-app mode — matching the Linux gate and the
         // apply_monitor_fit_to_active gate — because only the single-active path applies the
         // compensating per-source transform (scale=norm). Display-capture / non-single-active
@@ -339,9 +338,10 @@ impl CaptureContext {
         if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
             if let Some((w, h)) = super::mac_geometry::capture_canvas_size() {
                 debug!("macOS multi-monitor capture canvas: {}x{}", w, h);
-                let output =
-                    calculate_output_dimensions(w, h, self.recording_config.max_output_height);
-                return ((w, h), output);
+                // Output equals the normalized canvas — never cap the envelope. Capping it
+                // is the portrait-display incident: the envelope grew past 1080 tall and
+                // every display's content was downscaled ~0.56x to fit.
+                return ((w, h), (w, h));
             }
             warn!(
                 "macOS multi-monitor: could not enumerate displays for the capture canvas. \
@@ -1479,9 +1479,8 @@ impl CaptureContext {
     }
 
     /// Multi-monitor per-app placement: draw the active app's captured window at its real
-    /// on-monitor position, scaled by its monitor's 1080-HEIGHT normalization (4K window
-    /// 0.5×, FHD 1.0×, ultrawide 0.75×, …; see monitor_layout.rs — Windows uses short-edge
-    /// because its output is uncapped). Window + monitor
+    /// on-monitor position, scaled by its monitor's 1080-short-edge normalization (4K window
+    /// 0.5×, FHD 1.0×, ultrawide 0.75×, …), matching the Windows behaviour. Window + monitor
     /// geometry comes from the GNOME focus extension (logical coords) or X11/RandR (physical);
     /// the scene scale is derived from the captured buffer size, so HiDPI / fractional scaling
     /// needs no trusted scale factor. De-duped via `last_monitor_fit`; a no-op until the source

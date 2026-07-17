@@ -3,22 +3,21 @@
 //!
 //! Two jobs:
 //! 1. [`capture_canvas_size`]: the recording canvas = the per-axis bounding envelope of every
-//!    active display, each normalized so its HEIGHT is [`TARGET_HEIGHT`] (FHD ×1.0, 4K ×0.5,
-//!    1920×1200 ×0.9, …). Displays are overlaid at the canvas origin (only one app on one
-//!    display is ever shown), never tiled — same overlay model as Windows/Linux (Linux shares
-//!    the height rule; Windows keeps short-edge because its output is uncapped).
+//!    active display, each normalized so its SHORT EDGE is [`TARGET_SHORT_EDGE`] (FHD ×1.0,
+//!    4K ×0.5, 1920×1200 ×0.9, portrait 1440×2560 ×0.75 → 1080×1920). Displays are overlaid at
+//!    the canvas origin (only one app on one display is ever shown), never tiled — the same
+//!    model and rule as Windows/Linux.
 //! 2. [`norm_for_pixel_size`] / [`window_display_for_pid`]: the scale factor (and, for
 //!    follow-focus, the display) to draw a captured display-sized frame at, so it lands
-//!    normalized to its display's height.
+//!    normalized to its display's short edge.
 //!
-//! **Height, NOT short edge.** For landscape displays the two are identical, but a
-//! portrait-rotated display's short edge is its WIDTH: short-edge normalization turns a
-//! 1440×2560 portrait monitor into 1080×1920, inflating the envelope's height to 1920 — and the
-//! output cap (`max_output_height`) then crushes EVERY display's content by a further ~0.56× to
-//! fit. Field case: a 3440×1440 ultrawide recorded at 0.42× effective scale because an idle
-//! portrait monitor sat in the layout. Height normalization keeps every display at exactly
-//! 1080-tall, so the envelope height is always 1080, the output cap never engages, and a
-//! portrait display costs only its own (naturally narrow) width.
+//! **INVARIANT: a normalized envelope canvas is NEVER output-capped** — the OBS output must
+//! equal this canvas (`canvas_and_output_dimensions`), exactly like Windows. Short-edge
+//! normalization means a portrait display legitimately makes the envelope TALLER than 1080
+//! (1440×2560 → 1080×1920); applying `max_output_height` to that envelope downscales EVERY
+//! display's content to fit (field case: an ultrawide recorded at 0.42× effective scale
+//! because an idle portrait monitor inflated the envelope and the cap crushed the canvas).
+//! The cap exists only for the raw main-display fallback path, which is not normalized.
 //!
 //! **macOS differs from Windows/Linux in the FIT, not the canvas.** ScreenCaptureKit
 //! *Application* capture hands libobs a **full-display-sized frame** with the app composited in
@@ -38,10 +37,10 @@
 use core_graphics::display::CGDisplay;
 use std::ffi::c_void;
 
-/// Normalize every display (and its captured frame) so its HEIGHT maps to this many pixels.
-/// Height rather than short edge: see the module docs — short-edge normalization lets a
-/// portrait display inflate the canvas envelope and degrade every other display's resolution.
-pub const TARGET_HEIGHT: f64 = 1080.0;
+/// Normalize every display (and its captured frame) so its SHORT edge maps to this many
+/// pixels: every display keeps at least 1080p-class quality regardless of orientation. The
+/// envelope this produces must never be output-capped (see the module docs).
+pub const TARGET_SHORT_EDGE: f64 = 1080.0;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -75,16 +74,18 @@ fn active_display_pixel_sizes() -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// Normalization factor for a display of the given PIXEL size: `TARGET_HEIGHT / pixel height`.
+/// Normalization factor for a display of the given PIXEL size: `TARGET_SHORT_EDGE / short edge`.
 /// `None` if the size is degenerate.
 pub fn norm_for_pixel_size(px_w: u32, px_h: u32) -> Option<f32> {
-    (px_w > 0 && px_h > 0).then(|| (TARGET_HEIGHT / px_h as f64) as f32)
+    let short = px_w.min(px_h);
+    (short > 0).then(|| (TARGET_SHORT_EDGE / short as f64) as f32)
 }
 
 /// Recording canvas size: per-axis max over all displays of each display's PIXEL size normalized
-/// so its HEIGHT is [`TARGET_HEIGHT`] (every normalized height is exactly 1080, so the envelope
-/// only ever grows in width). Even dimensions for the encoder. `None` if no display reports a
-/// usable size (caller fails closed — never a guessed canvas).
+/// so its SHORT edge is [`TARGET_SHORT_EDGE`]. A portrait display contributes 1080×(long/short
+/// ×1080) — the envelope may exceed 1080 in height, which is fine because the output equals the
+/// canvas (never capped; see module docs). Even dimensions for the encoder. `None` if no display
+/// reports a usable size (caller fails closed — never a guessed canvas).
 pub fn normalized_canvas(sizes: &[(u32, u32)]) -> Option<(u32, u32)> {
     let mut max_w = 0u32;
     let mut max_h = 0u32;
@@ -92,7 +93,7 @@ pub fn normalized_canvas(sizes: &[(u32, u32)]) -> Option<(u32, u32)> {
         if w == 0 || h == 0 {
             continue;
         }
-        let scale = TARGET_HEIGHT / h as f64;
+        let scale = TARGET_SHORT_EDGE / w.min(h) as f64;
         // ceil, not round: rounding down (frac < 0.5) would size the canvas fractionally
         // smaller than the continuous scaled footprint and clip a sub-pixel edge column.
         max_w = max_w.max((w as f64 * scale).ceil() as u32);
@@ -175,7 +176,7 @@ const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
 const K_CF_NUMBER_SINT32: i32 = 3;
 
 /// A display to retarget an SCK source to: its CGDirectDisplayID, UUID (for `set_display_uuid`),
-/// and normalization factor (1080 / PIXEL height).
+/// and normalization factor (1080 / PIXEL short edge).
 pub struct DisplayTarget {
     pub id: u32,
     pub uuid: String,
@@ -319,8 +320,8 @@ mod tests {
     }
 
     #[test]
-    fn fourk_normalizes_to_1080_height() {
-        // 3840x2160 height 2160 -> ×0.5 -> 1920x1080.
+    fn fourk_normalizes_to_1080_short_edge() {
+        // 3840x2160 short edge 2160 -> ×0.5 -> 1920x1080.
         assert_eq!(normalized_canvas(&[(3840, 2160)]), Some((1920, 1080)));
     }
 
@@ -335,43 +336,42 @@ mod tests {
     }
 
     #[test]
-    fn portrait_normalizes_by_height_not_short_edge() {
-        // A portrait-rotated 1440x2560: HEIGHT 2560 ×(1080/2560 = 0.421875) -> 607.5x1080,
-        // ceil-to-even 608x1080. Under the old short-edge rule this was 1080x1920, inflating
-        // the envelope height to 1920 and triggering the output cap for every display.
-        assert_eq!(normalized_canvas(&[(1440, 2560)]), Some((608, 1080)));
+    fn portrait_normalizes_by_short_edge_keeping_quality() {
+        // A portrait-rotated 1440x2560: SHORT edge is its width -> ×0.75 -> 1080x1920. The
+        // envelope legitimately exceeds 1080 tall; the output equals the canvas (never capped),
+        // so the portrait display keeps 1080p-class quality instead of being squeezed to 608
+        // wide. (The historical bug was capping this envelope's output, which crushed every
+        // display's content — the fix is in canvas_and_output_dimensions, not here.)
+        assert_eq!(normalized_canvas(&[(1440, 2560)]), Some((1080, 1920)));
     }
 
     #[test]
-    fn rotating_a_display_never_inflates_the_canvas_height() {
-        // The same physical monitor, landscape vs portrait: canvas height stays 1080 in both.
+    fn rotating_a_display_keeps_its_norm() {
+        // The same physical monitor, landscape vs portrait: same short edge, same 0.75 norm,
+        // transposed canvas contribution.
         assert_eq!(normalized_canvas(&[(2560, 1440)]), Some((1920, 1080)));
-        assert_eq!(normalized_canvas(&[(1440, 2560)]), Some((608, 1080)));
+        assert_eq!(normalized_canvas(&[(1440, 2560)]), Some((1080, 1920)));
+        assert_eq!(norm_for_pixel_size(1440, 2560), Some(0.75));
+        assert_eq!(norm_for_pixel_size(2560, 1440), Some(0.75));
     }
 
     #[test]
-    fn portrait_retina_normalizes_by_pixel_height() {
-        // A rotated Retina built-in: 2338x3600 PIXELS -> ×0.3 -> 701.4x1080 -> even 702x1080.
-        assert_eq!(normalized_canvas(&[(2338, 3600)]), Some((702, 1080)));
+    fn portrait_retina_short_edge_and_ceil() {
+        // A rotated Retina: 2338x3600 PIXELS, short edge 2338 -> ×0.46193 -> 1080x1662.96;
+        // the fractional HEIGHT must ceil (1663) then ceil-to-even (1664), never floor-crop.
+        assert_eq!(normalized_canvas(&[(2338, 3600)]), Some((1080, 1664)));
     }
 
     #[test]
-    fn mixed_orientation_rig_keeps_landscape_crisp() {
+    fn mixed_orientation_field_rig_envelope() {
         // The field case (three displays): 3440x1440 ultrawide (×0.75 -> 2580x1080) +
-        // 3600x2338 Retina (×0.4619 -> 1663x1080) + 1440x2560 portrait (×0.4219 -> 608x1080).
-        // Envelope must be 2580x1080 — NOT 2580x1920 (the short-edge bug that recorded the
-        // ultrawide at 0.42× effective scale because the output cap then crushed the canvas).
+        // 3600x2338 Retina (×0.4619 -> 1663x1080) + 1440x2560 portrait (×0.75 -> 1080x1920).
+        // Envelope 2580x1920: every display keeps full short-edge quality; the output must
+        // equal this canvas — capping it to 1080 tall is what produced the 0.42× recordings.
         assert_eq!(
             normalized_canvas(&[(3440, 1440), (3600, 2338), (1440, 2560)]),
-            Some((2580, 1080))
+            Some((2580, 1920))
         );
-    }
-
-    #[test]
-    fn norm_factor_uses_height_for_portrait() {
-        // Transform scale must agree with the canvas rule on portrait displays.
-        assert_eq!(norm_for_pixel_size(1440, 2560), Some(1080.0_f32 / 2560.0));
-        assert_eq!(norm_for_pixel_size(2560, 1440), Some(0.75));
     }
 
     #[test]
