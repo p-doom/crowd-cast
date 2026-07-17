@@ -1577,6 +1577,56 @@ unintended app video."
                     );
                 }
 
+                // Escalation: an in-place obs_source_update cannot revive every dead
+                // stream — in the field, a source recreated during post-unlock display
+                // churn stayed 0-dim through 41 refresh attempts (dropping the user's
+                // input events the whole time) and only a full source rebuild cured it.
+                // The four rebuilds that DID run all landed mid-churn; what was never
+                // tried was rebuilding at a calm moment. So after several failed
+                // refreshes, apply the display-change remedy — settle-gate, then reset
+                // video + recreate all sources — and repeat periodically while the
+                // source stays dead, so a rebuild that itself lands in flux gets
+                // another chance once things hold still.
+                const ESCALATE_AFTER: u32 = 8; // ~12s at the 1.5s watchdog cadence
+                const ESCALATE_EVERY: u32 = 20; // then every ~30s while still dead
+                let attempt = watchdog.attempt + 1;
+                if attempt >= ESCALATE_AFTER
+                    && (attempt - ESCALATE_AFTER) % ESCALATE_EVERY == 0
+                {
+                    warn!(
+                        "Active capture source for '{}' still dead after {} refresh attempts; recreating all capture sources in place",
+                        watchdog.expected_app, attempt
+                    );
+                    #[cfg(target_os = "macos")]
+                    wait_for_displays_to_settle().await;
+                    let restart_recording = self.current_session.is_some();
+                    if restart_recording {
+                        self.stop_recording().await.ok();
+                    }
+                    match self.capture_ctx.reset_video_and_recreate_sources() {
+                        Ok(()) => {
+                            info!("Recreated capture sources after dead-source escalation");
+                            if let Ok(res) = get_main_display_resolution() {
+                                self.display_resolution = res;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Dead-source escalation failed to recreate sources: {}", e);
+                        }
+                    }
+                    if restart_recording {
+                        if let Err(e) = self.start_recording().await {
+                            error!(
+                                "Failed to restart recording after dead-source escalation: {}",
+                                e
+                            );
+                        }
+                    }
+                    self.schedule_capture_watchdog(&watchdog.expected_app, attempt);
+                    self.refresh_capture_enabled_from_frontmost();
+                    return;
+                }
+
                 match self.capture_ctx.refresh_active_capture_source() {
                     Ok(_) => {
                         self.schedule_capture_watchdog(
