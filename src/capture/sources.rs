@@ -267,6 +267,12 @@ impl ScreenCaptureSource {
             .set_display_uuid(display_uuid)
             .set_show_cursor(true)
             .set_audio_capture(capture_audio)
+            // SCK builds the content filter from SCShareableContent; without hidden windows
+            // the enumeration is on-screen-only, so an app whose windows are all off-screen
+            // at creation time (another Space, minimized, locked screen at wake) is absent
+            // from it and the stream composites zero windows FOREVER — silent black capture
+            // with a green tray. Must also ride along on every update (updates reset settings).
+            .set_show_hidden_windows(true)
             .set_hide_obs(true) // Don't capture OBS/ourselves
             .add_to_scene(scene)
             .context("Failed to add application capture source to scene")?;
@@ -526,6 +532,8 @@ impl ScreenCaptureSource {
             .context("Failed to create source updater")?
             .set_application(bundle_id)
             .set_audio_capture(false)
+            // Updates reset settings — keep off-screen windows enumerable (see creation site).
+            .set_show_hidden_windows(true)
             .update()
             .context("Failed to update application")?;
 
@@ -641,6 +649,8 @@ impl ScreenCaptureSource {
             .context("Failed to create source updater")?
             .set_display_uuid(display_uuid)
             .set_audio_capture(false)
+            // Updates reset settings — keep off-screen windows enumerable (see creation site).
+            .set_show_hidden_windows(true)
             .update()
             .context("Failed to update display UUID")?;
 
