@@ -203,6 +203,29 @@ async fn wait_for_displays_to_settle() {
     warn!("display set did not settle within ~8s; proceeding with source recreate anyway");
 }
 
+/// Whether the capture watchdog should escalate a not-ready active source to a full
+/// rebuild. Pure (no OBS) so the trigger logic is unit-tested directly.
+///
+/// The trigger is how long the source has been *continuously* not-ready (`dead_since`),
+/// NOT the per-app refresh count: that count resets to zero on every app switch, so a
+/// user cycling between apps whose sources are all dead would never reach an attempt bar.
+/// `dead_since` is only cleared when a source becomes ready, so it spans app switches.
+/// `active_session_unpaused` must be true — the escalation toggles recording, which would
+/// wrongly un-pause a paused session. Repeats are throttled to `reescalate_every` so a
+/// rebuild that itself lands in display flux gets another try without thrashing.
+fn dead_source_escalation_due(
+    now: Instant,
+    dead_since: Instant,
+    last_escalation: Option<Instant>,
+    active_session_unpaused: bool,
+    escalate_after: Duration,
+    reescalate_every: Duration,
+) -> bool {
+    active_session_unpaused
+        && now.saturating_duration_since(dead_since) >= escalate_after
+        && last_escalation.map_or(true, |t| now.saturating_duration_since(t) >= reescalate_every)
+}
+
 #[cfg(all(target_os = "macos", not(no_tray)))]
 fn restart_history_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "crowd-cast", "agent")
@@ -690,6 +713,15 @@ pub struct SyncEngine {
     buffered_non_context_event_count: usize,
     /// Whether any capture source has ever been ready during this session
     any_source_ever_ready: bool,
+    /// When the current run of consecutive "active source not ready" watchdog checks began,
+    /// or `None` when the active source is (or was last) ready. Deliberately NOT reset on an
+    /// app switch — it tracks how long we've been unable to get ANY source ready, so the dead-
+    /// source escalation fires even while the user is switching between apps whose sources are
+    /// all dead (the per-app attempt counter resets on every switch and never reaches the bar).
+    capture_dead_since: Option<Instant>,
+    /// When the dead-source escalation last recreated all sources, to space out repeats while
+    /// a source stays dead. Cleared once a source becomes ready.
+    last_capture_escalation: Option<Instant>,
     /// Whether we've already shown the "restart your Mac" alert this session
     restart_alert_shown: bool,
     /// Linux: set when a previously-ready capture source dies mid-recording (e.g. the user
@@ -832,6 +864,8 @@ unintended app video."
             last_emitted_context: None,
             buffered_non_context_event_count: 0,
             any_source_ever_ready: false,
+            capture_dead_since: None,
+            last_capture_escalation: None,
             restart_alert_shown: false,
             #[cfg(target_os = "linux")]
             capture_lost: false,
@@ -1556,6 +1590,10 @@ unintended app video."
                     );
                 }
                 self.any_source_ever_ready = true;
+                // A source is live again — end the dead-streak so the next failure starts a
+                // fresh clock and a prior escalation doesn't keep the throttle armed.
+                self.capture_dead_since = None;
+                self.last_capture_escalation = None;
                 self.clear_capture_watchdog();
                 self.refresh_capture_enabled_from_frontmost();
             }
@@ -1578,25 +1616,45 @@ unintended app video."
                 }
 
                 // Escalation: an in-place obs_source_update cannot revive every dead
-                // stream — in the field, a source recreated during post-unlock display
-                // churn stayed 0-dim through 41 refresh attempts (dropping the user's
-                // input events the whole time) and only a full source rebuild cured it.
-                // The four rebuilds that DID run all landed mid-churn; what was never
-                // tried was rebuilding at a calm moment. So after several failed
-                // refreshes, apply the display-change remedy — settle-gate, then reset
-                // video + recreate all sources — and repeat periodically while the
-                // source stays dead, so a rebuild that itself lands in flux gets
-                // another chance once things hold still.
-                const ESCALATE_AFTER: u32 = 8; // ~12s at the 1.5s watchdog cadence
-                const ESCALATE_EVERY: u32 = 20; // then every ~30s while still dead
-                let attempt = watchdog.attempt + 1;
-                if attempt >= ESCALATE_AFTER
-                    && (attempt - ESCALATE_AFTER) % ESCALATE_EVERY == 0
-                {
+                // stream — in the field, sources recreated during post-unlock/monitor-
+                // connect display churn stayed not-ready (0-dim), dropping the user's
+                // input events, until a manual restart cured them. The automatic
+                // rebuilds that ran had all landed mid-churn; what worked was a rebuild
+                // at a CALM moment. So once a source has been dead long enough, apply the
+                // display-change remedy — settle-gate, then reset video + recreate all
+                // sources — repeating on an interval while it stays dead so a rebuild
+                // that itself lands in flux gets another chance once things hold still.
+                //
+                // The trigger is TIME the source has been continuously dead, not the
+                // per-app refresh count: that count resets to zero on every app switch,
+                // so a user actively switching between apps whose sources are all dead
+                // (observed on a monitor-connect) would never reach an attempt-based bar.
+                // `capture_dead_since` survives app switches; it only clears when a source
+                // actually becomes ready (the Ok(true) arm above).
+                const ESCALATE_AFTER: Duration = Duration::from_secs(12);
+                const REESCALATE_EVERY: Duration = Duration::from_secs(30);
+                let now = Instant::now();
+                let dead_since = *self.capture_dead_since.get_or_insert(now);
+                let dead_for = now.saturating_duration_since(dead_since);
+                // `surface_failure` (live session, not paused) gates the escalation: it stops
+                // and restarts recording, which would wrongly un-pause a paused session — the
+                // capture watchdog stays armed across a pause. When paused we still let the
+                // dead-clock accumulate, so escalation fires promptly once recording resumes.
+                let escalation_due = dead_source_escalation_due(
+                    now,
+                    dead_since,
+                    self.last_capture_escalation,
+                    surface_failure,
+                    ESCALATE_AFTER,
+                    REESCALATE_EVERY,
+                );
+                if escalation_due {
                     warn!(
-                        "Active capture source for '{}' still dead after {} refresh attempts; recreating all capture sources in place",
-                        watchdog.expected_app, attempt
+                        "Active capture source for '{}' dead for {}s; recreating all capture sources in place",
+                        watchdog.expected_app,
+                        dead_for.as_secs()
                     );
+                    self.last_capture_escalation = Some(now);
                     #[cfg(target_os = "macos")]
                     wait_for_displays_to_settle().await;
                     let restart_recording = self.current_session.is_some();
@@ -1622,7 +1680,7 @@ unintended app video."
                             );
                         }
                     }
-                    self.schedule_capture_watchdog(&watchdog.expected_app, attempt);
+                    self.schedule_capture_watchdog(&watchdog.expected_app, watchdog.attempt + 1);
                     self.refresh_capture_enabled_from_frontmost();
                     return;
                 }
@@ -3448,6 +3506,12 @@ unintended app video."
         #[cfg(target_os = "macos")]
         wait_for_displays_to_settle().await;
 
+        // This display change is about to recreate sources itself. Re-arm the dead-source
+        // escalation clock so the watchdog gives these fresh sources the full grace period
+        // before it stacks another rebuild on top.
+        self.capture_dead_since = None;
+        self.last_capture_escalation = None;
+
         let restart_recording = self.current_session.is_some();
 
         match event {
@@ -3805,6 +3869,87 @@ pub fn create_engine_channels() -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const AFTER: Duration = Duration::from_secs(12);
+    const EVERY: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn escalation_waits_for_the_dead_threshold() {
+        let t0 = Instant::now();
+        // Not dead long enough yet.
+        assert!(!dead_source_escalation_due(
+            t0 + Duration::from_secs(11),
+            t0,
+            None,
+            true,
+            AFTER,
+            EVERY
+        ));
+        // Crossed the threshold.
+        assert!(dead_source_escalation_due(
+            t0 + Duration::from_secs(12),
+            t0,
+            None,
+            true,
+            AFTER,
+            EVERY
+        ));
+    }
+
+    #[test]
+    fn escalation_is_independent_of_app_switching() {
+        // The regression: a per-app attempt counter resets on every app switch, so a user
+        // cycling between apps whose sources are all dead never escalates. Here `dead_since`
+        // is fixed while the "app" switches many times (modeled by repeated calls); the
+        // decision depends only on elapsed dead-time, so it fires regardless.
+        let t0 = Instant::now();
+        assert!(dead_source_escalation_due(
+            t0 + Duration::from_secs(20),
+            t0, // unchanged across all the intervening app switches
+            None,
+            true,
+            AFTER,
+            EVERY
+        ));
+    }
+
+    #[test]
+    fn escalation_is_throttled_after_a_rebuild() {
+        let t0 = Instant::now();
+        let last = t0 + Duration::from_secs(12); // just escalated
+        // 20s later (< 30s throttle): still dead, but do not stack another rebuild.
+        assert!(!dead_source_escalation_due(
+            last + Duration::from_secs(20),
+            t0,
+            Some(last),
+            true,
+            AFTER,
+            EVERY
+        ));
+        // 30s later: allowed to try again.
+        assert!(dead_source_escalation_due(
+            last + Duration::from_secs(30),
+            t0,
+            Some(last),
+            true,
+            AFTER,
+            EVERY
+        ));
+    }
+
+    #[test]
+    fn escalation_never_fires_while_paused() {
+        let t0 = Instant::now();
+        // Dead well past the threshold, but a paused/no-session state must not toggle recording.
+        assert!(!dead_source_escalation_due(
+            t0 + Duration::from_secs(120),
+            t0,
+            None,
+            false,
+            AFTER,
+            EVERY
+        ));
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let dir =
