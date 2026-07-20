@@ -214,6 +214,7 @@ async fn wait_for_displays_to_settle() {
 /// call site); when false we never escalate. Repeats are throttled to `reescalate_every`
 /// so a restart that lands during display flux gets another try without thrashing (the
 /// shared restart backoff, whose history persists across restarts, is the deeper guard).
+#[cfg(all(target_os = "macos", not(no_tray)))]
 fn dead_source_escalation_due(
     now: Instant,
     dead_since: Instant,
@@ -231,6 +232,52 @@ fn dead_source_escalation_due(
 fn restart_history_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "crowd-cast", "agent")
         .map(|p| p.data_dir().join("restart_history"))
+}
+
+/// Marker recording that we restarted to recover a dead capture source. It survives the
+/// exec() so the fresh process can tell "restart already tried, still dead" (→ likely an
+/// OS-level wedge that needs a Mac restart) from a first failure (→ try one restart).
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn capture_dead_restart_marker_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+        .map(|p| p.data_dir().join("capture_dead_restart"))
+}
+
+/// Time this marker was written, or `None` if absent/unreadable. Uses wall-clock seconds
+/// (`SystemTime`) rather than `Instant` because it is compared across process restarts.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn capture_dead_restart_age() -> Option<Duration> {
+    let path = capture_dead_restart_marker_path()?;
+    let ts: u64 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(Duration::from_secs(now.saturating_sub(ts)))
+}
+
+/// Stamp the marker with the current time (called just before a dead-source restart).
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn note_capture_dead_restart() {
+    let Some(path) = capture_dead_restart_marker_path() else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, now.to_string());
+}
+
+/// Clear the marker (called once a capture source is healthy again).
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn clear_capture_dead_restart() {
+    if let Some(path) = capture_dead_restart_marker_path() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Whether a restart is allowed under the exponential backoff, recording `now`
@@ -719,10 +766,14 @@ pub struct SyncEngine {
     /// app switch — it tracks how long we've been unable to get ANY source ready, so the dead-
     /// source escalation fires even while the user is switching between apps whose sources are
     /// all dead (the per-app attempt counter resets on every switch and never reaches the bar).
+    /// macOS-only: the escalation is a fresh-context process restart, which is the SCK cure —
+    /// Linux must not restart (it tears down the tray) and Windows/WGC has no such failure.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
     capture_dead_since: Option<Instant>,
     /// When the dead-source escalation last attempted a restart, to space out repeats while
     /// a source stays dead (the shared restart backoff is the deeper guard). Cleared once a
     /// source becomes ready.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
     last_capture_escalation: Option<Instant>,
     /// Whether we've already shown the "restart your Mac" alert this session
     restart_alert_shown: bool,
@@ -866,7 +917,9 @@ unintended app video."
             last_emitted_context: None,
             buffered_non_context_event_count: 0,
             any_source_ever_ready: false,
+            #[cfg(all(target_os = "macos", not(no_tray)))]
             capture_dead_since: None,
+            #[cfg(all(target_os = "macos", not(no_tray)))]
             last_capture_escalation: None,
             restart_alert_shown: false,
             #[cfg(target_os = "linux")]
@@ -1566,6 +1619,96 @@ unintended app video."
         }
     }
 
+    /// macOS: recover an active capture source that has been dead too long by restarting for
+    /// a fresh OBS context — the only thing that reliably rebinds a wedged ScreenCaptureKit
+    /// source (an in-place `obs_source_update` or same-context recreate does not; the
+    /// screen-unlock and `needs_scene_for_app` paths restart for the same reason). In the
+    /// field a source that came up not-ready (0-dim) after a monitor-connect display flap
+    /// stayed dead, dropping input, until a MANUAL crowd-cast restart cured it.
+    ///
+    /// Returns true if it handled the tick and the caller should stop (either it deferred a
+    /// restart under backoff, or it surfaced the "restart your Mac" alert). If it actually
+    /// restarts, the process exec()s and this never returns.
+    ///
+    /// One restart per dead episode: a persisted marker survives the exec, so if the fresh
+    /// process is STILL dead we treat it as an OS-level wedge and surface the Mac-restart
+    /// alert promptly rather than restarting again (and again). The marker is cleared the
+    /// moment a source becomes ready.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    async fn maybe_escalate_dead_source(
+        &mut self,
+        watchdog: &PendingCaptureWatchdog,
+        surface_failure: bool,
+    ) -> bool {
+        // How long a source must be continuously dead before we act, and how often we retry.
+        const ESCALATE_AFTER: Duration = Duration::from_secs(12);
+        const REESCALATE_EVERY: Duration = Duration::from_secs(30);
+        // A restart + fresh-process boot + re-detect takes well under this; if the marker is
+        // this recent and we're back here still dead, one restart already failed to help.
+        const RESTART_TRIED_WINDOW: Duration = Duration::from_secs(180);
+
+        let now = Instant::now();
+        let dead_since = *self.capture_dead_since.get_or_insert(now);
+        let dead_for = now.saturating_duration_since(dead_since);
+        // Precondition: a live, unpaused session. Deliberately NOT also `any_source_ever_ready`
+        // — "no sources" must self-heal even when the process came up dead from the start (an
+        // unlock-triggered restart landing mid display-churn on arrival at a desk). The
+        // restart-loop worry is covered by the backoff (history persists across restarts) and,
+        // for the never-heals wedge, by the one-restart-then-alert path below.
+        let escalation_due = dead_source_escalation_due(
+            now,
+            dead_since,
+            self.last_capture_escalation,
+            surface_failure,
+            ESCALATE_AFTER,
+            REESCALATE_EVERY,
+        );
+        if !escalation_due {
+            return false;
+        }
+        self.last_capture_escalation = Some(now);
+
+        // A restart was already tried for this still-unresolved dead episode → it didn't help,
+        // so this is almost certainly the OS-level wedge that needs a full Mac restart. Surface
+        // the alert once and stop restarting; keep watching so a spontaneous recovery clears it.
+        if capture_dead_restart_age().is_some_and(|age| age <= RESTART_TRIED_WINDOW) {
+            if !self.restart_alert_shown {
+                self.restart_alert_shown = true;
+                error!(
+                    "Capture source for '{}' still dead after an automatic restart — likely a \
+                     system-level wedge; prompting for a Mac restart",
+                    watchdog.expected_app
+                );
+                extern "C" {
+                    fn show_restart_mac_alert();
+                }
+                unsafe {
+                    show_restart_mac_alert();
+                }
+            }
+            return true;
+        }
+
+        // First attempt this episode: restart for a fresh context, if the shared backoff allows.
+        if restart_allowed_with_backoff() {
+            warn!(
+                "Active capture source for '{}' dead for {}s; restarting for a fresh capture context",
+                watchdog.expected_app,
+                dead_for.as_secs()
+            );
+            note_capture_dead_restart();
+            self.input_backend.stop();
+            self.stop_recording().await.ok();
+            restart_process(); // exec()s — never returns
+        }
+        warn!(
+            "Capture source for '{}' dead for {}s but restart deferred by backoff; will retry",
+            watchdog.expected_app,
+            dead_for.as_secs()
+        );
+        true
+    }
+
     async fn run_capture_watchdog(&mut self) {
         let Some(watchdog) = self.pending_capture_watchdog.clone() else {
             return;
@@ -1593,9 +1736,16 @@ unintended app video."
                 }
                 self.any_source_ever_ready = true;
                 // A source is live again — end the dead-streak so the next failure starts a
-                // fresh clock and a prior escalation doesn't keep the throttle armed.
-                self.capture_dead_since = None;
-                self.last_capture_escalation = None;
+                // fresh clock, a prior escalation doesn't keep the throttle armed, and the
+                // "one restart per dead episode" marker resets. Also re-arm the Mac-restart
+                // alert so a future, unrelated failure can surface it again.
+                #[cfg(all(target_os = "macos", not(no_tray)))]
+                {
+                    self.capture_dead_since = None;
+                    self.last_capture_escalation = None;
+                    clear_capture_dead_restart();
+                    self.restart_alert_shown = false;
+                }
                 self.clear_capture_watchdog();
                 self.refresh_capture_enabled_from_frontmost();
             }
@@ -1617,69 +1767,12 @@ unintended app video."
                     );
                 }
 
-                // Escalation: an in-place obs_source_update cannot revive a dead
-                // ScreenCaptureKit source, and neither can an in-place recreate within
-                // the same OBS context — SCK sources only bind reliably when created in a
-                // FRESH context (see the screen-unlock RestartProcess path and
-                // needs_scene_for_app; both restart the process rather than rebuild in
-                // place). In the field a source that came up not-ready (0-dim) after a
-                // monitor-connect display flap stayed dead, dropping the user's input,
-                // until a MANUAL crowd-cast restart cured it. So the escalation is that
-                // proven cure: a full process restart, gated by the shared exponential
-                // backoff so a restart that doesn't stick — or the rarer OS-level wedge
-                // that needs a Mac restart (check_capture_health's alert) — can't spin.
-                //
-                // The trigger is TIME the source has been continuously dead, not the
-                // per-app refresh count: that count resets to zero on every app switch,
-                // so a user actively switching between apps whose sources are all dead
-                // (observed on a monitor-connect) would never reach an attempt-based bar.
-                // `capture_dead_since` survives app switches; it only clears when a source
-                // actually becomes ready (the Ok(true) arm above).
-                const ESCALATE_AFTER: Duration = Duration::from_secs(12);
-                const REESCALATE_EVERY: Duration = Duration::from_secs(30);
-                let now = Instant::now();
-                let dead_since = *self.capture_dead_since.get_or_insert(now);
-                let dead_for = now.saturating_duration_since(dead_since);
-                // Precondition to auto-restart: a live, unpaused session (`surface_failure`).
-                // We deliberately do NOT also require `any_source_ever_ready` — "no sources"
-                // must self-heal even when the process came up dead from the start (e.g. the
-                // unlock-triggered restart landed mid display-churn on arrival at a desk). The
-                // restart-loop worry that gate guarded against is already covered by the shared
-                // backoff, whose history persists ACROSS restarts (15s → 30s → … → 15m), so a
-                // process that keeps coming up dead is spaced out, never tight-looped; and a
-                // genuinely healthy startup is ready in a few seconds, well under ESCALATE_AFTER.
-                let preconditions_met = surface_failure;
-                let escalation_due = dead_source_escalation_due(
-                    now,
-                    dead_since,
-                    self.last_capture_escalation,
-                    preconditions_met,
-                    ESCALATE_AFTER,
-                    REESCALATE_EVERY,
-                );
-                if escalation_due {
-                    self.last_capture_escalation = Some(now);
-                    // Only restart if the shared backoff allows it (macOS); other platforms
-                    // don't use SCK, so a fresh context is always fine to take.
-                    #[cfg(all(target_os = "macos", not(no_tray)))]
-                    let restart_ok = restart_allowed_with_backoff();
-                    #[cfg(not(all(target_os = "macos", not(no_tray))))]
-                    let restart_ok = true;
-                    if restart_ok {
-                        warn!(
-                            "Active capture source for '{}' dead for {}s; restarting for a fresh capture context",
-                            watchdog.expected_app,
-                            dead_for.as_secs()
-                        );
-                        self.input_backend.stop();
-                        self.stop_recording().await.ok();
-                        restart_process(); // exec()s — never returns
-                    }
-                    warn!(
-                        "Capture source for '{}' dead for {}s but restart deferred by backoff; will retry",
-                        watchdog.expected_app,
-                        dead_for.as_secs()
-                    );
+                // macOS: once a source has been continuously dead long enough, escalate to
+                // a fresh-context process restart (the proven SCK cure) — see
+                // maybe_escalate_dead_source. If it handles the tick (restarted, or surfaced
+                // the "restart your Mac" alert after a restart didn't help), stop here.
+                #[cfg(all(target_os = "macos", not(no_tray)))]
+                if self.maybe_escalate_dead_source(&watchdog, surface_failure).await {
                     self.schedule_capture_watchdog(&watchdog.expected_app, watchdog.attempt + 1);
                     self.refresh_capture_enabled_from_frontmost();
                     return;
@@ -3508,9 +3601,12 @@ unintended app video."
 
         // This display change is about to recreate sources itself. Re-arm the dead-source
         // escalation clock so the watchdog gives these fresh sources the full grace period
-        // before it stacks another rebuild on top.
-        self.capture_dead_since = None;
-        self.last_capture_escalation = None;
+        // before it escalates to a restart on top.
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        {
+            self.capture_dead_since = None;
+            self.last_capture_escalation = None;
+        }
 
         let restart_recording = self.current_session.is_some();
 
@@ -3870,87 +3966,93 @@ pub fn create_engine_channels() -> (
 mod tests {
     use super::*;
 
-    const AFTER: Duration = Duration::from_secs(12);
-    const EVERY: Duration = Duration::from_secs(30);
+    // The dead-source escalation (and its trigger fn) is macOS-only; gate its tests too.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    mod escalation {
+        use super::*;
 
-    #[test]
-    fn escalation_waits_for_the_dead_threshold() {
-        let t0 = Instant::now();
-        // Not dead long enough yet.
-        assert!(!dead_source_escalation_due(
-            t0 + Duration::from_secs(11),
-            t0,
-            None,
-            true,
-            AFTER,
-            EVERY
-        ));
-        // Crossed the threshold.
-        assert!(dead_source_escalation_due(
-            t0 + Duration::from_secs(12),
-            t0,
-            None,
-            true,
-            AFTER,
-            EVERY
-        ));
-    }
+        const AFTER: Duration = Duration::from_secs(12);
+        const EVERY: Duration = Duration::from_secs(30);
 
-    #[test]
-    fn escalation_is_independent_of_app_switching() {
-        // The regression: a per-app attempt counter resets on every app switch, so a user
-        // cycling between apps whose sources are all dead never escalates. Here `dead_since`
-        // is fixed while the "app" switches many times (modeled by repeated calls); the
-        // decision depends only on elapsed dead-time, so it fires regardless.
-        let t0 = Instant::now();
-        assert!(dead_source_escalation_due(
-            t0 + Duration::from_secs(20),
-            t0, // unchanged across all the intervening app switches
-            None,
-            true,
-            AFTER,
-            EVERY
-        ));
-    }
+        #[test]
+        fn escalation_waits_for_the_dead_threshold() {
+            let t0 = Instant::now();
+            // Not dead long enough yet.
+            assert!(!dead_source_escalation_due(
+                t0 + Duration::from_secs(11),
+                t0,
+                None,
+                true,
+                AFTER,
+                EVERY
+            ));
+            // Crossed the threshold.
+            assert!(dead_source_escalation_due(
+                t0 + Duration::from_secs(12),
+                t0,
+                None,
+                true,
+                AFTER,
+                EVERY
+            ));
+        }
 
-    #[test]
-    fn escalation_is_throttled_after_a_rebuild() {
-        let t0 = Instant::now();
-        let last = t0 + Duration::from_secs(12); // just escalated
-        // 20s later (< 30s throttle): still dead, but do not stack another rebuild.
-        assert!(!dead_source_escalation_due(
-            last + Duration::from_secs(20),
-            t0,
-            Some(last),
-            true,
-            AFTER,
-            EVERY
-        ));
-        // 30s later: allowed to try again.
-        assert!(dead_source_escalation_due(
-            last + Duration::from_secs(30),
-            t0,
-            Some(last),
-            true,
-            AFTER,
-            EVERY
-        ));
-    }
+        #[test]
+        fn escalation_is_independent_of_app_switching() {
+            // The regression: a per-app attempt counter resets on every app switch, so a user
+            // cycling between apps whose sources are all dead never escalates. Here `dead_since`
+            // is fixed while the "app" switches many times (modeled by repeated calls); the
+            // decision depends only on elapsed dead-time, so it fires regardless.
+            let t0 = Instant::now();
+            assert!(dead_source_escalation_due(
+                t0 + Duration::from_secs(20),
+                t0, // unchanged across all the intervening app switches
+                None,
+                true,
+                AFTER,
+                EVERY
+            ));
+        }
 
-    #[test]
-    fn escalation_never_fires_when_preconditions_unmet() {
-        let t0 = Instant::now();
-        // Dead well past the threshold, but preconditions are false — paused, or no live
-        // session — so the escalation must not restart (a restart would wrongly un-pause,
-        // and with no session there is nothing to recover).
-        assert!(!dead_source_escalation_due(
-            t0 + Duration::from_secs(120),
-            t0,
-            None,
-            false,
-            AFTER,
-            EVERY
-        ));
+        #[test]
+        fn escalation_is_throttled_after_a_rebuild() {
+            let t0 = Instant::now();
+            let last = t0 + Duration::from_secs(12); // just escalated
+            // 20s later (< 30s throttle): still dead, but do not stack another restart.
+            assert!(!dead_source_escalation_due(
+                last + Duration::from_secs(20),
+                t0,
+                Some(last),
+                true,
+                AFTER,
+                EVERY
+            ));
+            // 30s later: allowed to try again.
+            assert!(dead_source_escalation_due(
+                last + Duration::from_secs(30),
+                t0,
+                Some(last),
+                true,
+                AFTER,
+                EVERY
+            ));
+        }
+
+        #[test]
+        fn escalation_never_fires_when_preconditions_unmet() {
+            let t0 = Instant::now();
+            // Dead well past the threshold, but preconditions are false — paused, or no live
+            // session — so the escalation must not restart (a restart would wrongly un-pause,
+            // and with no session there is nothing to recover).
+            assert!(!dead_source_escalation_due(
+                t0 + Duration::from_secs(120),
+                t0,
+                None,
+                false,
+                AFTER,
+                EVERY
+            ));
+        }
     }
 
     fn test_dir(name: &str) -> PathBuf {
