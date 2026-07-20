@@ -210,10 +210,10 @@ async fn wait_for_displays_to_settle() {
 /// NOT the per-app refresh count: that count resets to zero on every app switch, so a
 /// user cycling between apps whose sources are all dead would never reach an attempt bar.
 /// `dead_since` is only cleared when a source becomes ready, so it spans app switches.
-/// `preconditions_met` folds in the caller's gating (a live, unpaused session that has
-/// had a working source at least once — see the call site); when false we never escalate.
-/// Repeats are throttled to `reescalate_every` so a restart that lands during display flux
-/// gets another try without thrashing (the shared restart backoff is the deeper guard).
+/// `preconditions_met` folds in the caller's gating (a live, unpaused session — see the
+/// call site); when false we never escalate. Repeats are throttled to `reescalate_every`
+/// so a restart that lands during display flux gets another try without thrashing (the
+/// shared restart backoff, whose history persists across restarts, is the deeper guard).
 fn dead_source_escalation_due(
     now: Instant,
     dead_since: Instant,
@@ -1640,12 +1640,15 @@ unintended app video."
                 let now = Instant::now();
                 let dead_since = *self.capture_dead_since.get_or_insert(now);
                 let dead_for = now.saturating_duration_since(dead_since);
-                // Preconditions to auto-restart: a live, unpaused session (`surface_failure`)
-                // that has had a working source at least once (`any_source_ever_ready`). The
-                // ever-ready gate scopes this to the "worked, then died" regression — a source
-                // that never came up at startup is left to check_capture_health / startup retry,
-                // so a slow first launch can't turn into a restart loop.
-                let preconditions_met = surface_failure && self.any_source_ever_ready;
+                // Precondition to auto-restart: a live, unpaused session (`surface_failure`).
+                // We deliberately do NOT also require `any_source_ever_ready` — "no sources"
+                // must self-heal even when the process came up dead from the start (e.g. the
+                // unlock-triggered restart landed mid display-churn on arrival at a desk). The
+                // restart-loop worry that gate guarded against is already covered by the shared
+                // backoff, whose history persists ACROSS restarts (15s → 30s → … → 15m), so a
+                // process that keeps coming up dead is spaced out, never tight-looped; and a
+                // genuinely healthy startup is ready in a few seconds, well under ESCALATE_AFTER.
+                let preconditions_met = surface_failure;
                 let escalation_due = dead_source_escalation_due(
                     now,
                     dead_since,
@@ -3937,9 +3940,9 @@ mod tests {
     #[test]
     fn escalation_never_fires_when_preconditions_unmet() {
         let t0 = Instant::now();
-        // Dead well past the threshold, but preconditions are false — paused, no live session,
-        // or a source that was never ready (a slow first launch, left to startup retry). Must
-        // not restart in any of these, or a launch that's merely slow becomes a restart loop.
+        // Dead well past the threshold, but preconditions are false — paused, or no live
+        // session — so the escalation must not restart (a restart would wrongly un-pause,
+        // and with no session there is nothing to recover).
         assert!(!dead_source_escalation_due(
             t0 + Duration::from_secs(120),
             t0,
