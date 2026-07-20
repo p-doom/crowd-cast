@@ -1478,6 +1478,29 @@ impl CaptureContext {
         Ok(true)
     }
 
+    /// Scene items downscaled via `set_scale` sample with libobs' default (bilinear),
+    /// which blurs fine text at the 0.37–0.57× monitor norms this canvas uses; area
+    /// sampling is the correct filter for UI downscales. Called wherever the fit
+    /// transform lands, so rebuilt scene items (which reset `last_monitor_fit`) are
+    /// re-covered on the next fit.
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    fn set_area_scale_filter(scene: &ObsSceneRef, source: &libobs_wrapper::sources::ObsSourceRef) {
+        use libobs_wrapper::utils::traits::ObsUpdatable as _;
+        let item_ptr = match scene.get_scene_item_ptr(source) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("area scale filter: no scene item: {}", e);
+                return;
+            }
+        };
+        let runtime = source.runtime();
+        if let Err(e) = libobs_wrapper::run_with_obs!(runtime, (item_ptr), move || unsafe {
+            libobs::obs_sceneitem_set_scale_filter(item_ptr, libobs::obs_scale_type_OBS_SCALE_AREA);
+        }) {
+            debug!("area scale filter: set failed: {}", e);
+        }
+    }
+
     /// Multi-monitor per-app placement: draw the active app's captured window at its real
     /// on-monitor position, scaled by its monitor's 1080-short-edge normalization (4K window
     /// 0.5×, FHD 1.0×, ultrawide 0.75×, …), matching the Windows behaviour. Window + monitor
@@ -1524,7 +1547,13 @@ impl CaptureContext {
             .build(0, 0);
 
         let applied = match self.app_scenes.get(&app) {
-            Some((scene, source)) => scene.set_transform_info(source.source(), &info).is_ok(),
+            Some((scene, source)) => {
+                let ok = scene.set_transform_info(source.source(), &info).is_ok();
+                if ok {
+                    Self::set_area_scale_filter(scene, source.source());
+                }
+                ok
+            }
             None => false,
         };
         if applied {
@@ -1715,7 +1744,11 @@ impl CaptureContext {
             let Some((scene, source)) = self.app_scenes.get(&app) else {
                 return;
             };
-            scene.set_transform_info(source.source(), &info).is_ok()
+            let ok = scene.set_transform_info(source.source(), &info).is_ok();
+            if ok {
+                Self::set_area_scale_filter(scene, source.source());
+            }
+            ok
         };
         if applied {
             self.last_monitor_fit = Some(key);
@@ -1815,7 +1848,13 @@ impl CaptureContext {
             .set_bounds_type(ObsBoundsType::None)
             .build(0, 0);
         let applied = match self.app_scenes.get(&app) {
-            Some((scene, source)) => scene.set_transform_info(source.source(), &info).is_ok(),
+            Some((scene, source)) => {
+                let ok = scene.set_transform_info(source.source(), &info).is_ok();
+                if ok {
+                    Self::set_area_scale_filter(scene, source.source());
+                }
+                ok
+            }
             None => false,
         };
         if applied {
