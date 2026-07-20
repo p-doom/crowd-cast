@@ -292,13 +292,14 @@ impl CaptureContext {
 
     /// Compute the recording canvas (base) and encoded output dimensions.
     ///
-    /// On Windows the canvas is the bounding box of all monitors, each normalized
-    /// to a 1080px shortest edge (so a window's monitor-level scale renders it at a
-    /// consistent resolution regardless of orientation); the output equals the
-    /// canvas since it is already in 1080-short-edge space. On Linux in single-active
-    /// per-app mode the canvas is the multi-monitor 1080-short-edge envelope (see
-    /// [`super::monitor_layout`]). On macOS (and as a fallback) the canvas is the main
-    /// display and the output is downscaled to `max_output_height`.
+    /// On all three platforms the canvas is the bounding envelope of every monitor,
+    /// each normalized to a 1080px shortest edge, and **the output equals the canvas**:
+    /// a normalized envelope is already in 1080-short-edge space, so capping it would
+    /// downscale every monitor's content whenever a portrait monitor makes the envelope
+    /// taller than 1080 (the field incident: an ultrawide recorded at 0.42× effective
+    /// scale). `max_output_height` applies only to the raw main-display FALLBACK paths,
+    /// which are not normalized (e.g. a 5K main display alone would otherwise encode at
+    /// 5120×2880).
     fn canvas_and_output_dimensions(&self) -> ((u32, u32), (u32, u32)) {
         #[cfg(target_os = "windows")]
         {
@@ -310,15 +311,14 @@ impl CaptureContext {
         }
 
         // Linux single-active per-app mode: the multi-monitor 1080-short-edge envelope, so a
-        // window on any monitor fits its normalized slot. Falls through to display resolution
+        // window on any monitor fits its normalized slot. Output equals the canvas — the
+        // envelope is already normalized; capping it crushes everything (see doc above). Falls through to display resolution
         // if monitor enumeration fails.
         #[cfg(target_os = "linux")]
         if self.use_single_active_app_capture() {
             if let Some((w, h)) = super::monitor_layout::capture_canvas_size() {
                 debug!("Multi-monitor capture canvas: {}x{}", w, h);
-                let output =
-                    calculate_output_dimensions(w, h, self.recording_config.max_output_height);
-                return ((w, h), output);
+                return ((w, h), (w, h));
             }
             warn!(
                 "Could not enumerate monitors for the multi-monitor capture canvas. \
@@ -338,9 +338,10 @@ impl CaptureContext {
         if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
             if let Some((w, h)) = super::mac_geometry::capture_canvas_size() {
                 debug!("macOS multi-monitor capture canvas: {}x{}", w, h);
-                let output =
-                    calculate_output_dimensions(w, h, self.recording_config.max_output_height);
-                return ((w, h), output);
+                // Output equals the normalized canvas — never cap the envelope. Capping it
+                // is the portrait-display incident: the envelope grew past 1080 tall and
+                // every display's content was downscaled ~0.56x to fit.
+                return ((w, h), (w, h));
             }
             warn!(
                 "macOS multi-monitor: could not enumerate displays for the capture canvas. \
@@ -1074,6 +1075,23 @@ impl CaptureContext {
     /// normalized envelope; otherwise the display resolution. `(0, 0)` before initialize.
     pub fn canvas_dimensions(&self) -> (u32, u32) {
         self.canvas_dims
+    }
+
+    /// The canvas the CURRENT display set calls for, per the same gating as `initialize`/
+    /// `reset_video` (macOS multi-monitor + single-active only — `None` otherwise, or when
+    /// enumeration fails). Lets the engine verify the in-use canvas still matches reality:
+    /// during display-attach flux the DisplayMonitor's dims snapshot and the canvas
+    /// computation can read a display's mode at different instants (observed live: a monitor
+    /// reattaching mid-rotation), leaving the canvas built from a transient value while the
+    /// change detector's memory holds the settled one — no further event ever fires. Comparing
+    /// expected vs actual closes every such divergence path.
+    #[cfg(target_os = "macos")]
+    pub fn expected_canvas(&self) -> Option<(u32, u32)> {
+        if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
+            super::mac_geometry::capture_canvas_size()
+        } else {
+            None
+        }
     }
 
     /// Layout metadata for the segment: the display currently captured (which physical monitor

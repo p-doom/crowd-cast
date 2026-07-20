@@ -120,7 +120,7 @@ pub struct MouseScrollEvent {
 /// context of a recording. Bounds are in POINTS in the global virtual-desktop space (top-left
 /// origin of the main display, matching CoreGraphics `CGDisplayBounds`); `px_*` are the backing
 /// pixel resolution. The active display's scale factor applied to the video is
-/// `1080 / min(px_width, px_height)`.
+/// `1080 / min(px_width, px_height)` (short-edge normalized, same rule on all platforms).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorInfo {
     /// Stable per-physical-display UUID (CoreGraphics), for joining across segments/sessions.
@@ -184,8 +184,8 @@ pub struct MetadataEvent {
     /// The display currently being captured — which physical monitor the video is showing — or
     /// `None` when the macOS multi-monitor path is inactive (flag off / non-macOS / not
     /// single-active). Also present in `displays`. The video (canvas = `display_width` x
-    /// `display_height`) shows this display's content scaled by `1080 / min(px_width, px_height)`
-    /// at the canvas origin.
+    /// `display_height`) shows this display's content scaled by
+    /// `1080 / min(px_width, px_height)` at the canvas origin.
     #[serde(default)]
     pub active_display: Option<MonitorInfo>,
 

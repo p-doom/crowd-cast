@@ -33,6 +33,12 @@ pub enum DisplayChangeEvent {
 pub struct DisplayMonitor {
     /// Last known display IDs
     last_display_ids: Vec<u32>,
+    /// Last known PIXEL dimensions per display, parallel to `last_display_ids`. Rotating a
+    /// display (or changing its resolution) preserves its CGDirectDisplayID, so an ID-only
+    /// diff misses it — while the per-source norm (recomputed fresh each poll) silently adopts
+    /// the new orientation, cropping content against the stale canvas until the next restart.
+    /// Windows/Linux compare full monitor rects for the same reason.
+    last_display_dims: Vec<(u32, u32)>,
     /// Whether displays were disconnected
     displays_were_disconnected: bool,
     /// The display ID that was active when recording started
@@ -45,13 +51,26 @@ pub struct DisplayMonitor {
 impl DisplayMonitor {
     pub fn new() -> Self {
         let ids = Self::get_display_ids();
-        debug!("DisplayMonitor initialized with displays: {:?}", ids);
+        let dims = Self::get_display_dims(&ids);
+        debug!("DisplayMonitor initialized with displays: {:?} {:?}", ids, dims);
         Self {
             last_display_ids: ids,
+            last_display_dims: dims,
             displays_were_disconnected: false,
             original_display_id: None,
             original_display_uuid: None,
         }
+    }
+
+    /// PIXEL dimensions for each display id, in the same order. `(0, 0)` when a display's
+    /// mode is momentarily unreadable — a flap to/from the sentinel emits an extra reinit
+    /// rather than being silently swallowed. While recording that costs two segment
+    /// boundaries (stop/start), which is acceptable: mode reads only realistically fail
+    /// during display-config changes, where a reinit is wanted anyway.
+    fn get_display_dims(ids: &[u32]) -> Vec<(u32, u32)> {
+        ids.iter()
+            .map(|&id| super::mac_geometry::display_pixel_size(id).unwrap_or((0, 0)))
+            .collect()
     }
 
     /// Set the original display when recording starts
@@ -87,13 +106,43 @@ impl DisplayMonitor {
     /// Check for display changes and return what kind of change occurred
     pub fn check_for_changes(&mut self) -> Option<DisplayChangeEvent> {
         let current_ids = Self::get_display_ids();
+        let current_dims = Self::get_display_dims(&current_ids);
 
-        // No change
-        if current_ids == self.last_display_ids {
+        // No change (IDs AND pixel dimensions — rotation/resolution changes keep the ID)
+        if current_ids == self.last_display_ids && current_dims == self.last_display_dims {
             return None;
         }
 
+        let ids_changed = current_ids != self.last_display_ids;
         let old_ids = std::mem::replace(&mut self.last_display_ids, current_ids.clone());
+        let old_dims = std::mem::replace(&mut self.last_display_dims, current_dims.clone());
+
+        // Same display set, different pixel dimensions: a display was rotated or its
+        // resolution changed. Reinitialize against it so the canvas and transforms are
+        // recomputed for the new orientation (rides the same path as a display switch).
+        if !ids_changed {
+            let (idx, &id) = current_ids
+                .iter()
+                .enumerate()
+                .find(|&(i, _)| current_dims.get(i) != old_dims.get(i))
+                .map(|(i, id)| (i, id))?;
+            let name = get_display_name(id);
+            let uuid = get_display_uuid(id).unwrap_or_default();
+            info!(
+                "Display {} ({}) changed size/orientation: {:?} -> {:?}; reinitializing",
+                name,
+                id,
+                old_dims.get(idx),
+                current_dims.get(idx)
+            );
+            return Some(DisplayChangeEvent::SwitchedToNew {
+                from_id: id,
+                from_name: name.clone(),
+                to_id: id,
+                to_name: name,
+                to_uuid: uuid,
+            });
+        }
 
         // All displays disconnected
         if current_ids.is_empty() {
