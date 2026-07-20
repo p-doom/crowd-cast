@@ -204,24 +204,25 @@ async fn wait_for_displays_to_settle() {
 }
 
 /// Whether the capture watchdog should escalate a not-ready active source to a full
-/// rebuild. Pure (no OBS) so the trigger logic is unit-tested directly.
+/// process restart. Pure (no OBS) so the trigger logic is unit-tested directly.
 ///
 /// The trigger is how long the source has been *continuously* not-ready (`dead_since`),
 /// NOT the per-app refresh count: that count resets to zero on every app switch, so a
 /// user cycling between apps whose sources are all dead would never reach an attempt bar.
 /// `dead_since` is only cleared when a source becomes ready, so it spans app switches.
-/// `active_session_unpaused` must be true — the escalation toggles recording, which would
-/// wrongly un-pause a paused session. Repeats are throttled to `reescalate_every` so a
-/// rebuild that itself lands in display flux gets another try without thrashing.
+/// `preconditions_met` folds in the caller's gating (a live, unpaused session that has
+/// had a working source at least once — see the call site); when false we never escalate.
+/// Repeats are throttled to `reescalate_every` so a restart that lands during display flux
+/// gets another try without thrashing (the shared restart backoff is the deeper guard).
 fn dead_source_escalation_due(
     now: Instant,
     dead_since: Instant,
     last_escalation: Option<Instant>,
-    active_session_unpaused: bool,
+    preconditions_met: bool,
     escalate_after: Duration,
     reescalate_every: Duration,
 ) -> bool {
-    active_session_unpaused
+    preconditions_met
         && now.saturating_duration_since(dead_since) >= escalate_after
         && last_escalation.map_or(true, |t| now.saturating_duration_since(t) >= reescalate_every)
 }
@@ -719,8 +720,9 @@ pub struct SyncEngine {
     /// source escalation fires even while the user is switching between apps whose sources are
     /// all dead (the per-app attempt counter resets on every switch and never reaches the bar).
     capture_dead_since: Option<Instant>,
-    /// When the dead-source escalation last recreated all sources, to space out repeats while
-    /// a source stays dead. Cleared once a source becomes ready.
+    /// When the dead-source escalation last attempted a restart, to space out repeats while
+    /// a source stays dead (the shared restart backoff is the deeper guard). Cleared once a
+    /// source becomes ready.
     last_capture_escalation: Option<Instant>,
     /// Whether we've already shown the "restart your Mac" alert this session
     restart_alert_shown: bool,
@@ -1615,15 +1617,17 @@ unintended app video."
                     );
                 }
 
-                // Escalation: an in-place obs_source_update cannot revive every dead
-                // stream — in the field, sources recreated during post-unlock/monitor-
-                // connect display churn stayed not-ready (0-dim), dropping the user's
-                // input events, until a manual restart cured them. The automatic
-                // rebuilds that ran had all landed mid-churn; what worked was a rebuild
-                // at a CALM moment. So once a source has been dead long enough, apply the
-                // display-change remedy — settle-gate, then reset video + recreate all
-                // sources — repeating on an interval while it stays dead so a rebuild
-                // that itself lands in flux gets another chance once things hold still.
+                // Escalation: an in-place obs_source_update cannot revive a dead
+                // ScreenCaptureKit source, and neither can an in-place recreate within
+                // the same OBS context — SCK sources only bind reliably when created in a
+                // FRESH context (see the screen-unlock RestartProcess path and
+                // needs_scene_for_app; both restart the process rather than rebuild in
+                // place). In the field a source that came up not-ready (0-dim) after a
+                // monitor-connect display flap stayed dead, dropping the user's input,
+                // until a MANUAL crowd-cast restart cured it. So the escalation is that
+                // proven cure: a full process restart, gated by the shared exponential
+                // backoff so a restart that doesn't stick — or the rarer OS-level wedge
+                // that needs a Mac restart (check_capture_health's alert) — can't spin.
                 //
                 // The trigger is TIME the source has been continuously dead, not the
                 // per-app refresh count: that count resets to zero on every app switch,
@@ -1636,50 +1640,43 @@ unintended app video."
                 let now = Instant::now();
                 let dead_since = *self.capture_dead_since.get_or_insert(now);
                 let dead_for = now.saturating_duration_since(dead_since);
-                // `surface_failure` (live session, not paused) gates the escalation: it stops
-                // and restarts recording, which would wrongly un-pause a paused session — the
-                // capture watchdog stays armed across a pause. When paused we still let the
-                // dead-clock accumulate, so escalation fires promptly once recording resumes.
+                // Preconditions to auto-restart: a live, unpaused session (`surface_failure`)
+                // that has had a working source at least once (`any_source_ever_ready`). The
+                // ever-ready gate scopes this to the "worked, then died" regression — a source
+                // that never came up at startup is left to check_capture_health / startup retry,
+                // so a slow first launch can't turn into a restart loop.
+                let preconditions_met = surface_failure && self.any_source_ever_ready;
                 let escalation_due = dead_source_escalation_due(
                     now,
                     dead_since,
                     self.last_capture_escalation,
-                    surface_failure,
+                    preconditions_met,
                     ESCALATE_AFTER,
                     REESCALATE_EVERY,
                 );
                 if escalation_due {
+                    self.last_capture_escalation = Some(now);
+                    // Only restart if the shared backoff allows it (macOS); other platforms
+                    // don't use SCK, so a fresh context is always fine to take.
+                    #[cfg(all(target_os = "macos", not(no_tray)))]
+                    let restart_ok = restart_allowed_with_backoff();
+                    #[cfg(not(all(target_os = "macos", not(no_tray))))]
+                    let restart_ok = true;
+                    if restart_ok {
+                        warn!(
+                            "Active capture source for '{}' dead for {}s; restarting for a fresh capture context",
+                            watchdog.expected_app,
+                            dead_for.as_secs()
+                        );
+                        self.input_backend.stop();
+                        self.stop_recording().await.ok();
+                        restart_process(); // exec()s — never returns
+                    }
                     warn!(
-                        "Active capture source for '{}' dead for {}s; recreating all capture sources in place",
+                        "Capture source for '{}' dead for {}s but restart deferred by backoff; will retry",
                         watchdog.expected_app,
                         dead_for.as_secs()
                     );
-                    self.last_capture_escalation = Some(now);
-                    #[cfg(target_os = "macos")]
-                    wait_for_displays_to_settle().await;
-                    let restart_recording = self.current_session.is_some();
-                    if restart_recording {
-                        self.stop_recording().await.ok();
-                    }
-                    match self.capture_ctx.reset_video_and_recreate_sources() {
-                        Ok(()) => {
-                            info!("Recreated capture sources after dead-source escalation");
-                            if let Ok(res) = get_main_display_resolution() {
-                                self.display_resolution = res;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Dead-source escalation failed to recreate sources: {}", e);
-                        }
-                    }
-                    if restart_recording {
-                        if let Err(e) = self.start_recording().await {
-                            error!(
-                                "Failed to restart recording after dead-source escalation: {}",
-                                e
-                            );
-                        }
-                    }
                     self.schedule_capture_watchdog(&watchdog.expected_app, watchdog.attempt + 1);
                     self.refresh_capture_enabled_from_frontmost();
                     return;
@@ -3938,9 +3935,11 @@ mod tests {
     }
 
     #[test]
-    fn escalation_never_fires_while_paused() {
+    fn escalation_never_fires_when_preconditions_unmet() {
         let t0 = Instant::now();
-        // Dead well past the threshold, but a paused/no-session state must not toggle recording.
+        // Dead well past the threshold, but preconditions are false — paused, no live session,
+        // or a source that was never ready (a slow first launch, left to startup retry). Must
+        // not restart in any of these, or a launch that's merely slow becomes a restart loop.
         assert!(!dead_source_escalation_due(
             t0 + Duration::from_secs(120),
             t0,
