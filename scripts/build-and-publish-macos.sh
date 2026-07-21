@@ -229,6 +229,43 @@ else
     echo "No Windows crowd-cast-setup.exe found yet; publishing macOS-only (win button stays 404 until Windows releases)."
 fi
 
+# --- Carry the current Linux assets forward ---
+# Same reason as the Windows exe above: this release becomes "Latest", and the
+# website's Linux install button (and page logo) resolve via
+# /releases/latest/download/, so crowd-cast-agent-x86_64, install-linux.sh, and
+# logo.png must ride along or those URLs 404. (Observed live: v1.0.7-1097
+# 404'd the Linux button for the minutes until linux-v1.0.7+11 took "Latest"
+# back — a macOS-last release would have left it 404 indefinitely.) The Linux
+# release's own asset URLs are immutable, so its auto-update/install flows are
+# unaffected; this is purely the human download path.
+LINUX_CARRY_ASSETS=(crowd-cast-agent-x86_64 install-linux.sh logo.png)
+LINUX_TAG=""
+LINUX_TAG_NAMES=""
+while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
+    names="$(gh release view "$tag" --repo "$GITHUB_REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+    if grep -qx 'crowd-cast-agent-x86_64' <<<"$names"; then LINUX_TAG="$tag"; LINUX_TAG_NAMES="$names"; break; fi
+done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+
+if [[ -n "$LINUX_TAG" ]]; then
+    for asset in "${LINUX_CARRY_ASSETS[@]}"; do
+        if ! grep -qx "$asset" <<<"$LINUX_TAG_NAMES"; then
+            echo "Warning: $LINUX_TAG has no $asset; skipping that carry-forward." >&2
+            continue
+        fi
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            echo "[dry-run] would carry forward $asset from $LINUX_TAG"
+        else
+            gh release download "$LINUX_TAG" --repo "$GITHUB_REPO" \
+                --pattern "$asset" --dir "$CARRY_DIR" --clobber
+            echo "Carried forward $asset from $LINUX_TAG"
+        fi
+        ASSETS+=("$CARRY_DIR/$asset")
+    done
+else
+    echo "No Linux crowd-cast-agent-x86_64 found yet; publishing without Linux assets (linux button stays 404 until Linux releases)."
+fi
+
 # --- Publish to GitHub Releases ---
 echo
 echo "=== Publishing to GitHub Releases ==="
