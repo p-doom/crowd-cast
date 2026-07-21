@@ -3623,7 +3623,7 @@ unintended app video."
                             );
                             let settled = wait_for_displays_to_settle().await;
                             // Prefer a fresh-context restart once settled (same rationale as
-                            // the event path); execs on success, else in-place this pass.
+                            // the event path); execs when settled, else in-place this pass.
                             #[cfg(no_tray)]
                             let _ = settled;
                             #[cfg(not(no_tray))]
@@ -3655,11 +3655,11 @@ unintended app video."
 
         // macOS: once the display set has *settled*, re-bind capture via a fresh OBS context —
         // the reliable cure for ScreenCaptureKit (an in-place recreate leaves sources 0-dim:
-        // the Firefox-dead-after-lid regression). Gated on `settled` because restarting into
-        // continued flux is exactly what crash-looped SCK init historically (#56); if it never
-        // settled we fall through to the non-crashing in-place reinit instead. AllDisconnected
-        // is excluded (nothing to capture — wait for reconnection). Execs on success; returns
-        // only if the backoff deferred it, then also falls through to in-place this pass.
+        // the Firefox-dead-after-lid regression). Fires on EVERY settled display change (lid
+        // open/close, dock, resolution change). Gated on `settled` because restarting into
+        // continued flux is what crash-looped SCK init historically (#56); if it never settles
+        // we fall through to the non-crashing in-place reinit instead. AllDisconnected is
+        // excluded (nothing to capture — wait for reconnection). Execs — never returns.
         // Non-macOS keeps the in-place path (a restart tears down the SNI tray on Linux).
         #[cfg(all(target_os = "macos", not(no_tray)))]
         if settled && !matches!(event, DisplayChangeEvent::AllDisconnected) {
@@ -3744,22 +3744,26 @@ unintended app video."
 
     /// macOS: restart the process for a fresh capture context after a *settled* display change.
     /// A fresh OBS context is the only reliable way to re-bind ScreenCaptureKit sources — an
-    /// in-place recreate leaves them 0-dim (the Firefox-dead-after-lid regression). This is
-    /// literally restoring the original behavior (#43); #56 reverted it because restarting
-    /// mid-flux crashed SCK init and crash-looped into launchd throttle exhaustion. Both of
-    /// those triggers are now handled: every caller runs the settle-gate first (so SCK init
-    /// never sees a half-resolved display), and `restart_allowed_with_backoff` bounds the rate
-    /// so a crash can't exhaust launchd. Execs on success (never returns); returns only when
-    /// the backoff defers, so the caller does an in-place reinit for this pass instead.
+    /// in-place recreate leaves them 0-dim (the Firefox-dead-after-lid regression). This
+    /// restores the original behavior (#43); #56 reverted it because restarting mid-flux
+    /// crashed SCK init and crash-looped. That trigger is handled by the caller's settle-gate:
+    /// it only reports settled once the display set is stable AND the main-display UUID is
+    /// resolvable — exactly the input SCK init needs — so a settled restart can't hit it.
+    ///
+    /// Deliberately NOT rate-limited by `restart_allowed_with_backoff` (unlike the dead-source
+    /// path): we WANT to restart on every settled display change — every lid open/close, dock,
+    /// resolution change — reliable capture over smoothness, and the backoff was what fell back
+    /// to the broken in-place path when it deferred. Dropping it is safe here because (a) the
+    /// settle-gate prevents the mid-flux crash, (b) its two-read requirement already rate-limits
+    /// this to ~once per 1.6s, and (c) these are CLEAN restarts (exit 0), which never count
+    /// toward launchd's crash throttle — so no number of them can strand the app the way #56's
+    /// crash (exit 1) loops did. Execs — never returns.
     #[cfg(all(target_os = "macos", not(no_tray)))]
     async fn restart_for_display_change(&mut self) {
-        if restart_allowed_with_backoff() {
-            info!("Display change settled — restarting for a fresh capture context");
-            self.input_backend.stop();
-            self.stop_recording().await.ok();
-            restart_process(); // exec()s — never returns
-        }
-        warn!("Display-change restart deferred by backoff; in-place reinit this pass");
+        info!("Display change settled — restarting for a fresh capture context");
+        self.input_backend.stop();
+        self.stop_recording().await.ok();
+        restart_process(); // exec()s — never returns
     }
 
     /// Stop-if-recording -> reset video/canvas + recreate sources -> restart. Shared by the
