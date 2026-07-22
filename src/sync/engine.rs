@@ -1705,10 +1705,8 @@ unintended app video."
         watchdog: &PendingCaptureWatchdog,
         surface_failure: bool,
     ) -> bool {
-        // How long an app's source must be continuously dead before we act; and how recent the
-        // per-app "we restarted for this app" marker must be to count as "the restart failed."
+        // How long an app's source must be continuously dead before we act.
         const ESCALATE_AFTER: Duration = Duration::from_secs(12);
-        const RESTART_TRIED_WINDOW: Duration = Duration::from_secs(180);
 
         let app = watchdog.expected_app.clone();
         let now = Instant::now();
@@ -1717,8 +1715,13 @@ unintended app video."
         let dead_since = *self.capture_dead_since.entry(app.clone()).or_insert(now);
         let dead_for = now.saturating_duration_since(dead_since);
 
-        let already_restarted =
-            capture_dead_restart_age(&app).is_some_and(|age| age <= RESTART_TRIED_WINDOW);
+        // "Already restarted for this app" is the mere PRESENCE of its marker — it persists
+        // until this app's OWN source recovers (Ok(true) clears it), not a time window. An
+        // earlier cut aged this out after 180s, which re-restarted a continuously-dead app
+        // every few minutes (caught dogfooding: Firefox restarted twice under a persistent
+        // wedge). The read layer prunes markers older than 1h purely as an orphan guard, so a
+        // marathon wedge re-restarts at most hourly — otherwise it's one restart per wedge.
+        let already_restarted = capture_dead_restart_age(&app).is_some();
         let already_alerted = self.capture_alerted_apps.contains(&app);
         // Precondition: a live, unpaused session. Deliberately NOT `any_source_ever_ready` —
         // "no sources" must self-heal even from a dead-at-startup process (an unlock-restart
