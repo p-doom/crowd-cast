@@ -156,6 +156,22 @@ fn main() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // E2E-ONLY (tmp/e2e-follow-focus): redirect logging (and crash.log) into the caller's
+    // out_dir before init_logging fires, so this diagnostic never appends to the shared
+    // %LOCALAPPDATA%\crowd-cast Logs tree the long-running tray agent writes to.
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("CROWD_CAST_LOG_PATH").is_none() {
+        let raw_args: Vec<String> = std::env::args().collect();
+        if let Some(pos) = raw_args.iter().position(|a| a == "--e2e-follow-focus") {
+            if let Some(out_dir) = raw_args.get(pos + 1) {
+                std::env::set_var(
+                    "CROWD_CAST_LOG_PATH",
+                    std::path::Path::new(out_dir).join("logs"),
+                );
+            }
+        }
+    }
+
     // Initialize logging
     let _log_guard = logging::init_logging()?;
 
@@ -323,6 +339,35 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+
+    // E2E-ONLY (tmp/e2e-follow-focus): record while running the real follow-focus +
+    // monitor-fit poll against live focus changes, without the engine/tray/uploader.
+    if let Some(pos) = args.iter().position(|a| a == "--e2e-follow-focus") {
+        #[cfg(target_os = "windows")]
+        {
+            let usage = "usage: --e2e-follow-focus <out_dir> <exe> <duration_secs>";
+            let out_dir = args.get(pos + 1).ok_or_else(|| anyhow::anyhow!(usage))?;
+            let exe = args.get(pos + 2).ok_or_else(|| anyhow::anyhow!(usage))?;
+            let secs: u64 = args
+                .get(pos + 3)
+                .ok_or_else(|| anyhow::anyhow!(usage))?
+                .parse()
+                .map_err(|_| anyhow::anyhow!(usage))?;
+            match e2e_follow_focus(std::path::Path::new(out_dir), exe, secs) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!("e2e-follow-focus failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = pos;
+            eprintln!("--e2e-follow-focus is windows only");
+            std::process::exit(1);
         }
     }
 
@@ -760,6 +805,122 @@ fn get_output_directory(config: &Config) -> std::path::PathBuf {
         .output_directory
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"))
+}
+
+/// E2E-ONLY (tmp/e2e-follow-focus): record `exe` for `secs` seconds while running the real
+/// follow-focus + monitor-fit poll every 100ms, logging every bound-window change to
+/// <out_dir>/e2e_log.jsonl with wall-clock and OBS frame-time stamps. An external script
+/// drives real focus changes between two windows of `exe`; the recording plus the log are
+/// then checked for: capture following focus, HWND dedup (no re-point without a focus
+/// change), and per-switch black-frame cost.
+#[cfg(target_os = "windows")]
+fn e2e_follow_focus(out_dir: &std::path::Path, exe: &str, secs: u64) -> Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("Failed to create output dir {:?}", out_dir))?;
+
+    let runtime = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+    let mut ctx = runtime
+        .block_on(capture::CaptureContext::new(out_dir.to_path_buf()))
+        .context("Failed to create capture context")?;
+    let targets = vec![exe.to_string()];
+    ctx.set_single_active_app_capture(true);
+    ctx.set_target_apps(&targets);
+    ctx.initialize().context("Failed to initialize libobs")?;
+    ctx.setup_capture(&targets, &std::collections::HashMap::new())
+        .context("Failed to set up capture")?;
+    ctx.switch_active_app_capture(Some(&exe.to_ascii_lowercase()))
+        .context("Failed to activate capture scene")?;
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !ctx.active_source_is_ready().unwrap_or(false) {
+        if Instant::now() >= ready_deadline {
+            anyhow::bail!("capture source never became ready (no frames after 5s)");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let session_id = format!(
+        "e2e-follow-focus-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let session = ctx
+        .start_recording(session_id)
+        .context("Failed to start recording")?;
+    let mp4_path = session.output_path.clone();
+    let start_time_ns = session.start_time_ns;
+
+    let log_path = out_dir.join("e2e_log.jsonl");
+    let mut log = std::fs::File::create(&log_path)
+        .with_context(|| format!("Failed to create log file {:?}", log_path))?;
+    let start = Instant::now();
+
+    let mut emit = |log: &mut std::fs::File,
+                    ctx: &capture::CaptureContext,
+                    mut event: serde_json::Value|
+     -> Result<()> {
+        if let Some(obj) = event.as_object_mut() {
+            obj.insert(
+                "wall_ms".to_string(),
+                serde_json::json!(start.elapsed().as_millis() as u64),
+            );
+            let frame_time = match ctx.get_video_frame_time() {
+                Ok(ns) => serde_json::json!(ns),
+                Err(_) => serde_json::Value::Null,
+            };
+            obj.insert("frame_time_ns".to_string(), frame_time);
+        }
+        writeln!(log, "{event}").context("Failed to write e2e log line")?;
+        Ok(())
+    };
+
+    emit(
+        &mut log,
+        &ctx,
+        serde_json::json!({"event": "recording_start", "start_time_ns": start_time_ns}),
+    )?;
+
+    // The real production tick pair, at the engine's cadence.
+    let mut last_bound = ctx.e2e_active_bound_hwnd();
+    emit(
+        &mut log,
+        &ctx,
+        serde_json::json!({"event": "initial_bound", "hwnd": last_bound}),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let body = (|| -> Result<()> {
+        while Instant::now() < deadline {
+            ctx.apply_focused_window_to_active();
+            ctx.apply_monitor_fit_to_active();
+            let bound = ctx.e2e_active_bound_hwnd();
+            if bound != last_bound {
+                emit(
+                    &mut log,
+                    &ctx,
+                    serde_json::json!({"event": "bound_change", "from": last_bound, "to": bound}),
+                )?;
+                last_bound = bound;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    })();
+    let _ = ctx.stop_recording();
+    body?;
+
+    let summary = serde_json::json!({
+        "mp4": mp4_path.to_string_lossy(),
+        "log": log_path.to_string_lossy(),
+        "start_time_ns": start_time_ns,
+    });
+    println!("{summary}");
+    Ok(())
 }
 
 fn reconcile_start_on_login(config: &mut Config) {
