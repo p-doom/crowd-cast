@@ -156,6 +156,25 @@ fn main() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // SPIKE-ONLY diagnostic: if this run is the WGC re-point measurement harness
+    // (--measure-wgc-repoint <out_dir> ...), redirect logging (and crash.log, which
+    // shares the same dir) into the caller's out_dir *before* logging::init_logging()
+    // below fires -- resolve_log_dir() checks CROWD_CAST_LOG_PATH first. Otherwise this
+    // diagnostic would append to the shared %LOCALAPPDATA%\crowd-cast\...\Logs tree the
+    // long-running tray agent also writes to.
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("CROWD_CAST_LOG_PATH").is_none() {
+        let raw_args: Vec<String> = std::env::args().collect();
+        if let Some(pos) = raw_args.iter().position(|a| a == "--measure-wgc-repoint") {
+            if let Some(out_dir) = raw_args.get(pos + 1) {
+                std::env::set_var(
+                    "CROWD_CAST_LOG_PATH",
+                    std::path::Path::new(out_dir).join("logs"),
+                );
+            }
+        }
+    }
+
     // Initialize logging
     let _log_guard = logging::init_logging()?;
 
@@ -323,6 +342,35 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+
+    // SPIKE-ONLY Windows diagnostic: measure how long a window_capture (WGC) source
+    // takes to resume producing frames of a new target window after being re-pointed at
+    // runtime (obs_source_update / set_window_raw), and what the recording shows during
+    // the gap (black vs. stale frames). Runs its own short-lived tokio runtime and writes
+    // ONLY under the caller-supplied out_dir. Kept above config load / setup wizard /
+    // autostart reconcile / auth / tray / engine init -- none of which this needs.
+    if let Some(pos) = args.iter().position(|a| a == "--measure-wgc-repoint") {
+        #[cfg(target_os = "windows")]
+        {
+            let usage = "usage: --measure-wgc-repoint <out_dir> <exeA> <exeB>";
+            let out_dir = args.get(pos + 1).ok_or_else(|| anyhow::anyhow!(usage))?;
+            let exe_a = args.get(pos + 2).ok_or_else(|| anyhow::anyhow!(usage))?;
+            let exe_b = args.get(pos + 3).ok_or_else(|| anyhow::anyhow!(usage))?;
+            match measure_wgc_repoint(std::path::Path::new(out_dir), exe_a, exe_b) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!("measure-wgc-repoint failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = pos;
+            eprintln!("--measure-wgc-repoint is windows only");
+            std::process::exit(1);
         }
     }
 
@@ -760,6 +808,303 @@ fn get_output_directory(config: &Config) -> std::path::PathBuf {
         .output_directory
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"))
+}
+
+/// SPIKE-ONLY (WGC re-point measurement harness). Driven by the --measure-wgc-repoint
+/// branch in `main`. Windows-only.
+///
+/// Points a `window_capture` (WGC) source at exeA's window, records, then re-points it at
+/// runtime (obs_source_update / set_window_raw) between exeA and exeB and logs what OBS
+/// reports around each re-point, so we can measure how long a re-point takes to resume
+/// producing new-window frames and whether the recording shows black vs. stale frames
+/// during the gap. Writes a recording mp4, a JSONL event log, and a final summary line --
+/// all under `out_dir`. Never touches the prod agent's config/data tree.
+#[cfg(target_os = "windows")]
+fn measure_wgc_repoint(out_dir: &std::path::Path, exe_a: &str, exe_b: &str) -> Result<()> {
+    use anyhow::Context as _;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("Failed to create output dir {:?}", out_dir))?;
+
+    // 1. Resolve one window obs_id per exe (first match by exe file stem, case-insensitive)
+    //    from a single enumeration -- done once, outside any timed window (enumeration is
+    //    expensive; see recon). Abort with a clear message if either exe has no window.
+    let windows =
+        capture::enumerate_capturable_windows().context("Failed to enumerate windows")?;
+    let resolve = |exe: &str| -> Option<(String, Option<String>)> {
+        windows
+            .iter()
+            .find(|(_, w_exe, _)| w_exe.eq_ignore_ascii_case(exe))
+            .map(|(obs_id, _, title)| (obs_id.clone(), title.clone()))
+    };
+    let (obs_id_a, title_a) = resolve(exe_a)
+        .ok_or_else(|| anyhow::anyhow!("no capturable (non-minimized) window for exeA '{}'", exe_a))?;
+    let (obs_id_b, title_b) = resolve(exe_b)
+        .ok_or_else(|| anyhow::anyhow!("no capturable (non-minimized) window for exeB '{}'", exe_b))?;
+    info!(
+        "measure-wgc-repoint: A '{}' -> obs_id '{}' (title {:?}); B '{}' -> obs_id '{}' (title {:?})",
+        exe_a, obs_id_a, title_a, exe_b, obs_id_b, title_b
+    );
+
+    // 2. Build the capture context targeting exeA in single-active mode. Own short-lived
+    //    runtime so we never touch the main path's config load / wizard / tray / engine.
+    let runtime = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+    let mut ctx = runtime
+        .block_on(capture::CaptureContext::new(out_dir.to_path_buf()))
+        .context("Failed to create capture context")?;
+    let targets = vec![exe_a.to_string()];
+    ctx.set_single_active_app_capture(true);
+    ctx.set_target_apps(&targets);
+    ctx.initialize().context("Failed to initialize libobs")?;
+    ctx.setup_capture(&targets, &std::collections::HashMap::new())
+        .context("Failed to set up capture")?;
+
+    // Force exeA's scene onto channel 0. setup_capture only auto-activates it if exeA was
+    // frontmost; we cannot (and must not) change focus, so activate it explicitly. app_scenes
+    // is keyed by the canonical (lower-cased) exe stem.
+    ctx.switch_active_app_capture(Some(&exe_a.to_ascii_lowercase()))
+        .context("Failed to activate exeA capture scene")?;
+
+    // Wait until the source actually produces non-zero frames before recording (WGC starts
+    // asynchronously); bail if it never does (e.g. exeA's window vanished after step 1).
+    let ready_deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while !ctx.active_source_is_ready().unwrap_or(false) {
+        if Instant::now() >= ready_deadline {
+            anyhow::bail!("exeA capture source never became ready (no frames after 5s)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // 2b. Record each window's initial capture dimensions and guard against the two
+    //     windows sharing a source size. The in-log transition signal
+    //     (measure_wgc_poll_dims) keys purely on obs_source_get_width/height changing, so
+    //     if exeA and exeB capture at the SAME pixel size (e.g. both maximized on one
+    //     monitor -- a common real setup) NO "dims" event ever fires across a re-point and
+    //     the dims stream is blind. That is why the PRIMARY signal is per-frame mp4 content
+    //     analysed against the recording_start anchor logged below; "dims" is only a coarse
+    //     secondary cue. exeA is currently active and ready so read its dims directly; probe
+    //     exeB by pointing the source at it and waiting for its dims to appear (bounded), then
+    //     point back at exeA. All of this runs BEFORE start_recording, so it never appears in
+    //     the measured mp4.
+    let dims_a = ctx.active_source_dimensions().unwrap_or(None);
+    ctx.spike_repoint_active_to_raw_window(&obs_id_b)
+        .context("probe: failed to point capture source at exeB")?;
+    let probe_deadline = Instant::now() + std::time::Duration::from_secs(3);
+    let mut dims_b = ctx.active_source_dimensions().unwrap_or(None);
+    while dims_b == dims_a && Instant::now() < probe_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        dims_b = ctx.active_source_dimensions().unwrap_or(None);
+    }
+    ctx.spike_repoint_active_to_raw_window(&obs_id_a)
+        .context("probe: failed to point capture source back at exeA")?;
+    let reready_deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while !ctx.active_source_is_ready().unwrap_or(false) {
+        if Instant::now() >= reready_deadline {
+            anyhow::bail!("exeA capture source never became ready again after exeB dims probe");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    info!(
+        "measure-wgc-repoint: initial capture dims A={:?} B={:?}",
+        dims_a, dims_b
+    );
+    if dims_a.is_some() && dims_a == dims_b {
+        warn!(
+            "measure-wgc-repoint: exeA and exeB capture at identical dimensions {:?}; the \
+             \"dims\" event stream will show NO transition across re-points. Rely on per-frame \
+             mp4 content (the primary signal) located via the recording_start anchor; treat \
+             \"dims\" as only a coarse secondary cue.",
+            dims_a
+        );
+    }
+
+    // 3. Start recording; remember the mp4 path.
+    let session_id = format!(
+        "wgc-measure-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let session = ctx
+        .start_recording(session_id)
+        .context("Failed to start recording")?;
+    let mp4_path = session.output_path.clone();
+    // The OBS video-frame-time captured at record start IS the mp4's PTS t=0 (mirrors
+    // engine.rs: video_relative_us = (get_video_frame_time() - start_time_ns)/1000). Every
+    // event below logs frame_time_ns on this same monotonic clock, so logging this anchor
+    // once is what lets an analyst convert any event to video-relative time and locate the
+    // switch/switch_done events in the recording. wall_ms is a different, unanchored clock.
+    let start_time_ns = session.start_time_ns;
+
+    // 4. Open the JSONL event log.
+    let log_path = out_dir.join("measure_log.jsonl");
+    let mut log = std::fs::File::create(&log_path)
+        .with_context(|| format!("Failed to create log file {:?}", log_path))?;
+    let start = Instant::now();
+
+    // First line: the mp4 t=0 anchor, so every later frame_time_ns maps onto the
+    // recording's zero-based PTS timeline.
+    measure_wgc_emit(
+        &mut log,
+        &ctx,
+        start,
+        serde_json::json!({"event": "recording_start", "start_time_ns": start_time_ns}),
+    )?;
+
+    // Run the timed body; on ANY failure still attempt stop_recording before returning,
+    // so the mp4 is finalized and playable regardless.
+    let body = measure_wgc_repoint_body(
+        &mut ctx,
+        &mut log,
+        start,
+        (exe_a, obs_id_a.as_str()),
+        (exe_b, obs_id_b.as_str()),
+    );
+    let _ = ctx.stop_recording();
+    body?;
+
+    // 8. Final summary line on stdout.
+    let (cw, ch) = ctx.canvas_dimensions();
+    let summary = serde_json::json!({
+        "mp4": mp4_path.to_string_lossy(),
+        "log": log_path.to_string_lossy(),
+        // mp4 PTS t=0 anchor (also emitted as the recording_start log line): map any
+        // event's frame_time_ns onto the video via (frame_time_ns - start_time_ns)/1000 us.
+        "start_time_ns": start_time_ns,
+        "dims_a": dims_a.map(|(w, h)| [w, h]),
+        "dims_b": dims_b.map(|(w, h)| [w, h]),
+        "dims_differ": dims_a != dims_b,
+        "primary_signal": "per-frame mp4 content vs recording_start anchor; dims is a coarse secondary cue",
+        "switches": 20,
+        "noops": 10,
+        "canvas": [cw, ch],
+    });
+    println!("{summary}");
+    Ok(())
+}
+
+/// SPIKE-ONLY: the timed measurement body (warmup, alternating re-points, same-window
+/// no-ops). Split out from `measure_wgc_repoint` so its caller can always run
+/// stop_recording afterwards even if a step here fails. `a`/`b` are `(exe, obs_id)`.
+#[cfg(target_os = "windows")]
+fn measure_wgc_repoint_body(
+    ctx: &mut capture::CaptureContext,
+    log: &mut std::fs::File,
+    start: std::time::Instant,
+    a: (&str, &str),
+    b: (&str, &str),
+) -> Result<()> {
+    use anyhow::Context as _;
+    use std::time::Duration;
+
+    let (exe_a, obs_a) = a;
+    let (exe_b, obs_b) = b;
+
+    // Carries the last-seen active-source dims across every phase so a dims change is
+    // detected relative to the true prior value, not per-phase.
+    let mut last_dims: Option<(u32, u32)> = None;
+
+    // 5. Warmup: 5s, logging a "dims" line on every change (the first observation included).
+    measure_wgc_poll_dims(log, ctx, start, Duration::from_secs(5), &mut last_dims)?;
+
+    // 6. Alternating re-points: 20 total, starting A->B (even n -> B, odd n -> back to A),
+    //    3000ms dwell between them polling dims every 20ms.
+    let mut current_obs = obs_a.to_string(); // source starts showing exeA's window
+    for n in 0..20u32 {
+        let (to_exe, to_obs) = if n % 2 == 0 { (exe_b, obs_b) } else { (exe_a, obs_a) };
+        measure_wgc_emit(
+            log,
+            ctx,
+            start,
+            serde_json::json!({"event": "switch", "n": n, "to": to_exe, "obs_id": to_obs}),
+        )?;
+        ctx.spike_repoint_active_to_raw_window(to_obs)
+            .with_context(|| format!("re-point #{} to '{}' failed", n, to_exe))?;
+        current_obs = to_obs.to_string();
+        measure_wgc_emit(log, ctx, start, serde_json::json!({"event": "switch_done", "n": n}))?;
+        measure_wgc_poll_dims(log, ctx, start, Duration::from_millis(3000), &mut last_dims)?;
+    }
+
+    // 7. Same-window no-ops: 10 re-points to the CURRENTLY SET obs_id, 2000ms dwell.
+    for n in 0..10u32 {
+        measure_wgc_emit(
+            log,
+            ctx,
+            start,
+            serde_json::json!({"event": "noop", "n": n, "obs_id": current_obs.as_str()}),
+        )?;
+        ctx.spike_repoint_active_to_raw_window(&current_obs)
+            .with_context(|| format!("no-op re-point #{} failed", n))?;
+        measure_wgc_emit(log, ctx, start, serde_json::json!({"event": "noop_done", "n": n}))?;
+        measure_wgc_poll_dims(log, ctx, start, Duration::from_millis(2000), &mut last_dims)?;
+    }
+
+    Ok(())
+}
+
+/// SPIKE-ONLY: write one JSONL event line, augmented with wall-clock ms since harness
+/// start and the OBS video frame time (ns) when available (null otherwise).
+#[cfg(target_os = "windows")]
+fn measure_wgc_emit(
+    log: &mut std::fs::File,
+    ctx: &capture::CaptureContext,
+    start: std::time::Instant,
+    mut event: serde_json::Value,
+) -> Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+
+    if let Some(obj) = event.as_object_mut() {
+        obj.insert(
+            "wall_ms".to_string(),
+            serde_json::json!(start.elapsed().as_millis() as u64),
+        );
+        let frame_time = match ctx.get_video_frame_time() {
+            Ok(ns) => serde_json::json!(ns),
+            Err(_) => serde_json::Value::Null,
+        };
+        obj.insert("frame_time_ns".to_string(), frame_time);
+    }
+    writeln!(log, "{event}").context("Failed to write measure log line")?;
+    Ok(())
+}
+
+/// SPIKE-ONLY: poll `active_source_dimensions()` every 20ms for `dwell`, writing a
+/// `{"event":"dims",...}` line on every change (relative to `last`, which is updated).
+#[cfg(target_os = "windows")]
+fn measure_wgc_poll_dims(
+    log: &mut std::fs::File,
+    ctx: &capture::CaptureContext,
+    start: std::time::Instant,
+    dwell: std::time::Duration,
+    last: &mut Option<(u32, u32)>,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + dwell;
+    loop {
+        let dims = ctx.active_source_dimensions().unwrap_or(None);
+        if dims != *last {
+            *last = dims;
+            let (w, h) = match dims {
+                Some((w, h)) => (serde_json::json!(w), serde_json::json!(h)),
+                None => (serde_json::Value::Null, serde_json::Value::Null),
+            };
+            measure_wgc_emit(
+                log,
+                ctx,
+                start,
+                serde_json::json!({"event": "dims", "w": w, "h": h}),
+            )?;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 fn reconcile_start_on_login(config: &mut Config) {

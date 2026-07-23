@@ -1687,6 +1687,30 @@ impl CaptureContext {
         Ok(false)
     }
 
+    /// SPIKE-ONLY (WGC re-point measurement harness): re-point the ACTIVE app's
+    /// `window_capture` source at a specific raw OBS window id via `obs_source_update`/
+    /// `set_window_raw`, in-place (no source/scene recreation). Unlike
+    /// [`refresh_active_capture_source`](Self::refresh_active_capture_source) this points
+    /// the source at an arbitrary caller-resolved window (from
+    /// `enumerate_capturable_windows`) rather than re-resolving the active app's own exe —
+    /// this is the actual follow-focus re-point being measured. Requires single-active mode
+    /// with an active app whose scene exists. Windows-only.
+    #[cfg(target_os = "windows")]
+    pub fn spike_repoint_active_to_raw_window(&mut self, obs_id: &str) -> Result<()> {
+        let app = self
+            .active_capture_app
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("spike re-point: no active capture app"))?;
+        let (_, source) = self
+            .app_scenes
+            .get_mut(app.as_str())
+            .ok_or_else(|| anyhow::anyhow!("spike re-point: no scene for active app '{}'", app))?;
+        source
+            .update_to_raw_window(obs_id)
+            .with_context(|| format!("spike re-point of '{}' to '{}' failed", app, obs_id))?;
+        Ok(())
+    }
+
     /// Report the dimensions of the currently active source, if any.
     pub fn active_source_dimensions(&self) -> Result<Option<(u32, u32)>> {
         let source = if self.use_single_active_app_capture() {

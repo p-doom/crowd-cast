@@ -566,6 +566,30 @@ impl ScreenCaptureSource {
         Ok(())
     }
 
+    /// SPIKE-ONLY (WGC re-point measurement harness): re-point this `window_capture`
+    /// source in-place at a specific raw OBS window id, skipping the exe-stem lookup that
+    /// [`update_application`](Self::update_application) does. Mirrors that method's
+    /// `obs_source_update`/`set_window_raw` primitive but takes a caller-resolved
+    /// `obs_id` (from `enumerate_capturable_windows`) so the harness can target one
+    /// specific window among several sharing an exe. Windows-only.
+    #[cfg(target_os = "windows")]
+    pub fn update_to_raw_window(&mut self, obs_id: &str) -> Result<()> {
+        use libobs_simple::sources::windows::WindowCaptureSourceUpdater;
+        use libobs_wrapper::data::ObsObjectUpdater;
+
+        WindowCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
+            .context("Failed to create window capture updater")?
+            .set_window_raw(obs_id)
+            .update()
+            .context("Failed to update window capture target")?;
+
+        debug!(
+            "Re-pointed window capture source '{}' to raw obs_id '{}'",
+            self.name, obs_id
+        );
+        Ok(())
+    }
+
     /// Re-resolve and re-point this source at the app's focused window, in-place.
     ///
     /// On X11 the window id is ephemeral (app restart / new window), so on every focus switch
@@ -860,6 +884,31 @@ fn find_window_obs_id_for_app(bundle_id: &str) -> Result<String> {
         .ok_or_else(|| {
             anyhow::anyhow!("No capturable window found for application '{}'", bundle_id)
         })
+}
+
+/// SPIKE-ONLY (WGC re-point measurement harness): enumerate every capturable,
+/// non-minimized top-level window as `(obs_id, exe_file_stem, title)`. Same
+/// enumeration `find_window_obs_id_for_app` uses, but returns all windows (already
+/// carrying the wire-format `obs_id` ready for `set_window_raw`) so the harness can
+/// resolve a specific window per exe instead of only the first match. Windows-only.
+#[cfg(target_os = "windows")]
+pub(crate) fn enumerate_capturable_windows() -> Result<Vec<(String, String, Option<String>)>> {
+    use libobs_simple::sources::windows::{WindowCaptureSourceBuilder, WindowSearchMode};
+
+    let windows = WindowCaptureSourceBuilder::get_windows(WindowSearchMode::ExcludeMinimized)
+        .map_err(|e| anyhow::anyhow!("Failed to enumerate windows: {}", e))?;
+
+    Ok(windows
+        .iter()
+        .map(|w| {
+            let exe = std::path::Path::new(&w.0.full_exe)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            (w.0.obs_id.clone(), exe, w.0.title.clone())
+        })
+        .collect())
 }
 
 /// Get the actual resolution of the main display

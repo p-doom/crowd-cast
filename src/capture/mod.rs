@@ -71,6 +71,10 @@ pub use recording::{
 };
 pub use recovery::{get_display_name, get_display_uuid, DisplayChangeEvent, DisplayMonitor};
 pub use sources::{get_main_display_resolution, get_main_display_uuid, ScreenCaptureSource};
+// SPIKE-ONLY (WGC re-point measurement harness): window enumeration used by the
+// --measure-wgc-repoint subcommand to resolve a specific window's obs_id per exe.
+#[cfg(target_os = "windows")]
+pub(crate) use sources::enumerate_capturable_windows;
 // Linux/Wayland display-capture restore-token persistence (handled in main): the reserved
 // map key and the session predicate used to gate the one-time monitor-pick wait.
 #[cfg(target_os = "linux")]
