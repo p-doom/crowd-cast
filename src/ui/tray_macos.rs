@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use tracing::info;
 
 use super::platform_tray::{
@@ -27,6 +27,23 @@ static SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TOGGLE_UPLOADS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SIGN_IN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static MACOS_QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+// Last status-item health verdict seen by poll(), so transitions are logged
+// exactly once. -1 = nothing observed yet (distinct from the C layer's
+// 0 = "not yet checked").
+static LAST_HEALTH_STATE: AtomicI32 = AtomicI32::new(-1);
+
+/// Human-readable name for a tray.h status-item health value.
+fn health_state_name(state: i32) -> &'static str {
+    match state {
+        -1 => "startup",
+        0 => "unchecked",
+        1 => "attached",
+        2 => "detached",
+        3 => "never-attached",
+        _ => "unknown",
+    }
+}
 
 // ---------------------------------------------------------------------------
 // C callbacks — set atomic flags, nothing else
@@ -328,6 +345,22 @@ impl PlatformTray for MacOSTray {
 
         if loop_result < 0 {
             return PlatformTrayPoll::Exit;
+        }
+
+        // Log status-item health transitions into the app log file, so a
+        // missing-icon report can be classified from the participant's log
+        // alone: "never-attached" persisting = the item allocated but no
+        // menu-bar window ever appeared; "attached" while the icon is
+        // visually absent = AppKit thinks it's in the bar but ControlCenter
+        // isn't rendering it (a different failure needing a different fix).
+        let health = unsafe { tray_ffi::tray_status_item_health_state() } as i32;
+        let prev = LAST_HEALTH_STATE.swap(health, Ordering::Relaxed);
+        if health != prev && !(prev == -1 && health == 0) {
+            info!(
+                "Status item health: {} -> {}",
+                health_state_name(prev),
+                health_state_name(health)
+            );
         }
 
         // Platform-specific restart triggers

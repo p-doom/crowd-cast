@@ -60,6 +60,11 @@ extern "C" {
 
     /// Returns true (once) if the native tray needs a process restart
     pub fn tray_needs_restart() -> bool;
+
+    /// Last status-item health verdict (see tray.h for values). Logged as
+    /// transitions by the poll loop so participant log files record whether
+    /// the menu-bar icon ever attached.
+    pub fn tray_status_item_health_state() -> std::os::raw::c_int;
 }
 
 // Stub implementations when tray is not available
@@ -91,6 +96,11 @@ pub unsafe fn tray_screen_was_unlocked() -> bool {
 #[cfg(any(no_tray, target_os = "linux"))]
 pub unsafe fn tray_needs_restart() -> bool {
     false
+}
+
+#[cfg(any(no_tray, target_os = "linux"))]
+pub unsafe fn tray_status_item_health_state() -> std::os::raw::c_int {
+    0
 }
 
 impl Default for Tray {

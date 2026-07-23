@@ -53,6 +53,16 @@ bool tray_screen_was_unlocked(void);
 /* Returns true once if the native tray needs a process restart */
 bool tray_needs_restart(void);
 
+/* Last status-item health verdict, for the Rust side to log transitions into
+ * the app log file (NSLog from the native layer only reaches the unified
+ * system log, which participants don't send us). Values:
+ *   0 = not yet checked
+ *   1 = attached (button has a backing menu-bar window)
+ *   2 = detached (had a window earlier, currently none)
+ *   3 = never attached (no backing window since creation)
+ */
+int tray_status_item_health_state(void);
+
 #ifdef __cplusplus
 }
 #endif
