@@ -2791,6 +2791,12 @@ unintended app video."
                     }
 
                     self.poll_frontmost_app().await;
+                    // Windows follow-focus: if the foreground window changed to a different
+                    // window of the SAME active app, re-point the window_capture source to it
+                    // in-place (deduped on HWND). Runs before the monitor fit so the fit derives
+                    // geometry from whatever window ends up bound. No-op elsewhere.
+                    #[cfg(target_os = "windows")]
+                    self.capture_ctx.apply_focused_window_to_active();
                     // Track the active window's real on-monitor position/scale
                     // (Windows monitor-level fit; no-op elsewhere).
                     self.capture_ctx.apply_monitor_fit_to_active();
