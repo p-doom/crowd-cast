@@ -1718,7 +1718,14 @@ impl CaptureContext {
         let Some(app) = self.active_capture_app.clone() else {
             return;
         };
-        let Some(fit) = super::window_geometry::monitor_fit_for_app(&app) else {
+        // The capture source's size fingerprints which of the app's same-exe windows
+        // OBS is rendering, so the fit tracks that window rather than a transient
+        // dialog that happens to be topmost in Z-order.
+        let source_size = self
+            .app_scenes
+            .get(&app)
+            .and_then(|(_, source)| source.dimensions().ok());
+        let Some(fit) = super::window_geometry::monitor_fit_for_app(&app, source_size) else {
             return;
         };
         let key = (

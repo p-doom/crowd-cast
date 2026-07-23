@@ -168,21 +168,63 @@ pub struct MonitorFit {
     pub pos_y: f32,
 }
 
-pub fn monitor_fit_for_app(bundle_id: &str) -> Option<MonitorFit> {
+/// Among an app's candidate windows (their pixel sizes, topmost-first in Z-order),
+/// choose the index of the one the capture source is actually rendering.
+///
+/// The capture source reports the size of the window OBS locked onto, so when that
+/// size is known we pick the candidate whose bounds match it most closely (ties
+/// resolve to the topmost). This is what stops the fit from latching onto a
+/// transient dialog or floating panel that is momentarily topmost in Z-order:
+/// positioning the captured main-window content at a dialog's location is what
+/// makes the window jump to the wrong spot for a few seconds. Without a source
+/// hint, fall back to the largest window (the main document window dwarfs
+/// dialogs/palettes). `None` only when `sizes` is empty.
+fn select_capture_window(sizes: &[(u32, u32)], source_size: Option<(u32, u32)>) -> Option<usize> {
+    match source_size {
+        Some((sw, sh)) if sw > 0 && sh > 0 => (0..sizes.len()).min_by_key(|&i| {
+            let (w, h) = sizes[i];
+            (w as i64 - sw as i64).unsigned_abs() + (h as i64 - sh as i64).unsigned_abs()
+        }),
+        _ => (0..sizes.len())
+            .min_by_key(|&i| std::cmp::Reverse(sizes[i].0 as u64 * sizes[i].1 as u64)),
+    }
+}
+
+pub fn monitor_fit_for_app(bundle_id: &str, source_size: Option<(u32, u32)>) -> Option<MonitorFit> {
     let mut wins: Vec<*mut c_void> = Vec::new();
     unsafe {
         EnumWindows(collect_window, &mut wins as *mut Vec<*mut c_void> as isize);
     }
 
-    // First match in Z-order (topmost) for this executable, mirroring OBS's
-    // executable-priority matching.
-    let hwnd = wins.into_iter().find(|&h| window_exe_matches(h, bundle_id))?;
+    // Every window this executable owns (topmost first) paired with its bounds.
+    let candidates: Vec<(*mut c_void, Rect)> = wins
+        .into_iter()
+        .filter(|&h| window_exe_matches(h, bundle_id))
+        .filter_map(|h| {
+            let mut r = Rect::ZERO;
+            // SAFETY: `h` is a live top-level window handle from EnumWindows.
+            if unsafe { GetWindowRect(h, &mut r) } != 0 {
+                Some((h, r))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Pick the window OBS is actually capturing, not merely the topmost one, so a
+    // transient dialog/panel does not hijack the transform.
+    let sizes: Vec<(u32, u32)> = candidates
+        .iter()
+        .map(|(_, r)| {
+            (
+                (r.right - r.left).max(0) as u32,
+                (r.bottom - r.top).max(0) as u32,
+            )
+        })
+        .collect();
+    let (hwnd, win) = candidates[select_capture_window(&sizes, source_size)?];
 
     unsafe {
-        let mut win = Rect::ZERO;
-        if GetWindowRect(hwnd, &mut win) == 0 {
-            return None;
-        }
         let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         if hmon.is_null() {
             return None;
@@ -236,5 +278,52 @@ fn window_exe_matches(hwnd: *mut c_void, bundle_id: &str) -> bool {
             .and_then(|s| s.to_str())
             .map(|stem| stem.eq_ignore_ascii_case(bundle_id))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod select_capture_window_tests {
+    use super::select_capture_window;
+
+    #[test]
+    fn matches_source_size_over_topmost_dialog() {
+        // Topmost is a dialog; the captured (main) window is second in Z-order.
+        // Martin's SpaceClaim glitch: a dialog was topmost while OBS captured the
+        // 1927x1047 main window, so the fit must select index 1, not 0.
+        let sizes = [(400, 300), (1927, 1047), (200, 150)];
+        assert_eq!(select_capture_window(&sizes, Some((1927, 1047))), Some(1));
+    }
+
+    #[test]
+    fn tolerates_small_drift_between_source_and_bounds() {
+        // Reported source size and GetWindowRect can differ by a few px (DWM frame).
+        let sizes = [(500, 500), (1920, 1040)];
+        assert_eq!(select_capture_window(&sizes, Some((1927, 1047))), Some(1));
+    }
+
+    #[test]
+    fn size_match_ties_resolve_to_topmost() {
+        let sizes = [(1000, 1000), (1000, 1000)];
+        assert_eq!(select_capture_window(&sizes, Some((1000, 1000))), Some(0));
+    }
+
+    #[test]
+    fn falls_back_to_largest_without_source_hint() {
+        let sizes = [(400, 300), (1927, 1047), (800, 600)];
+        assert_eq!(select_capture_window(&sizes, None), Some(1));
+        // A zero source size is treated as unknown.
+        assert_eq!(select_capture_window(&sizes, Some((0, 0))), Some(1));
+    }
+
+    #[test]
+    fn largest_fallback_ties_resolve_to_topmost() {
+        let sizes = [(1000, 1000), (1000, 1000), (500, 500)];
+        assert_eq!(select_capture_window(&sizes, None), Some(0));
+    }
+
+    #[test]
+    fn empty_candidates_return_none() {
+        assert_eq!(select_capture_window(&[], Some((100, 100))), None);
+        assert_eq!(select_capture_window(&[], None), None);
     }
 }
