@@ -1804,6 +1804,16 @@ impl CaptureContext {
         }
     }
 
+    /// E2E-ONLY (tmp/e2e-follow-focus): the active source's currently bound HWND, so the
+    /// --e2e-follow-focus driver can log bound-window changes. Windows-only.
+    #[cfg(target_os = "windows")]
+    pub fn e2e_active_bound_hwnd(&self) -> Option<isize> {
+        self.active_capture_app
+            .as_ref()
+            .and_then(|app| self.app_scenes.get(app.as_str()))
+            .and_then(|(_, source)| source.bound_hwnd())
+    }
+
     /// Apply the monitor-level fit to the active app's capture source: scale the
     /// window by its monitor's 1080-shortest-edge factor and place it at its real
     /// on-monitor position. Re-applied each poll so it tracks the window as it
