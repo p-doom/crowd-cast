@@ -62,6 +62,7 @@ extern "system" {
     fn IsWindowVisible(hwnd: *mut c_void) -> i32;
     fn IsIconic(hwnd: *mut c_void) -> i32;
     fn GetWindowTextLengthW(hwnd: *mut c_void) -> i32;
+    fn GetForegroundWindow() -> *mut c_void;
 }
 
 #[link(name = "kernel32")]
@@ -207,6 +208,85 @@ pub fn monitor_fit_for_app(bundle_id: &str) -> Option<MonitorFit> {
     }
 }
 
+/// The current foreground window's HWND (as `isize`), but only if it belongs to `bundle_id`
+/// (case-insensitive executable file-stem match, the same rule as `window_exe_matches` and
+/// frontmost app resolution) AND is a real capturable window: visible, not minimized, and
+/// titled (the same filter `collect_window` applies when building the monitor-fit candidate
+/// list, which roughly matches OBS's own `window_capture` enumeration). Returns `None` for
+/// every other case: no foreground window, a window of a different app, or a non-real window.
+///
+/// This is design decision 3(b)'s raw `GetForegroundWindow` query. It deliberately does NOT
+/// reuse `frontmost::get_frontmost_app` (that provider is self-masked and goes deliberately
+/// stale during our own tray / settings interactions to protect input-capture gating, so it
+/// would miss legitimate focus changes here), and it deliberately does NOT consult OBS's own
+/// window enumeration (that is the caller's job, via `sources::select_window_by_handle`, which
+/// keeps this function's dependencies to raw Win32 only). The file-stem match against the active
+/// app's exe is what filters out transient self-focus, so no extra self-mask is layered on.
+///
+/// For a UWP-hosted app, `GetForegroundWindow` returns the `ApplicationFrameHost` parent HWND
+/// while libobs' enumeration surfaces the content child HWND, so the caller's
+/// `select_window_by_handle` lookup will simply miss and no-op for that (uncommon here) class
+/// of app; that is an accepted gap, not a correctness bug, since the fallback is "keep the
+/// current binding".
+///
+/// The pass/fail decision is factored into the pure `foreground_qualifies` gate so it can be
+/// unit-tested without live Win32 handles (see `foreground_gate_tests`); this function only
+/// reads the raw Win32 traits and feeds them to that gate.
+pub(crate) fn foreground_window_of_app(bundle_id: &str) -> Option<isize> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+        let traits = ForegroundWindowTraits {
+            visible: IsWindowVisible(hwnd) != 0,
+            minimized: IsIconic(hwnd) != 0,
+            titled: GetWindowTextLengthW(hwnd) > 0,
+        };
+        // Resolve the owning exe only when the cheap real-window checks already pass:
+        // `window_exe_matches` does an OpenProcess round-trip and this runs on every ~100ms
+        // poll. The pure gate re-checks `is_real_window`, so it stays the single authority on
+        // the combined decision (design decisions 2a + 2b).
+        let exe_matches = traits.is_real_window() && window_exe_matches(hwnd, bundle_id);
+        if foreground_qualifies(traits, exe_matches) {
+            Some(hwnd as isize)
+        } else {
+            None
+        }
+    }
+}
+
+/// Traits of the foreground window that decide whether follow-focus may track it, read from raw
+/// Win32 by `foreground_window_of_app`. Split out from the decision (`foreground_qualifies`) so
+/// the gate is unit-testable without live Win32 handles, exactly as `frontmost::ForegroundTraits`
+/// is split from `frontmost::filter_self`.
+#[derive(Clone, Copy)]
+struct ForegroundWindowTraits {
+    /// `IsWindowVisible`: WGC has no surface to capture for an invisible window.
+    visible: bool,
+    /// `IsIconic`: a minimized window has no live content.
+    minimized: bool,
+    /// `GetWindowTextLengthW > 0`: OBS's `window_capture` enumeration skips untitled windows.
+    titled: bool,
+}
+
+impl ForegroundWindowTraits {
+    /// The "real capturable window" half of the gate (design decision 2b): visible, not
+    /// minimized, titled — the same filter `collect_window` / OBS's own enumeration apply.
+    fn is_real_window(self) -> bool {
+        self.visible && !self.minimized && self.titled
+    }
+}
+
+/// Pure follow-focus gate (design decisions 2a + 2b): the foreground window qualifies as a
+/// re-point target only when it is a real capturable window (`is_real_window`) AND belongs to
+/// the active captured app (`exe_matches`, the caller's case-insensitive exe file-stem check).
+/// Kept free of Win32 so the foreign-exe rejection is unit-testable — binding the active app's
+/// source to another app's window is the foreground-misattribution class behind PR #119 / #120.
+fn foreground_qualifies(traits: ForegroundWindowTraits, exe_matches: bool) -> bool {
+    traits.is_real_window() && exe_matches
+}
+
 /// Whether `hwnd`'s owning process executable file-stem matches `bundle_id`
 /// (case-insensitive), reusing the same exe-resolution as frontmost detection.
 fn window_exe_matches(hwnd: *mut c_void, bundle_id: &str) -> bool {
@@ -236,5 +316,62 @@ fn window_exe_matches(hwnd: *mut c_void, bundle_id: &str) -> bool {
             .and_then(|s| s.to_str())
             .map(|stem| stem.eq_ignore_ascii_case(bundle_id))
             .unwrap_or(false)
+    }
+}
+
+// The whole module is `#[cfg(target_os = "windows")]`, so `#[cfg(test)]` alone already scopes
+// these to Windows test builds.
+#[cfg(test)]
+mod foreground_gate_tests {
+    use super::{foreground_qualifies, ForegroundWindowTraits};
+
+    /// A normal, capturable window: visible, not minimized, titled.
+    const REAL: ForegroundWindowTraits = ForegroundWindowTraits {
+        visible: true,
+        minimized: false,
+        titled: true,
+    };
+
+    #[test]
+    fn real_window_of_the_active_app_qualifies() {
+        // Real capturable window owned by the active app's exe: track it.
+        assert!(foreground_qualifies(REAL, true));
+    }
+
+    #[test]
+    fn foreign_exe_is_rejected_even_when_real() {
+        // A perfectly real, visible, titled foreground window that belongs to a DIFFERENT exe
+        // than the active captured app must NOT be a re-point target: pointing the active app's
+        // source at another app's window is exactly the foreground misattribution that caused
+        // PR #119 / #120. This is the clause with no coverage before this test.
+        assert!(!foreground_qualifies(REAL, false));
+    }
+
+    #[test]
+    fn invisible_window_is_rejected() {
+        // Even the right app's window is skipped when there is no live surface to capture.
+        let traits = ForegroundWindowTraits {
+            visible: false,
+            ..REAL
+        };
+        assert!(!foreground_qualifies(traits, true));
+    }
+
+    #[test]
+    fn minimized_window_is_rejected() {
+        let traits = ForegroundWindowTraits {
+            minimized: true,
+            ..REAL
+        };
+        assert!(!foreground_qualifies(traits, true));
+    }
+
+    #[test]
+    fn untitled_window_is_rejected() {
+        let traits = ForegroundWindowTraits {
+            titled: false,
+            ..REAL
+        };
+        assert!(!foreground_qualifies(traits, true));
     }
 }
