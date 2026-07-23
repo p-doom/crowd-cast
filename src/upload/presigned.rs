@@ -301,6 +301,70 @@ impl Uploader {
     pub fn is_configured(&self) -> bool {
         Self::compile_time_endpoint().is_some()
     }
+
+    /// Upload an app log file under the `logs/` sub-prefix
+    /// (`uploads/<version>/<user>/logs/<remote_name>`), so participant
+    /// issues can be debugged without manually collecting log files.
+    ///
+    /// Returns the number of bytes uploaded — the caller records it and
+    /// re-ships the file when its size changes (see `LogShipper`).
+    pub async fn upload_log_file(
+        &self,
+        local_path: &std::path::Path,
+        remote_name: &str,
+    ) -> Result<u64> {
+        let endpoint = Self::compile_time_endpoint()
+            .context("Lambda endpoint not configured at compile time")?;
+
+        // Same explicit version choice as chunk uploads: test builds go to
+        // the segregated TEST_VERSION prefix, everything else to the crate
+        // version.
+        let version = if option_env!("CROWD_CAST_UPLOAD_TEST").is_some() {
+            "TEST_VERSION"
+        } else {
+            env!("CARGO_PKG_VERSION")
+        };
+        let user_id = Self::compute_user_id();
+        let auth_token = self.get_auth_token().await;
+
+        let file_name = format!("logs/{}", remote_name);
+        let presign = self
+            .request_presigned_url(endpoint, &file_name, version, &user_id, auth_token.as_deref())
+            .await?;
+        debug!("Got pre-signed URL for log file (key: {})", presign.key);
+
+        // Log files are a few MB at most — no need for the streaming path.
+        let bytes = tokio::fs::read(local_path)
+            .await
+            .with_context(|| format!("Failed to read log file: {:?}", local_path))?;
+        let uploaded_len = bytes.len() as u64;
+
+        let content_type = if presign.content_type.is_empty() {
+            "text/plain"
+        } else {
+            presign.content_type.as_str()
+        };
+
+        let response = self
+            .client
+            .put(&presign.upload_url)
+            .header("Content-Type", content_type)
+            .timeout(std::time::Duration::from_secs(60))
+            .body(bytes)
+            .send()
+            .await
+            .context("Failed to send log upload request")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            let preview = &body_text[..body_text.len().min(500)];
+            warn!("Log upload failed for {}: HTTP {} — {}", remote_name, status, preview);
+            anyhow::bail!("Log upload returned HTTP {}", status);
+        }
+
+        Ok(uploaded_len)
+    }
 }
 
 #[cfg(test)]

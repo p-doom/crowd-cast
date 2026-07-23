@@ -2308,6 +2308,31 @@ unintended app video."
             );
         }
 
+        // Ship app log files to S3 (best-effort) so participant issues can
+        // be debugged without manually collecting logs. Every 5 minutes —
+        // segment-upload freshness — but on our OWN timer, NOT hooked to
+        // segment uploads: segments only flow while recording works, and
+        // broken-capture states are exactly what the logs are for. Ticks
+        // where the log didn't grow upload nothing, so the fast cadence is
+        // free on idle machines. Gated on the same uploads-paused switch as
+        // segment uploads; a pass skipped while paused runs on the next tick.
+        if self.uploader.is_configured() {
+            if let Some(shipper) = crate::upload::LogShipper::new(self.uploader.clone()) {
+                info!("Log shipping to S3 enabled (5-minute cadence)");
+                let paused = self.uploads_paused.clone();
+                tokio::spawn(async move {
+                    // Give startup (segment recovery, capture init) a head start.
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    loop {
+                        if !paused.load(AtomicOrdering::SeqCst) {
+                            shipper.run_once().await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    }
+                });
+            }
+        }
+
         // Take notification receiver for the main loop
         let mut notification_rx = self.notification_rx.take();
 
