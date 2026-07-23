@@ -21,6 +21,29 @@ static atomic_bool trayRestartRequested = false;
 static CFAbsoluteTime statusItemDetachedSince = 0;
 static BOOL statusItemWasAttached = NO;
 
+// Last health-check verdict, exposed via tray_status_item_health_state() so the
+// Rust side can log transitions into the app log file (NSLog from this layer
+// only reaches the unified system log, which participants don't send us).
+// Values are documented in tray.h.
+enum {
+    TRAY_HEALTH_UNKNOWN = 0,
+    TRAY_HEALTH_ATTACHED = 1,
+    TRAY_HEALTH_DETACHED = 2,
+    TRAY_HEALTH_NEVER_ATTACHED = 3,
+};
+static atomic_int statusItemHealthState = TRAY_HEALTH_UNKNOWN;
+
+// Detach grace for an item that was previously attached: ControlCenter can
+// transiently detach the backing window while it rebuilds the status bar.
+static const CFAbsoluteTime kDetachedRestartAfter = 8.0;
+// First-attach grace: a fresh item can legitimately lack a backing window
+// while ControlCenter builds the status-bar scene, and a cold launch/login
+// can be slow — so give the INITIAL attach far longer before concluding it
+// will never happen (seen on macOS 26: an item created during the first-run
+// sign-in browser handoff allocates but never attaches, leaving the app
+// running with no menu-bar icon at all).
+static const CFAbsoluteTime kNeverAttachedRestartAfter = 30.0;
+
 // Login-session lock state, used to decide whether a wake should restart immediately. Declared
 // here because it has no public header. Returns a dict with "CGSSessionScreenIsLocked" set when
 // the screen is locked.
@@ -116,6 +139,7 @@ static NSStatusItem *create_status_item(void) {
     if (item != nil) {
         statusItemDetachedSince = 0;
         statusItemWasAttached = NO;
+        atomic_store(&statusItemHealthState, TRAY_HEALTH_UNKNOWN);
     }
     return item;
 }
@@ -153,8 +177,13 @@ static void check_status_item_health(void) {
     if (window != nil) {
         statusItemWasAttached = YES;
         statusItemDetachedSince = 0;
+        atomic_store(&statusItemHealthState, TRAY_HEALTH_ATTACHED);
         return;
     }
+
+    atomic_store(&statusItemHealthState,
+                 statusItemWasAttached ? TRAY_HEALTH_DETACHED
+                                       : TRAY_HEALTH_NEVER_ATTACHED);
 
     if (statusItemDetachedSince == 0) {
         statusItemDetachedSince = now;
@@ -165,14 +194,23 @@ static void check_status_item_health(void) {
     // ControlCenter can transiently detach the window while it rebuilds the
     // status bar, then reattach within a few seconds — restarting on such a
     // blip is wasted churn. Only restart if an item that was previously
-    // attached stays detached across many consecutive samples (>8s: past the
+    // attached stays detached across many consecutive samples (past the
     // transient-blip envelope, but fast enough that a wake-broken tray heals
     // in seconds, not tens of seconds). Restart pacing beyond this threshold
     // is the engine's exponential backoff. In-process recreation has proven
     // unreliable on Tahoe, so ask Rust to restart with a fresh process
     // identity.
-    if (statusItemWasAttached && now - statusItemDetachedSince > 8.0) {
+    if (statusItemWasAttached && now - statusItemDetachedSince > kDetachedRestartAfter) {
         request_tray_restart(@"Status item is not attached to the menu bar");
+        return;
+    }
+
+    // An item that NEVER attached is a distinct failure: the app is running
+    // with no menu-bar icon — no user-facing control surface at all — and no
+    // detach event will ever trip the branch above. After a generous
+    // first-attach grace, recover the same way the detach path does.
+    if (!statusItemWasAttached && now - statusItemDetachedSince > kNeverAttachedRestartAfter) {
+        request_tray_restart(@"Status item never attached to the menu bar");
     }
 }
 
@@ -449,4 +487,8 @@ bool tray_needs_restart(void) {
         return true;
     }
     return false;
+}
+
+int tray_status_item_health_state(void) {
+    return atomic_load(&statusItemHealthState);
 }
