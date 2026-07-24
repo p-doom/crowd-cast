@@ -159,16 +159,17 @@ fn restart_process() -> ! {
 /// The first restart in a quiet window fires immediately; each subsequent one
 /// within [`RESTART_HISTORY_WINDOW`] must wait twice as long as the last,
 /// starting at [`RESTART_BACKOFF_BASE`]. History ages out after a quiet window,
-/// resetting the backoff.
-#[cfg(all(target_os = "macos", not(no_tray)))]
+/// resetting the backoff. Shared by the macOS tray watchdog and the
+/// macOS/Windows dead-capture-source escalation.
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 const RESTART_BACKOFF_BASE: u64 = 15;
 
 /// Ceiling for the backoff gap between watchdog restarts (15 minutes).
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 const RESTART_BACKOFF_MAX: u64 = 900;
 
 /// Sliding window over which restart history is kept for backoff computation.
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 const RESTART_HISTORY_WINDOW: Duration = Duration::from_secs(3600);
 
 /// Wait (bounded) for the display configuration to hold still after a change
@@ -217,20 +218,20 @@ async fn wait_for_displays_to_settle() -> bool {
 /// global signal. That is what lets a partial wedge (one app dead while others record fine)
 /// still restart-once-and-alert for the broken app, WITHOUT a different working app resetting
 /// its state. `preconditions_met` folds in the caller's gating (a live, unpaused session).
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 #[derive(Debug, PartialEq, Eq)]
 enum DeadSourceAction {
     /// Not dead long enough, or preconditions unmet — do nothing.
     Wait,
     /// First failure for this app — restart the process for a fresh capture context.
     Restart,
-    /// Already restarted for this app and still dead — surface the "restart your Mac" alert.
+    /// Already restarted for this app and still dead — surface the restart-your-machine alert.
     Alert,
     /// Already restarted AND alerted for this app — sit tight (no restart, no re-alert).
     Hold,
 }
 
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn dead_source_action(
     dead_for: Duration,
     preconditions_met: bool,
@@ -248,7 +249,7 @@ fn dead_source_action(
     }
 }
 
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn restart_history_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "crowd-cast", "agent")
         .map(|p| p.data_dir().join("restart_history"))
@@ -259,13 +260,13 @@ fn restart_history_path() -> Option<PathBuf> {
 /// dead" (→ OS-level wedge, alert) from a first failure (→ try one restart). Keyed per app so
 /// a *different* app recovering never clears a still-broken app's "already tried" memory —
 /// the fix for the partial-wedge restart loop. Stored as `app<TAB>unix_secs` lines.
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn capture_dead_restart_marker_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "crowd-cast", "agent")
         .map(|p| p.data_dir().join("capture_dead_restart"))
 }
 
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -275,7 +276,7 @@ fn unix_now_secs() -> u64 {
 
 /// Read the marker as `{app -> unix_secs}`, dropping unparseable and stale (>1h) entries so a
 /// long-past wedge never suppresses a genuinely new one for the same app.
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn read_capture_dead_restart_map() -> std::collections::HashMap<String, u64> {
     let mut map = std::collections::HashMap::new();
     let Some(path) = capture_dead_restart_marker_path() else {
@@ -297,7 +298,7 @@ fn read_capture_dead_restart_map() -> std::collections::HashMap<String, u64> {
     map
 }
 
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn write_capture_dead_restart_map(map: &std::collections::HashMap<String, u64>) {
     let Some(path) = capture_dead_restart_marker_path() else {
         return;
@@ -314,14 +315,14 @@ fn write_capture_dead_restart_map(map: &std::collections::HashMap<String, u64>) 
 }
 
 /// How long ago we restarted for `app`, or `None` if we haven't (recently).
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn capture_dead_restart_age(app: &str) -> Option<Duration> {
     let ts = *read_capture_dead_restart_map().get(app)?;
     Some(Duration::from_secs(unix_now_secs().saturating_sub(ts)))
 }
 
 /// Record that we just restarted for `app` (called just before the restart; survives exec).
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn note_capture_dead_restart(app: &str) {
     let mut map = read_capture_dead_restart_map();
     map.insert(app.to_string(), unix_now_secs());
@@ -330,7 +331,7 @@ fn note_capture_dead_restart(app: &str) {
 
 /// Forget the restart marker for `app` (called once ITS source is healthy again — never
 /// because some other app recovered).
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn clear_capture_dead_restart(app: &str) {
     let mut map = read_capture_dead_restart_map();
     if map.remove(app).is_some() {
@@ -350,7 +351,7 @@ fn clear_capture_dead_restart(app: &str) {
 /// Fails OPEN: on any file-I/O or path error the restart is allowed (a missing
 /// tray icon from an occasional extra restart is fine; being unable to restart
 /// at all is worse). Never panics.
-#[cfg(all(target_os = "macos", not(no_tray)))]
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn restart_allowed_with_backoff() -> bool {
     let Some(path) = restart_history_path() else {
         return true; // fail open
@@ -825,15 +826,18 @@ pub struct SyncEngine {
     /// PER-APP: when each app's active capture source was first seen not-ready, keyed by the
     /// app's canonical id. An entry is cleared only when THAT app's source becomes ready again
     /// — never because a different app is fine — so a partial wedge (one app dead while others
-    /// record) still escalates for the broken app. macOS-only: the escalation is a fresh-
-    /// context process restart, the SCK cure — Linux must not restart (tears down the tray),
-    /// Windows/WGC has no such failure.
-    #[cfg(all(target_os = "macos", not(no_tray)))]
+    /// record) still escalates for the broken app. macOS + Windows: the escalation is a
+    /// fresh-context process restart, the cure for a wedged SCK stack (macOS) and equally for
+    /// a wedged WGC/D3D stack (Windows: a 2026-07-23 idle-resume left window capture
+    /// never-ready for 21 hours, recording black video, while a fresh process captured the
+    /// same window fine — the in-place refresh loop alone never recovers that). Linux must
+    /// not restart (tears down the tray).
+    #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
     capture_dead_since: std::collections::HashMap<String, Instant>,
-    /// PER-APP: apps for which the "restart your Mac" alert has already been shown this
+    /// PER-APP: apps for which the restart-your-machine alert has already been shown this
     /// process (so we don't re-alert every watchdog tick). The persisted "already restarted"
     /// memory lives in the marker file; this is only the in-process alert de-dupe.
-    #[cfg(all(target_os = "macos", not(no_tray)))]
+    #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
     capture_alerted_apps: std::collections::HashSet<String>,
     /// Whether we've already shown the "restart your Mac" alert this session
     restart_alert_shown: bool,
@@ -979,9 +983,9 @@ unintended app video."
             last_emitted_context: None,
             buffered_non_context_event_count: 0,
             any_source_ever_ready: false,
-            #[cfg(all(target_os = "macos", not(no_tray)))]
+            #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
             capture_dead_since: std::collections::HashMap::new(),
-            #[cfg(all(target_os = "macos", not(no_tray)))]
+            #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
             capture_alerted_apps: std::collections::HashSet::new(),
             restart_alert_shown: false,
             #[cfg(target_os = "linux")]
@@ -1682,24 +1686,29 @@ unintended app video."
         }
     }
 
-    /// macOS: recover an active capture source that has been dead too long by restarting for
-    /// a fresh OBS context — the only thing that reliably rebinds a wedged ScreenCaptureKit
-    /// source (an in-place `obs_source_update` or same-context recreate does not; the
-    /// screen-unlock and `needs_scene_for_app` paths restart for the same reason). In the
-    /// field a source that came up not-ready (0-dim) after a monitor-connect display flap
-    /// stayed dead, dropping input, until a MANUAL crowd-cast restart cured it.
+    /// macOS + Windows: recover an active capture source that has been dead too long by
+    /// restarting for a fresh OBS context — the only thing that reliably rebinds a wedged
+    /// capture stack. On macOS that is a wedged ScreenCaptureKit source (an in-place
+    /// `obs_source_update` or same-context recreate does not cure it; the screen-unlock and
+    /// `needs_scene_for_app` paths restart for the same reason); in the field a source that
+    /// came up not-ready (0-dim) after a monitor-connect display flap stayed dead, dropping
+    /// input, until a MANUAL crowd-cast restart cured it. On Windows the same failure shape
+    /// exists in the WGC/D3D stack: a 2026-07-23 idle-resume left window capture never-ready
+    /// for 21 hours (35k+ in-place refreshes, none helped, recordings were black) while a
+    /// fresh process captured the very same window immediately.
     ///
     /// All state is PER-APP (keyed to the active app), so a *partial* wedge — one app dead
     /// while others record fine — still restarts once and alerts for the broken app, and a
     /// *different* app working never resets it (the bug that caused the restart loop: a working
     /// app's Ok(true) used to wipe the global "already tried" state). One restart per app: the
-    /// per-app marker survives the exec, so if the fresh process is still dead for the same app
-    /// we treat it as an OS-level wedge, alert once, and hold — no more restarts for that app
-    /// until ITS source recovers.
+    /// per-app marker survives the restart, so if the fresh process is still dead for the same
+    /// app we treat it as an OS-level wedge, alert once, and hold — no more restarts for that
+    /// app until ITS source recovers.
     ///
     /// Returns true if it handled the tick (restart deferred / alert / hold). On an actual
-    /// restart the process exec()s and this never returns.
-    #[cfg(all(target_os = "macos", not(no_tray)))]
+    /// restart the process is replaced (exec on macOS, spawn+exit on Windows) and this never
+    /// returns.
+    #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
     async fn maybe_escalate_dead_source(
         &mut self,
         watchdog: &PendingCaptureWatchdog,
@@ -1743,15 +1752,20 @@ unintended app video."
                 self.capture_alerted_apps.insert(app.clone());
                 error!(
                     "Capture source for '{}' still dead after an automatic restart — likely a \
-                     system-level wedge; prompting for a Mac restart",
+                     system-level wedge; prompting for a machine restart",
                     app
                 );
-                extern "C" {
-                    fn show_restart_mac_alert();
+                #[cfg(target_os = "macos")]
+                {
+                    extern "C" {
+                        fn show_restart_mac_alert();
+                    }
+                    unsafe {
+                        show_restart_mac_alert();
+                    }
                 }
-                unsafe {
-                    show_restart_mac_alert();
-                }
+                #[cfg(target_os = "windows")]
+                crate::ui::show_capture_stuck_notification();
                 true
             }
             DeadSourceAction::Restart => {
@@ -1766,7 +1780,7 @@ unintended app video."
                     note_capture_dead_restart(&app);
                     self.input_backend.stop();
                     self.stop_recording().await.ok();
-                    restart_process(); // exec()s — never returns
+                    restart_process(); // replaces the process — never returns
                 }
                 warn!(
                     "Capture source for '{}' dead for {}s but restart deferred by backoff; will retry",
@@ -1808,7 +1822,7 @@ unintended app video."
                 // restart marker, alerted flag). Deliberately scoped to `expected_app`: a
                 // different app recovering must NOT reset a still-broken app's "already tried /
                 // alerted" state, or a partial wedge would restart-loop.
-                #[cfg(all(target_os = "macos", not(no_tray)))]
+                #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
                 {
                     self.capture_dead_since.remove(watchdog.expected_app.as_str());
                     self.capture_alerted_apps
@@ -1836,11 +1850,12 @@ unintended app video."
                     );
                 }
 
-                // macOS: once a source has been continuously dead long enough, escalate to
-                // a fresh-context process restart (the proven SCK cure) — see
-                // maybe_escalate_dead_source. If it handles the tick (restarted, or surfaced
-                // the "restart your Mac" alert after a restart didn't help), stop here.
-                #[cfg(all(target_os = "macos", not(no_tray)))]
+                // macOS + Windows: once a source has been continuously dead long enough,
+                // escalate to a fresh-context process restart (the proven cure for a wedged
+                // SCK or WGC/D3D stack) — see maybe_escalate_dead_source. If it handles the
+                // tick (restarted, or surfaced the restart-your-machine alert after a restart
+                // didn't help), stop here.
+                #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
                 if self.maybe_escalate_dead_source(&watchdog, surface_failure).await {
                     self.schedule_capture_watchdog(&watchdog.expected_app, watchdog.attempt + 1);
                     self.refresh_capture_enabled_from_frontmost();
@@ -4154,7 +4169,7 @@ mod tests {
     // The dead-source escalation decision (dead_source_action) is macOS-only; gate its tests.
     // Per-app STATE isolation (dead clock / alerted set / restart marker keyed by app) is a
     // call-site property; these tests cover the pure decision the call sites feed.
-    #[cfg(all(target_os = "macos", not(no_tray)))]
+    #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
     mod escalation {
         use super::*;
 

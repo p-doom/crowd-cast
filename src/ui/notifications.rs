@@ -280,6 +280,18 @@ pub fn show_recording_stopped_notification() {
     emit("Recording stopped", "");
 }
 
+/// Notify that screen capture is wedged and an automatic agent restart did not fix it — the
+/// Windows counterpart of the macOS "restart your Mac" alert (a toast rather than a blocking
+/// dialog; the windowless tray agent has nothing to parent one on). Shown at most once per
+/// wedge by the dead-source escalation's per-app alert de-dupe.
+#[cfg(target_os = "windows")]
+pub fn show_capture_stuck_notification() {
+    emit(
+        "crowd-cast cannot capture the screen",
+        "An automatic restart did not fix it. Please restart your computer.",
+    );
+}
+
 /// Show notification when recording is paused
 #[cfg(target_os = "macos")]
 pub fn show_recording_paused_notification() {
