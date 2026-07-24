@@ -119,6 +119,13 @@ pub struct CaptureContext {
     /// full-display frame; see `apply_monitor_fit_to_active`.)
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     last_monitor_fit: Option<(String, u32, u32, u32)>,
+    /// Windows follow-focus: backoff for a foreground window that OBS's enumeration does not
+    /// surface (a UWP `ApplicationFrameWindow` parent stays foreground indefinitely while libobs
+    /// lists only its content child), as `(hwnd, remaining skip ticks)`. Without it, such a
+    /// window re-triggers the full window enumeration every poll tick for as long as it holds
+    /// focus. See `sources::should_skip_unresolvable`.
+    #[cfg(target_os = "windows")]
+    follow_focus_unresolvable: Option<(isize, u8)>,
     /// macOS: whether the multi-monitor capture path (normalized canvas + per-display fit) is
     /// enabled. Set from `config.capture.mac_multi_monitor_capture` at startup. Kill-switch;
     /// when false, behaves exactly like the pre-feature main-display-only path.
@@ -237,6 +244,8 @@ impl CaptureContext {
             active_capture_app: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             last_monitor_fit: None,
+            #[cfg(target_os = "windows")]
+            follow_focus_unresolvable: None,
             #[cfg(target_os = "macos")]
             mac_multi_monitor_capture: false,
             #[cfg(target_os = "macos")]
@@ -1701,6 +1710,97 @@ impl CaptureContext {
         match source {
             Some(s) => Ok(Some(s.dimensions()?)),
             None => Ok(None),
+        }
+    }
+
+    /// Follow-focus within the active app: when the foreground window becomes a DIFFERENT window
+    /// of the SAME already-captured app (a dialog, a second window, a file picker), re-point the
+    /// existing `window_capture` source to it in-place. On current main the Windows path only
+    /// re-points reactively, when the bound window dies (the readiness watchdog re-resolves to the
+    /// first enumerated window); this fills the gap for a live focus change to a different window.
+    ///
+    /// The dedup contract lives in `sources::plan_repoint` (HWND-keyed, never obs_id/title-keyed,
+    /// see that function's and `ScreenCaptureSource::bound_hwnd`'s docs) so it is unit-tested
+    /// without any Win32 or OBS calls. Dedup is mandatory, not an optimization: every
+    /// `obs_source_update` re-point recreates the WGC session, costing a measured ~2 black frames
+    /// even when the target is unchanged, so an unconditional per-poll re-point would strobe
+    /// ~10 black frames/second into every recording.
+    ///
+    /// No-fallback: if the foreground window does not belong to the active app, is not a real
+    /// capturable window, or has closed since `GetForegroundWindow` was read (absent from a fresh
+    /// OBS window enumeration), the bound window is left exactly where it is.
+    ///
+    /// The foreground window is matched against `self.active_capture_app` (what the source is
+    /// actually bound to), NOT the frontmost app: `poll_frontmost_app` has already applied any
+    /// pending app-level switch for this tick before this runs, and on a tick where the app
+    /// switch legitimately lags, re-pointing against the frontmost app would bind app A's source
+    /// to app B's window. Called every poll tick, immediately before `apply_monitor_fit_to_active`
+    /// (so the monitor fit that follows always derives geometry from whatever window ends up
+    /// bound). Safe to call every poll and outside a recording (mirrors `apply_monitor_fit_to_active`:
+    /// no session/pause guard, only the internal early-returns). Windows-only.
+    #[cfg(target_os = "windows")]
+    pub fn apply_focused_window_to_active(&mut self) {
+        let Some(app) = self.active_capture_app.clone() else {
+            return;
+        };
+        // Read the source's current binding without holding the borrow across the (FFI-heavy)
+        // enumeration below.
+        let Some(bound) = self
+            .app_scenes
+            .get(app.as_str())
+            .map(|(_, source)| source.bound_hwnd())
+        else {
+            return;
+        };
+
+        let foreground = super::window_geometry::foreground_window_of_app(&app);
+        let Some(target_hwnd) = super::sources::plan_repoint(foreground, bound) else {
+            return;
+        };
+
+        // A target the last enumeration could not resolve (UWP frame parent) stays foreground
+        // for as long as the user is in that app; back off instead of paying for a guaranteed-
+        // miss enumeration every tick.
+        if super::sources::should_skip_unresolvable(&mut self.follow_focus_unresolvable, target_hwnd)
+        {
+            return;
+        }
+
+        // Resolve the target window's CURRENT obs_id from a fresh enumeration (never a cached
+        // one; the title embedded in obs_id may have changed since it was last bound).
+        let candidates = match super::sources::enumerate_capture_windows() {
+            Ok(w) => w,
+            Err(e) => {
+                debug!("Follow-focus: window enumeration failed for '{}': {}", app, e);
+                return;
+            }
+        };
+        let Some(obs_id) = super::sources::select_window_by_handle(&candidates, target_hwnd) else {
+            // The foreground window is not in OBS's enumeration right now (e.g. closed since the
+            // GetForegroundWindow read, or a UWP parent whose child libobs surfaces instead).
+            // No fallback: keep the current binding, and back off before retrying this hwnd.
+            self.follow_focus_unresolvable =
+                Some((target_hwnd, super::sources::UNRESOLVABLE_RETRY_TICKS));
+            debug!(
+                "Follow-focus: target window {:#x} not in current enumeration for '{}'; keeping current binding",
+                target_hwnd, app
+            );
+            return;
+        };
+        let obs_id = obs_id.to_string();
+        self.follow_focus_unresolvable = None;
+
+        let Some((_, source)) = self.app_scenes.get_mut(app.as_str()) else {
+            return;
+        };
+        match source.update_to_window(target_hwnd, &obs_id) {
+            Ok(()) => info!(
+                "Follow-focus: re-pointed '{}' from {:#x} to window {:#x}",
+                app,
+                bound.unwrap_or(0),
+                target_hwnd
+            ),
+            Err(e) => warn!("Follow-focus: re-point failed for '{}': {}", app, e),
         }
     }
 

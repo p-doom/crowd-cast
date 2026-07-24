@@ -58,6 +58,30 @@ pub struct ScreenCaptureSource {
     /// requested UUID is unchanged. macOS-only — only ScreenCaptureKit capture is display-keyed.
     #[cfg(target_os = "macos")]
     display_uuid: Option<String>,
+    /// Windows: the HWND (numeric window handle, as `isize`) this `window_capture` source is
+    /// currently bound to. This is the follow-focus dedup key, keyed on the handle and NEVER on
+    /// `obs_id`. `obs_id` embeds the window title and class (`title:class:exe`), which change
+    /// constantly (every browser tab switch, document rename) without the window itself changing;
+    /// a title-keyed dedup would re-point on every such change, and every `obs_source_update`
+    /// re-point recreates the WGC session, costing a measured ~2 black frames (~67ms at 30fps)
+    /// even when the target window is unchanged. Keying on the stable handle is what keeps those
+    /// black frames out of the recording.
+    ///
+    /// Set at every bind site so the dedup never compares against a stale value:
+    /// `new_application_capture` (source creation), `update_application` (the readiness
+    /// watchdog's re-resolve, which prefers this same bound window when it is still live), and
+    /// `update_to_window` (follow-focus's in-place re-point). Windows-only: only `window_capture`
+    /// is window-bound;
+    /// macOS SCK Application capture and Linux capture are keyed by display / PipeWire node.
+    ///
+    /// Caveat: Windows recycles HWND values after a window is destroyed. If a window closes and
+    /// the OS immediately reissues its exact HWND to a brand-new window of the SAME app between
+    /// two ~100ms polls, this dedup would see "unchanged" and skip a re-point it should have made.
+    /// That is an accepted, unmeasured narrow race, not something this design addresses; the
+    /// readiness watchdog (which re-resolves when the bound window dies) is the backstop, and the
+    /// next genuine focus change self-corrects it.
+    #[cfg(target_os = "windows")]
+    bound_hwnd: Option<isize>,
 }
 
 impl ScreenCaptureSource {
@@ -155,6 +179,8 @@ impl ScreenCaptureSource {
             name: name.to_string(),
             is_active: true,
             app_id: None,
+            // Monitor capture is display-bound, never window-bound; follow-focus never touches it.
+            bound_hwnd: None,
         })
     }
 
@@ -312,10 +338,10 @@ impl ScreenCaptureSource {
             ObsWindowCaptureMethod, ObsWindowPriority, WindowCaptureSourceBuilder,
         };
 
-        let obs_id = find_window_obs_id_for_app(bundle_id)?;
+        let (hwnd, obs_id) = find_window_obs_id_for_app(bundle_id)?;
         info!(
-            "Creating Windows window capture source: {} (app: {}, window: {})",
-            name, bundle_id, obs_id
+            "Creating Windows window capture source: {} (app: {}, window: {}, hwnd: {:#x})",
+            name, bundle_id, obs_id, hwnd
         );
 
         let source = context
@@ -337,6 +363,9 @@ impl ScreenCaptureSource {
             name: name.to_string(),
             is_active: true,
             app_id: Some(bundle_id.to_string()),
+            // Seed the follow-focus dedup key with the window we just bound, so the first poll
+            // after creation only re-points if the foreground window is genuinely different.
+            bound_hwnd: Some(hwnd),
         })
     }
 
@@ -545,25 +574,80 @@ impl ScreenCaptureSource {
     }
 
     /// Re-resolve the target application's window and update this `window_capture`
-    /// source in-place (Windows). Used by the readiness watchdog to recover when
-    /// the captured window has changed (e.g. closed and reopened).
+    /// source in-place (Windows). Used by the readiness watchdog to recover a not-ready source.
+    ///
+    /// Re-points to the window this source is ALREADY bound to when it is still a live
+    /// enumerated window, and only falls back to the first exe-match when the bound window is
+    /// gone (its original "closed and reopened" recovery case). This keeps the watchdog's
+    /// recovery reset (`obs_source_update` recreates the WGC session either way) on the SAME
+    /// window follow-focus tracks; targeting the first exe-match instead would let the two
+    /// writers disagree and hand a not-ready source back and forth, ~2 black frames each way
+    /// (see `resolve_watchdog_target` and `bound_hwnd`).
     #[cfg(target_os = "windows")]
     pub fn update_application(&mut self, bundle_id: &str) -> Result<()> {
         use libobs_simple::sources::windows::WindowCaptureSourceUpdater;
         use libobs_wrapper::data::ObsObjectUpdater;
 
-        let obs_id = find_window_obs_id_for_app(bundle_id)?;
+        let candidates = enumerate_capture_windows()?;
+        let (hwnd, obs_id) = resolve_watchdog_target(&candidates, self.bound_hwnd, bundle_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("No capturable window found for application '{}'", bundle_id)
+            })?;
         WindowCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
             .context("Failed to create window capture updater")?
             .set_window_raw(obs_id.as_str())
             .update()
             .context("Failed to update window capture target")?;
 
+        // Keep the follow-focus dedup key in step with the watchdog's re-resolve, otherwise the
+        // next poll would either spuriously re-point (stale key) or fail to correct a genuine
+        // change (see the `bound_hwnd` doc comment on why every bind site must set this).
+        self.bound_hwnd = Some(hwnd);
         info!(
-            "Updated window capture source '{}' to application '{}'",
-            self.name, bundle_id
+            "Updated window capture source '{}' to application '{}' (hwnd: {:#x})",
+            self.name, bundle_id, hwnd
         );
         Ok(())
+    }
+
+    /// Re-point this `window_capture` source at a specific, already-resolved window, in-place
+    /// via `obs_source_update` (no source recreation, so the scene item and its transform /
+    /// z-order are preserved). Used by follow-focus to switch to a just-focused window of the
+    /// SAME app (a dialog, a second window, a file picker).
+    ///
+    /// Unlike `update_application` (which re-resolves the app's window from a fresh enumeration,
+    /// preferring the currently-bound window), the target here is the caller's already-resolved
+    /// foreground window. Callers MUST dedup on
+    /// `hwnd` before calling (see `plan_repoint` / `select_window_by_handle`): a same-window call
+    /// still pays the measured ~2-black-frame WGC session reset (`obs_source_update` always
+    /// recreates the WGC session, even on a no-op target), so an unconditional per-poll re-point
+    /// would strobe black frames into the recording.
+    #[cfg(target_os = "windows")]
+    pub fn update_to_window(&mut self, hwnd: isize, obs_id: &str) -> Result<()> {
+        use libobs_simple::sources::windows::WindowCaptureSourceUpdater;
+        use libobs_wrapper::data::ObsObjectUpdater;
+
+        WindowCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
+            .context("Failed to create window capture updater")?
+            .set_window_raw(obs_id)
+            .update()
+            .context("Failed to re-point window capture target")?;
+
+        self.bound_hwnd = Some(hwnd);
+        info!(
+            "Re-pointed window capture source '{}' to window {:#x} ({})",
+            self.name, hwnd, obs_id
+        );
+        Ok(())
+    }
+
+    /// Windows: the HWND this `window_capture` source is currently bound to, if any. Read by
+    /// follow-focus (`CaptureContext::apply_focused_window_to_active`) as the dedup baseline.
+    /// `pub(crate)` because it is an internal follow-focus accessor with no cross-crate use
+    /// (mirrors `display_uuid`, which has no public getter and is read only internally).
+    #[cfg(target_os = "windows")]
+    pub(crate) fn bound_hwnd(&self) -> Option<isize> {
+        self.bound_hwnd
     }
 
     /// Re-resolve and re-point this source at the app's focused window, in-place.
@@ -838,28 +922,137 @@ pub fn get_main_display_uuid() -> Result<String> {
     anyhow::bail!("Display UUID not available on this platform")
 }
 
-/// Find the OBS window id of a capturable top-level window belonging to the
-/// given application (matched by executable file stem, case-insensitive).
+/// Enumerate every window OBS's `window_capture` could bind to right now, the same list
+/// `find_window_obs_id_for_app` searches. Each entry is `(hwnd, obs_id, exe_stem)`:
+/// - `hwnd`: numeric window handle (`isize`), for HWND-keyed follow-focus dedup.
+/// - `obs_id`: the OBS window-id string (the `set_window_raw` input). It embeds title/class/exe
+///   and MUST always be read fresh from a live enumeration, never cached, since the title changes
+///   independently of the window (see `ScreenCaptureSource::bound_hwnd`).
+/// - `exe_stem`: the executable file stem (not case-normalized here; matching is done with
+///   `eq_ignore_ascii_case`, the same rule used everywhere else for app identity).
+///
+/// The `handle` field of libobs' `WindowInfo` is compiled in only when neither the
+/// `serde` nor the `specta` feature of `libobs-window-helper` is enabled (upstream cfg gate).
+/// Neither is enabled in this build's lockfile, so `.handle` is accessible; if a future
+/// dependency turns either feature on, this stops compiling (a loud cargo error, not silent
+/// breakage). `HWND` is `HWND(pub *mut c_void)` in `windows` 0.62, so `.0 as isize` yields the
+/// same numeric identity as the raw `*mut c_void` our own `GetForegroundWindow` FFI returns.
+/// Windows-only.
 #[cfg(target_os = "windows")]
-fn find_window_obs_id_for_app(bundle_id: &str) -> Result<String> {
+pub(crate) fn enumerate_capture_windows() -> Result<Vec<(isize, String, String)>> {
     use libobs_simple::sources::windows::{WindowCaptureSourceBuilder, WindowSearchMode};
 
     let windows = WindowCaptureSourceBuilder::get_windows(WindowSearchMode::ExcludeMinimized)
         .map_err(|e| anyhow::anyhow!("Failed to enumerate windows: {}", e))?;
 
-    windows
-        .iter()
-        .find(|w| {
-            std::path::Path::new(&w.0.full_exe)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|stem| stem.eq_ignore_ascii_case(bundle_id))
-                .unwrap_or(false)
+    Ok(windows
+        .into_iter()
+        .filter_map(|w| {
+            let stem = std::path::Path::new(&w.0.full_exe)
+                .file_stem()?
+                .to_str()?
+                .to_string();
+            Some((w.0.handle.0 as isize, w.0.obs_id.clone(), stem))
         })
-        .map(|w| w.0.obs_id.clone())
+        .collect())
+}
+
+/// Find a capturable top-level window belonging to the given application (matched by executable
+/// file stem, case-insensitive), returning its numeric handle and OBS window id. Picks the first
+/// match in enumeration order, unchanged from before; only the return shape grew to also surface
+/// the HWND (so the two callers can seed `bound_hwnd`).
+#[cfg(target_os = "windows")]
+fn find_window_obs_id_for_app(bundle_id: &str) -> Result<(isize, String)> {
+    enumerate_capture_windows()?
+        .into_iter()
+        .find(|(_, _, stem)| stem.eq_ignore_ascii_case(bundle_id))
+        .map(|(hwnd, obs_id, _)| (hwnd, obs_id))
         .ok_or_else(|| {
             anyhow::anyhow!("No capturable window found for application '{}'", bundle_id)
         })
+}
+
+/// Pure follow-focus dedup / trigger decision. `foreground` is the HWND the caller has already
+/// filtered to "belongs to the active app and is a real capturable window" (see
+/// `window_geometry::foreground_window_of_app`); `bound` is the source's current `bound_hwnd()`.
+/// Returns the HWND to re-point to, or `None` when there is nothing to do: no qualifying
+/// foreground window, or it is already the bound one. HWND-keyed, never obs_id/title-keyed (see
+/// `ScreenCaptureSource::bound_hwnd` for why); deliberately takes only plain data so the contract
+/// is unit-tested without any Win32 or OBS calls.
+#[cfg(target_os = "windows")]
+pub(crate) fn plan_repoint(foreground: Option<isize>, bound: Option<isize>) -> Option<isize> {
+    match foreground {
+        Some(hwnd) if Some(hwnd) != bound => Some(hwnd),
+        _ => None,
+    }
+}
+
+/// How many poll ticks to skip before re-attempting enumeration for a foreground window that
+/// the last enumeration did not surface. At the ~100ms poll cadence this caps the retry rate at
+/// roughly once per second instead of every tick.
+#[cfg(target_os = "windows")]
+pub(crate) const UNRESOLVABLE_RETRY_TICKS: u8 = 9;
+
+/// Rate-limit repeated lookups of a foreground window that OBS's enumeration does not surface
+/// (the standing case is a UWP `ApplicationFrameWindow` parent: `GetForegroundWindow` returns it
+/// indefinitely while libobs lists only its content child, so without a backoff every poll tick
+/// pays for a full window enumeration that is guaranteed to miss). `skip` is the caller's
+/// `(hwnd, remaining ticks)` slot: while `target` matches the remembered hwnd and ticks remain,
+/// decrement and report "skip this tick". A different target falls through immediately (the
+/// caller re-arms the slot on the next miss), so a real focus change is never delayed.
+#[cfg(target_os = "windows")]
+pub(crate) fn should_skip_unresolvable(skip: &mut Option<(isize, u8)>, target: isize) -> bool {
+    match skip {
+        Some((hwnd, remaining)) if *hwnd == target && *remaining > 0 => {
+            *remaining -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Look up `hwnd` in a live `enumerate_capture_windows()` snapshot, returning its CURRENT
+/// `obs_id` (never a cached one; the title embedded in `obs_id` may have changed since any
+/// earlier lookup). `None` when the window is not in the list right now (closed between the
+/// `GetForegroundWindow` read and this call, or filtered out by `ExcludeMinimized`); callers
+/// MUST treat that as "no re-point", NEVER fall back to a different window of the app.
+#[cfg(target_os = "windows")]
+pub(crate) fn select_window_by_handle(
+    candidates: &[(isize, String, String)],
+    hwnd: isize,
+) -> Option<&str> {
+    candidates
+        .iter()
+        .find(|(h, _, _)| *h == hwnd)
+        .map(|(_, obs_id, _)| obs_id.as_str())
+}
+
+/// Choose the window the readiness watchdog should re-point a not-ready `window_capture` source
+/// to, given a live `enumerate_capture_windows()` snapshot. Prefers the window the source is
+/// ALREADY bound to (`bound`) when it is still enumerated, so the watchdog's recovery reset
+/// (`update_application`) targets the SAME window follow-focus tracks via `GetForegroundWindow`,
+/// rather than the first enumerated exe-match. A disagreement between the two writers would let
+/// them hand a not-ready source back and forth, each `obs_source_update` costing a measured ~2
+/// black frames (see `ScreenCaptureSource::bound_hwnd`). Falls back to the first exe-match
+/// (file-stem, case-insensitive, the same rule as everywhere else) only when the bound window is
+/// gone — the watchdog's original "closed and reopened" recovery case. Returns the
+/// `(hwnd, obs_id)` to bind, or `None` when the app has no capturable window at all. Pure: no
+/// Win32 or OBS calls, so the prefer-bound / fall-back contract is unit-tested directly.
+#[cfg(target_os = "windows")]
+pub(crate) fn resolve_watchdog_target(
+    candidates: &[(isize, String, String)],
+    bound: Option<isize>,
+    bundle_id: &str,
+) -> Option<(isize, String)> {
+    if let Some(b) = bound {
+        if let Some(obs_id) = select_window_by_handle(candidates, b) {
+            return Some((b, obs_id.to_string()));
+        }
+    }
+    candidates
+        .iter()
+        .find(|(_, _, stem)| stem.eq_ignore_ascii_case(bundle_id))
+        .map(|(h, obs_id, _)| (*h, obs_id.clone()))
 }
 
 /// Get the actual resolution of the main display
@@ -958,4 +1151,165 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn get_main_display_resolution() -> Result<(u32, u32)> {
     anyhow::bail!("Display resolution detection not available on this platform")
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod follow_focus_tests {
+    use super::{
+        plan_repoint, resolve_watchdog_target, select_window_by_handle,
+        should_skip_unresolvable, UNRESOLVABLE_RETRY_TICKS,
+    };
+
+    // --- plan_repoint: the HWND-keyed dedup / trigger gate ----------------
+    // These pin the contract that the decision is made purely on the numeric
+    // window handle and is blind to any title/obs_id string (design decision 1).
+
+    #[test]
+    fn no_foreground_is_noop() {
+        // Nothing qualifying is focused for this app right now: leave the
+        // current binding exactly where it is.
+        assert_eq!(plan_repoint(None, Some(0x1000)), None);
+    }
+
+    #[test]
+    fn same_window_is_deduped() {
+        // The foreground window is the one we are already bound to. Even if its
+        // title (and hence obs_id) just changed, the HWND is unchanged, so this
+        // must be a no-op: an obs_source_update here would strobe ~2 black
+        // frames into the recording for no reason.
+        assert_eq!(plan_repoint(Some(0x1000), Some(0x1000)), None);
+    }
+
+    #[test]
+    fn different_window_repoints() {
+        // A genuinely different window of the same app is focused: re-point.
+        assert_eq!(plan_repoint(Some(0x2000), Some(0x1000)), Some(0x2000));
+    }
+
+    #[test]
+    fn first_bind_when_bound_is_none() {
+        // No binding recorded yet (fresh source that somehow lost its seed):
+        // a qualifying foreground window re-points through the same path.
+        assert_eq!(plan_repoint(Some(0x2000), None), Some(0x2000));
+    }
+
+    // --- select_window_by_handle: the no-fallback candidate lookup --------
+
+    fn candidate(hwnd: isize, obs_id: &str) -> (isize, String, String) {
+        (hwnd, obs_id.to_string(), "firefox".to_string())
+    }
+
+    #[test]
+    fn finds_by_handle_ignoring_title() {
+        // The obs_id column embeds the window title and can be anything; only
+        // the HWND column decides the match. The two entries share nothing but
+        // the handle we ask for, proving title-immunity directly.
+        let candidates = vec![
+            candidate(0x1000, "old title:Chrome_WidgetWin_1:firefox.exe"),
+            candidate(0x2000, "a completely different title:SomeClass:firefox.exe"),
+        ];
+        assert_eq!(
+            select_window_by_handle(&candidates, 0x2000),
+            Some("a completely different title:SomeClass:firefox.exe")
+        );
+    }
+
+    #[test]
+    fn absent_handle_returns_none_no_fallback() {
+        // The target window is not in the live enumeration (e.g. it closed
+        // between the GetForegroundWindow read and this lookup). Must be None,
+        // NEVER a fallback to the first (or any other) candidate.
+        let candidates = vec![candidate(0x1000, "a"), candidate(0x3000, "b")];
+        assert_eq!(select_window_by_handle(&candidates, 0x9999), None);
+    }
+
+    #[test]
+    fn empty_candidates_returns_none() {
+        let candidates: Vec<(isize, String, String)> = Vec::new();
+        assert_eq!(select_window_by_handle(&candidates, 0x1000), None);
+    }
+
+    // --- resolve_watchdog_target: align the watchdog with follow-focus -----
+    // The watchdog and follow-focus are two writers of the same source's binding.
+    // These pin that the watchdog re-points to the currently-bound window when it
+    // is still live (so it does not fight follow-focus with ~2 black frames each
+    // way), and only falls back to the first exe-match when the bound window is gone.
+
+    fn app_candidate(hwnd: isize, obs_id: &str, stem: &str) -> (isize, String, String) {
+        (hwnd, obs_id.to_string(), stem.to_string())
+    }
+
+    #[test]
+    fn watchdog_prefers_the_live_bound_window() {
+        // The bound window (0x2000) is NOT the first exe-match (0x1000 is), but it is
+        // still enumerated. The watchdog must re-point to the bound window, matching
+        // whatever follow-focus last set, instead of yanking back to the first match.
+        let candidates = vec![
+            app_candidate(0x1000, "first:C:firefox.exe", "firefox"),
+            app_candidate(0x2000, "bound:C:firefox.exe", "firefox"),
+        ];
+        assert_eq!(
+            resolve_watchdog_target(&candidates, Some(0x2000), "firefox"),
+            Some((0x2000, "bound:C:firefox.exe".to_string()))
+        );
+    }
+
+    #[test]
+    fn watchdog_falls_back_to_first_match_when_bound_is_gone() {
+        // The bound window (0x2000) has closed and is no longer enumerated. The
+        // watchdog recovers by binding the first exe-match, its original behaviour.
+        let candidates = vec![
+            app_candidate(0x1000, "first:C:firefox.exe", "firefox"),
+            app_candidate(0x3000, "other-app:C:chrome.exe", "chrome"),
+        ];
+        assert_eq!(
+            resolve_watchdog_target(&candidates, Some(0x2000), "firefox"),
+            Some((0x1000, "first:C:firefox.exe".to_string()))
+        );
+    }
+
+    #[test]
+    fn watchdog_falls_back_to_first_match_when_unbound() {
+        // No binding recorded yet: first exe-match, skipping other apps' windows.
+        let candidates = vec![
+            app_candidate(0x3000, "other-app:C:chrome.exe", "chrome"),
+            app_candidate(0x1000, "first:C:firefox.exe", "firefox"),
+        ];
+        assert_eq!(
+            resolve_watchdog_target(&candidates, None, "firefox"),
+            Some((0x1000, "first:C:firefox.exe".to_string()))
+        );
+    }
+
+    #[test]
+    fn watchdog_returns_none_when_app_has_no_window() {
+        // The bound window is gone AND no window of the app is enumerated: nothing to
+        // bind. update_application turns this into its "no capturable window" error.
+        let candidates = vec![app_candidate(0x3000, "other-app:C:chrome.exe", "chrome")];
+        assert_eq!(resolve_watchdog_target(&candidates, Some(0x2000), "firefox"), None);
+    }
+
+    #[test]
+    fn unresolvable_backoff_skips_then_retries() {
+        // An armed slot for this hwnd skips exactly `remaining` ticks, then lets one
+        // attempt through (the caller re-arms on the next miss).
+        let mut skip = Some((0x5000isize, 2u8));
+        assert!(should_skip_unresolvable(&mut skip, 0x5000));
+        assert!(should_skip_unresolvable(&mut skip, 0x5000));
+        assert!(!should_skip_unresolvable(&mut skip, 0x5000));
+    }
+
+    #[test]
+    fn unresolvable_backoff_never_delays_a_different_window() {
+        // A real focus change to another window must not be rate-limited by a stale slot.
+        let mut skip = Some((0x5000isize, UNRESOLVABLE_RETRY_TICKS));
+        assert!(!should_skip_unresolvable(&mut skip, 0x6000));
+    }
+
+    #[test]
+    fn unresolvable_backoff_disarmed_is_noop() {
+        let mut skip = None;
+        assert!(!should_skip_unresolvable(&mut skip, 0x5000));
+        assert_eq!(skip, None);
+    }
 }
