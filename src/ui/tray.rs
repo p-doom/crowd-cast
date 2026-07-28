@@ -310,10 +310,6 @@ impl TrayApp {
             notifications: super::notification_center::compute(
                 super::notification_center::NotificationInputs {
                     uploads_paused: self.uploads_paused,
-                    capture_blocked: matches!(
-                        self.last_status,
-                        Some(EngineStatus::RecordingBlocked)
-                    ),
                     signed_out: self.auth_configured && self.account_display_text.is_empty(),
                 },
             ),

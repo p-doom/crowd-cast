@@ -28,15 +28,20 @@ use super::platform_tray::{TrayAction, TrayNotification};
 pub struct NotificationInputs {
     /// Uploads are currently paused by the user.
     pub uploads_paused: bool,
-    /// Recording is active but capture is producing nothing (RecordingBlocked /
-    /// no capture sources) — the "screen recording isn't working" condition.
-    pub capture_blocked: bool,
     /// Google sign-in is configured for this build but the user is not signed in.
     pub signed_out: bool,
-    // TODO(phase-1-followup): `update_pending` — needs a "newer version is
-    // downloadable" signal from the Sparkle updater. `UpdaterController` only
-    // exposes whether the *mechanism* is available, not whether an update is
-    // waiting, so this notification is deferred until that signal exists.
+    // TODO(capture-health): a "screen recording isn't working" notification.
+    // Do NOT wire this to `EngineStatus::RecordingBlocked` — that fires routinely
+    // whenever a non-captured app is frontmost (e.g. focusing WhatsApp), so it's
+    // a false positive. The genuine signal is the dead-source escalation in
+    // engine.rs (~:1754, `show_capture_stuck_notification` / the "system-level
+    // wedge" path), which is currently a transient event, not a persistent tray
+    // status. Wiring this needs a persistent "capture wedged" state broadcast to
+    // TrayApp first.
+    //
+    // TODO(update-pending): needs a "newer version is downloadable" signal from
+    // the Sparkle updater. `UpdaterController` only exposes whether the
+    // *mechanism* is available, not whether an update is waiting.
 }
 
 /// Compute the active notification set from live state, highest-priority first.
@@ -45,15 +50,6 @@ pub struct NotificationInputs {
 /// silently losing data, so they sort to the top of the submenu.
 pub fn compute(inputs: NotificationInputs) -> Vec<TrayNotification> {
     let mut out = Vec::new();
-
-    // Capture broken is the most serious: recording looks "on" but nothing is
-    // being captured. Route to Settings so the user can re-check sources.
-    if inputs.capture_blocked {
-        out.push(TrayNotification {
-            title: "Screen recording isn't working".to_string(),
-            action: TrayAction::Settings,
-        });
-    }
 
     // Uploads paused: data is being recorded but not shipped. Clicking resumes.
     if inputs.uploads_paused {
@@ -98,7 +94,6 @@ mod tests {
     fn each_condition_yields_one_notification() {
         let n = compute(NotificationInputs {
             uploads_paused: true,
-            capture_blocked: false,
             signed_out: false,
         });
         assert_eq!(n.len(), 1);
@@ -106,16 +101,14 @@ mod tests {
     }
 
     #[test]
-    fn capture_blocked_sorts_first_and_all_present() {
+    fn both_conditions_present_uploads_first() {
         let n = compute(NotificationInputs {
             uploads_paused: true,
-            capture_blocked: true,
             signed_out: true,
         });
-        assert_eq!(n.len(), 3);
-        // Most-serious first.
-        assert_eq!(n[0].action, TrayAction::Settings);
-        assert_eq!(n[0].title, "Screen recording isn't working");
+        assert_eq!(n.len(), 2);
+        assert_eq!(n[0].action, TrayAction::ToggleUploads);
+        assert_eq!(n[1].action, TrayAction::SignIn);
     }
 
     #[test]
