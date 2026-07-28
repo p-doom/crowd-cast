@@ -19,6 +19,23 @@ pub enum TrayAction {
     CheckForUpdates,
     ReportBug,
     Quit,
+    /// Open the web dashboard in the default browser (notification-center footer).
+    OpenDashboard,
+}
+
+/// A single glanceable notification shown in the tray's notification section.
+///
+/// Phase 1 notifications are *derived from live state* (e.g. "uploads are paused"
+/// is present while uploads are paused), so they carry no read/unread state:
+/// acting on one clears the underlying condition and the entry disappears on the
+/// next refresh. Each notification reuses an existing `TrayAction` as its click
+/// handler, so no new engine plumbing is needed per notification kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayNotification {
+    /// One-line, glanceable text (e.g. "Uploads are paused").
+    pub title: String,
+    /// What clicking this notification does — reuses the existing action set.
+    pub action: TrayAction,
 }
 
 /// Visual state of the tray icon.
@@ -59,6 +76,11 @@ pub struct TrayDisplayState {
     pub uploads_text: String,
     /// Whether "Check for Updates" should be enabled.
     pub can_check_updates: bool,
+    /// Active glanceable notifications (derived from live state). macOS-only for
+    /// now; the badge count and the "Notifications" submenu render from this.
+    /// Other platforms don't populate or render it yet.
+    #[cfg(target_os = "macos")]
+    pub notifications: Vec<TrayNotification>,
 }
 
 /// Result of polling the platform tray for events.

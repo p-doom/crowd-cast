@@ -93,6 +93,9 @@ fn next_prepare_for_update_action(
 /// Issue tracker targeted by the "Report Bug…" menu item.
 const BUG_REPORT_ISSUES_URL: &str = "https://github.com/p-doom/crowd-cast/issues/new";
 
+/// Web dashboard opened from the notification-center footer / notifications.
+const DASHBOARD_URL: &str = "https://pdoom.org/crowd-cast-dashboard.html";
+
 /// Build the prefilled GitHub new-issue URL for the "Report Bug…" menu item.
 /// Pure function (all environment data passed in) so URL encoding is testable.
 fn build_bug_report_url(version: &str, os: &str, arch: &str, log_dir: &str) -> String {
@@ -304,6 +307,19 @@ impl TrayApp {
                 "Pause Uploads".to_string()
             },
             can_check_updates: self.updater.can_check_for_updates(),
+            // Derive the glanceable notification set from live state (macOS only
+            // for now). Each condition maps to an existing action that clears it.
+            #[cfg(target_os = "macos")]
+            notifications: super::notification_center::compute(
+                super::notification_center::NotificationInputs {
+                    uploads_paused: self.uploads_paused,
+                    capture_blocked: matches!(
+                        self.last_status,
+                        Some(EngineStatus::RecordingBlocked)
+                    ),
+                    signed_out: self.auth_configured && self.account_display_text.is_empty(),
+                },
+            ),
         }
     }
 
@@ -414,6 +430,10 @@ impl TrayApp {
                     TrayAction::ReportBug => {
                         info!("Bug report requested via tray");
                         open_url(&bug_report_url());
+                    }
+                    TrayAction::OpenDashboard => {
+                        info!("Dashboard requested via tray notifications");
+                        open_url(DASHBOARD_URL);
                     }
                 },
             }
@@ -900,6 +920,159 @@ fn apply_status_dot(img: &mut RgbaImage, color: [u8; 4]) {
             if (dx * dx + dy * dy).sqrt() <= radius {
                 img.put_pixel(x, y, image::Rgba(color));
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Notification badge (macOS only)
+// ---------------------------------------------------------------------------
+
+/// The status-dot color for each icon state (mirrors `create_tray_icons`), so a
+/// badged icon is the same base + dot as the plain one, plus the badge.
+#[cfg(target_os = "macos")]
+fn status_dot_color(state: TrayIconState) -> [u8; 4] {
+    match state {
+        TrayIconState::Idle => [158, 158, 158, 255],
+        TrayIconState::Recording => [76, 175, 80, 255],
+        TrayIconState::Blocked => [255, 152, 0, 255],
+    }
+}
+
+/// 3x5 bitmap glyphs for the badge text ('0'..'9' and '+'). Each row is 3 bits,
+/// MSB = leftmost pixel.
+#[cfg(target_os = "macos")]
+fn badge_glyph(c: char) -> [u8; 5] {
+    match c {
+        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+        '+' => [0b000, 0b010, 0b111, 0b010, 0b000],
+        _ => [0; 5],
+    }
+}
+
+/// Draw a red notification badge with `text` (1–2 glyphs) in the top-right
+/// corner of a square icon. Kept in the same direct-pixel style as
+/// `apply_status_dot` (the status dot sits bottom-right, so they don't collide).
+#[cfg(target_os = "macos")]
+fn apply_badge(img: &mut RgbaImage, text: &str) {
+    const BG: [u8; 4] = [220, 50, 47, 255]; // attention red
+    const FG: [u8; 4] = [255, 255, 255, 255]; // white text
+    let size = img.width().min(img.height());
+    if size == 0 || text.is_empty() {
+        return;
+    }
+
+    let scale: i32 = (size as i32 / 16).max(2); // ~2 on a 32px icon
+    let gap: i32 = scale;
+    let glyph_w = 3 * scale;
+    let glyph_h = 5 * scale;
+    let pad: i32 = scale + 1;
+
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len() as i32;
+    let text_w = n * glyph_w + (n - 1) * gap;
+    let badge_w = text_w + 2 * pad;
+    let badge_h = glyph_h + 2 * pad;
+
+    let x0 = size as i32 - badge_w; // flush to the right edge
+    let y0 = 0; // flush to the top edge
+    let r = badge_h as f32 / 2.0;
+    let lc = (x0 as f32 + r, y0 as f32 + r);
+    let rc = (x0 as f32 + badge_w as f32 - r, y0 as f32 + r);
+
+    // Pill background.
+    for y in y0..(y0 + badge_h) {
+        for x in x0..(x0 + badge_w) {
+            if x < 0 || y < 0 || x >= size as i32 || y >= size as i32 {
+                continue;
+            }
+            let fx = x as f32;
+            let fy = y as f32;
+            let in_mid = fx >= lc.0 && fx <= rc.0;
+            let in_left = (fx - lc.0).powi(2) + (fy - lc.1).powi(2) <= r * r;
+            let in_right = (fx - rc.0).powi(2) + (fy - rc.1).powi(2) <= r * r;
+            if in_mid || in_left || in_right {
+                img.put_pixel(x as u32, y as u32, image::Rgba(BG));
+            }
+        }
+    }
+
+    // Glyphs.
+    let mut gx = x0 + pad;
+    let gy = y0 + pad;
+    for c in chars {
+        let glyph = badge_glyph(c);
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..3 {
+                if bits & (0b100 >> col) != 0 {
+                    // Fill a scale×scale block for this "pixel".
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let px = gx + col * scale + dx;
+                            let py = gy + row as i32 * scale + dy;
+                            if px >= 0 && py >= 0 && px < size as i32 && py < size as i32 {
+                                img.put_pixel(px as u32, py as u32, image::Rgba(FG));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        gx += glyph_w + gap;
+    }
+}
+
+/// Render (and cache) a tray icon for `state` with a notification badge showing
+/// `count`. Returns the badged PNG path, or `None` if `count == 0` or rendering
+/// fails (caller falls back to the plain icon).
+#[cfg(target_os = "macos")]
+pub(crate) fn render_badged_tray_icon(state: TrayIconState, count: usize) -> Option<PathBuf> {
+    let text = super::notification_center::badge_text(count);
+    if text.is_empty() {
+        return None;
+    }
+
+    let icon_dir = directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+        .map(|p| p.cache_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&icon_dir);
+
+    let state_tag = match state {
+        TrayIconState::Idle => "idle",
+        TrayIconState::Recording => "recording",
+        TrayIconState::Blocked => "blocked",
+    };
+    // Filename keys on version + state + badge text, so it regenerates across
+    // upgrades and is a cheap cache hit within a run.
+    let fname = format!(
+        "tray_badged_{}_{}_{}.png",
+        env!("CARGO_PKG_VERSION"),
+        state_tag,
+        text.replace('+', "plus")
+    );
+    let path = icon_dir.join(fname);
+    if path.exists() {
+        return Some(path);
+    }
+
+    let size = 32u32;
+    let mut img = load_base_icon(size);
+    apply_status_dot(&mut img, status_dot_color(state));
+    apply_badge(&mut img, &text);
+    match img.save(&path) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            warn!("Failed to render badged tray icon: {}", e);
+            None
         }
     }
 }
