@@ -559,7 +559,7 @@ fn write_uploads_paused(paused: bool) {
 
 // --- Pending uploads manifest (persists upload queue across restarts) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingUploadEntry {
     chunk_id: String,
     session_id: String,
@@ -618,11 +618,18 @@ fn remove_pending_uploads(chunk_ids: &[String]) {
     }
 
     let mut entries = read_pending_uploads();
-    let before = entries.len();
-    entries.retain(|e| !chunk_ids.contains(&e.chunk_id));
-    if entries.len() != before {
+    if retain_unpurged_pending_uploads(&mut entries, chunk_ids) {
         write_pending_uploads(&entries);
     }
+}
+
+fn retain_unpurged_pending_uploads(
+    entries: &mut Vec<PendingUploadEntry>,
+    chunk_ids: &[String],
+) -> bool {
+    let before = entries.len();
+    entries.retain(|e| !chunk_ids.contains(&e.chunk_id));
+    entries.len() != before
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4307,6 +4314,46 @@ mod tests {
         assert!(!input2.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn purge_keeps_unpurged_pending_entries() {
+        let mut entries = ["keep-1", "purge-1", "keep-2", "purge-2"]
+            .into_iter()
+            .map(|chunk_id| PendingUploadEntry {
+                chunk_id: chunk_id.to_string(),
+                session_id: "test-session".to_string(),
+                video_path: None,
+                input_path: PathBuf::from(format!("{chunk_id}.json")),
+                buffered_at_epoch_s: 1,
+            })
+            .collect();
+        let chunk_ids = vec!["purge-1".to_string(), "purge-2".to_string()];
+
+        assert!(retain_unpurged_pending_uploads(&mut entries, &chunk_ids));
+        assert!(!entries.is_empty());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep-1", "keep-2"]
+        );
+    }
+
+    #[test]
+    fn purge_with_empty_chunk_ids_keeps_manifest_unchanged() {
+        let mut entries = vec![PendingUploadEntry {
+            chunk_id: "keep".to_string(),
+            session_id: "test-session".to_string(),
+            video_path: None,
+            input_path: PathBuf::from("keep.json"),
+            buffered_at_epoch_s: 1,
+        }];
+        let original = entries.clone();
+
+        assert!(!retain_unpurged_pending_uploads(&mut entries, &[]));
+        assert_eq!(entries, original);
     }
 
     #[test]
