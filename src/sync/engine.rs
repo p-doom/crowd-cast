@@ -612,6 +612,19 @@ fn remove_pending_upload(chunk_id: &str) {
     }
 }
 
+fn remove_pending_uploads(chunk_ids: &[String]) {
+    if chunk_ids.is_empty() {
+        return;
+    }
+
+    let mut entries = read_pending_uploads();
+    let before = entries.len();
+    entries.retain(|e| !chunk_ids.contains(&e.chunk_id));
+    if entries.len() != before {
+        write_pending_uploads(&entries);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusKind {
     Idle,
@@ -1115,12 +1128,13 @@ unintended app video."
         }
     }
 
-    /// Panic: delete all buffered segments from disk and clear the manifest.
+    /// Panic: delete all buffered segments from disk and remove them from the manifest.
     fn purge_upload_buffer(&mut self) {
         let count = self.upload_buffer.len();
         if count > 0 {
             info!("Panic: deleting {} buffered segment(s)", count);
         }
+        let mut purged_chunk_ids = Vec::with_capacity(count);
         while let Some((_, segment)) = self.upload_buffer.pop_front() {
             if let Some(ref video_path) = segment.chunk.video_path {
                 if let Err(e) = std::fs::remove_file(video_path) {
@@ -1134,8 +1148,9 @@ unintended app video."
             } else {
                 debug!("Deleted input: {:?}", segment.input_path);
             }
+            purged_chunk_ids.push(segment.chunk.chunk_id);
         }
-        write_pending_uploads(&[]);
+        remove_pending_uploads(&purged_chunk_ids);
     }
 
     fn active_video_target(&self) -> Option<&str> {
@@ -2085,7 +2100,7 @@ unintended app video."
             let mut retry_queue: BinaryHeap<RetryEntry> = BinaryHeap::new();
             let mut sequence: u64 = 0;
             let mut active_session_id: Option<String> = None;
-            let mut upload_pause_notified = false;
+            let mut upload_pause_last_notified_count = 0;
 
             // Semaphore limits concurrent uploads
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPLOADS));
@@ -2195,15 +2210,20 @@ unintended app video."
                                             next_attempt_at: now,
                                         },
                                     });
-                                    if retry_queue.len() >= UPLOAD_PAUSE_NOTIFY_THRESHOLD && !upload_pause_notified {
-                                        upload_pause_notified = true;
-                                        warn!("{} segments waiting to upload. Resume uploads from the tray menu.", UPLOAD_PAUSE_NOTIFY_THRESHOLD);
-                                        crate::ui::notifications::show_upload_queue_warning_notification();
+                                    let queued_count = retry_queue.len();
+                                    // Re-arm after each threshold-sized increase while uploads
+                                    // remain paused.
+                                    if queued_count.saturating_sub(upload_pause_last_notified_count)
+                                        >= UPLOAD_PAUSE_NOTIFY_THRESHOLD
+                                    {
+                                        upload_pause_last_notified_count = queued_count;
+                                        warn!("{} segments waiting to upload. Resume uploads from the tray menu.", queued_count);
+                                        crate::ui::notifications::show_upload_queue_warning_notification(queued_count);
                                     }
                                     continue;
                                 }
 
-                                upload_pause_notified = false;
+                                upload_pause_last_notified_count = 0;
                                 info!("Background upload starting for segment {}", chunk_id);
                                 spawn_upload(
                                     uploader.clone(),
