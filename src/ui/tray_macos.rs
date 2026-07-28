@@ -27,7 +27,6 @@ static SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TOGGLE_UPLOADS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SIGN_IN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static MACOS_QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-static OPEN_DASHBOARD_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 // Last status-item health verdict seen by poll(), so transitions are logged
 // exactly once. -1 = nothing observed yet (distinct from the C layer's
@@ -89,10 +88,6 @@ unsafe extern "C" fn on_quit(_item: *mut TrayMenuItem) {
     }
 }
 
-unsafe extern "C" fn on_open_dashboard(_item: *mut TrayMenuItem) {
-    OPEN_DASHBOARD_REQUESTED.store(true, Ordering::SeqCst);
-}
-
 /// Map a notification's action to the existing menu callback that performs it,
 /// so notification rows need no new engine plumbing.
 fn notification_callback(
@@ -103,7 +98,6 @@ fn notification_callback(
         TrayAction::Settings => Some(on_settings),
         TrayAction::SignIn => Some(on_sign_in),
         TrayAction::CheckForUpdates => Some(on_check_for_updates),
-        TrayAction::OpenDashboard => Some(on_open_dashboard),
         _ => None,
     }
 }
@@ -372,7 +366,6 @@ impl PlatformTray for MacOSTray {
         REPORT_BUG_REQUESTED.store(false, Ordering::SeqCst);
         SETTINGS_REQUESTED.store(false, Ordering::SeqCst);
         TOGGLE_UPLOADS_REQUESTED.store(false, Ordering::SeqCst);
-        OPEN_DASHBOARD_REQUESTED.store(false, Ordering::SeqCst);
         SIGN_IN_REQUESTED.store(false, Ordering::SeqCst);
         MACOS_QUIT_REQUESTED.store(false, Ordering::SeqCst);
 
@@ -450,9 +443,6 @@ impl PlatformTray for MacOSTray {
         if REPORT_BUG_REQUESTED.swap(false, Ordering::SeqCst) {
             return PlatformTrayPoll::Action(TrayAction::ReportBug);
         }
-        if OPEN_DASHBOARD_REQUESTED.swap(false, Ordering::SeqCst) {
-            return PlatformTrayPoll::Action(TrayAction::OpenDashboard);
-        }
 
         PlatformTrayPoll::None
     }
@@ -506,36 +496,22 @@ impl PlatformTray for MacOSTray {
         }
         self.menu_items[MENU_NOTIFICATIONS].disabled = if count == 0 { 1 } else { 0 };
 
-        // Child strings: one per notification, plus a "View on dashboard" footer.
-        let mut notif_strings: Vec<CString> = Vec::with_capacity(count + 1);
+        // Child strings: one per notification.
+        let mut notif_strings: Vec<CString> = Vec::with_capacity(count);
         for n in &state.notifications {
             notif_strings
                 .push(CString::new(n.title.as_bytes()).unwrap_or_else(|_| CString::default()));
         }
-        if count > 0 {
-            notif_strings.push(
-                CString::new("View on dashboard…").unwrap_or_else(|_| CString::default()),
-            );
-        }
         self.notif_strings = notif_strings;
 
         // Child items reuse existing action callbacks; NULL-terminated.
-        let mut notif_items: Vec<TrayMenuItem> = Vec::with_capacity(count + 2);
+        let mut notif_items: Vec<TrayMenuItem> = Vec::with_capacity(count + 1);
         for (i, n) in state.notifications.iter().enumerate() {
             notif_items.push(TrayMenuItem {
                 text: self.notif_strings[i].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: notification_callback(&n.action),
-                submenu: std::ptr::null_mut(),
-            });
-        }
-        if count > 0 {
-            notif_items.push(TrayMenuItem {
-                text: self.notif_strings[count].as_ptr(),
-                disabled: 0,
-                checked: 0,
-                cb: Some(on_open_dashboard),
                 submenu: std::ptr::null_mut(),
             });
         }

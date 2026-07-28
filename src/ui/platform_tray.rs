@@ -19,8 +19,6 @@ pub enum TrayAction {
     CheckForUpdates,
     ReportBug,
     Quit,
-    /// Open the web dashboard in the default browser (notification-center footer).
-    OpenDashboard,
 }
 
 /// A single glanceable notification shown in the tray's notification section.

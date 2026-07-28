@@ -93,9 +93,6 @@ fn next_prepare_for_update_action(
 /// Issue tracker targeted by the "Report Bug…" menu item.
 const BUG_REPORT_ISSUES_URL: &str = "https://github.com/p-doom/crowd-cast/issues/new";
 
-/// Web dashboard opened from the notification-center footer / notifications.
-const DASHBOARD_URL: &str = "https://pdoom.org/crowd-cast-dashboard.html";
-
 /// Build the prefilled GitHub new-issue URL for the "Report Bug…" menu item.
 /// Pure function (all environment data passed in) so URL encoding is testable.
 fn build_bug_report_url(version: &str, os: &str, arch: &str, log_dir: &str) -> String {
@@ -430,10 +427,6 @@ impl TrayApp {
                     TrayAction::ReportBug => {
                         info!("Bug report requested via tray");
                         open_url(&bug_report_url());
-                    }
-                    TrayAction::OpenDashboard => {
-                        info!("Dashboard requested via tray notifications");
-                        open_url(DASHBOARD_URL);
                     }
                 },
             }
