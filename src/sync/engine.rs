@@ -262,15 +262,23 @@ fn dead_source_action(
 const BLACK_PCT_MIN: f32 = 0.97;
 
 /// How long a source that has never shown real content may stay continuously black, with
-/// the user actively working, before the automatic restart fires. The happy path needs no
-/// timer at all — the first real frame clears the source within a couple of seconds of the
-/// app painting; this deadline only bounds the failure case. 30s (not 10s) on purpose: a
-/// pure-#000 near-empty screen that is genuinely live (an empty black-themed terminal) reads
-/// as black no matter how long we wait, so a shorter deadline only widens that rare false
-/// trigger without making real recoveries meaningfully faster. Worst case cost of a false
-/// trigger stays one ~3s recorder restart, bounded further by the shared backoff.
+/// the user actively working, before we act. The happy path needs no timer at all — the
+/// first real frame clears the source within a couple of seconds of the app painting; this
+/// deadline only bounds the failure case. 10s is safe ONLY because no restart fires on the
+/// timer alone anymore: every action is first confirmed by the second-opinion probe
+/// (`run_sck_probe`), which stands down when a fresh stream sees the same black the
+/// recording sees (a genuinely black screen) — so the timer being early costs a 2.5s probe,
+/// not a restart.
 #[cfg(all(target_os = "macos", not(no_tray)))]
-const BLIND_REBIND_AFTER: Duration = Duration::from_secs(30);
+const BLIND_REBIND_AFTER: Duration = Duration::from_secs(10);
+
+/// How long a key stands down after the second-opinion probe confirmed the screen is
+/// GENUINELY black (not a capture failure). Deliberately a stand-down rather than a
+/// permanent all-clear: the screen may paint real content minutes later while the
+/// recorder's stream stays wedged, and that must still be caught — just not by re-running
+/// a 2.5s probe every few seconds against someone working in a black terminal.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const BLIND_PROBE_STANDDOWN: Duration = Duration::from_secs(300);
 
 /// How long past the (post-restart) blind clock the "restart your Mac" alert waits. Split
 /// from [`BLIND_REBIND_AFTER`] deliberately: the re-bind is a cheap ~2s blip worth firing
@@ -359,6 +367,54 @@ fn blind_gates_met(
 #[cfg(all(target_os = "macos", not(no_tray)))]
 fn blind_restart_consumed(marker_present: bool, latched: bool) -> bool {
     marker_present || latched
+}
+
+/// What a fresh, short-lived ScreenCaptureKit stream saw for the same target the recording
+/// is keyed to (see `src/capture/sck_probe.m`). This is the second opinion that separates
+/// "the recorder's stream is wedged" from "the screen genuinely shows black".
+#[cfg(all(target_os = "macos", not(no_tray)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SckProbeVerdict {
+    /// Probe failed / timed out / target not visible to SCK — treat as if the probe does
+    /// not exist (fail open, proceed on the timer alone).
+    Unavailable,
+    /// A fresh stream delivered nothing at all — the OS-level wedge signature.
+    NoFrames,
+    /// A fresh stream delivered frames that are just as black as the recording: the screen
+    /// genuinely shows black. Restarting would fix nothing.
+    Black,
+    /// A fresh stream sees real content while the recording is black: the recorder's own
+    /// stream is wedged, and a restart is the proven fix.
+    Content,
+}
+
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn sck_probe_verdict(raw: std::os::raw::c_int) -> SckProbeVerdict {
+    match raw {
+        1 => SckProbeVerdict::NoFrames,
+        2 => SckProbeVerdict::Black,
+        3 => SckProbeVerdict::Content,
+        _ => SckProbeVerdict::Unavailable,
+    }
+}
+
+/// Run the second-opinion probe for `key` (an app bundle id, or the whole display for
+/// `__display__`). Blocks the engine thread for up to ~2.5s — only called at escalation
+/// decisions, which are rare by construction.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn run_sck_probe(key: &str) -> SckProbeVerdict {
+    extern "C" {
+        fn sck_probe_capture(
+            bundle_id: *const std::os::raw::c_char,
+            budget_secs: f64,
+        ) -> std::os::raw::c_int;
+    }
+    let c_key = match std::ffi::CString::new(key) {
+        Ok(c) => c,
+        Err(_) => return SckProbeVerdict::Unavailable,
+    };
+    let raw = unsafe { sck_probe_capture(c_key.as_ptr(), 2.5) };
+    sck_probe_verdict(raw)
 }
 
 #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
@@ -998,6 +1054,10 @@ pub struct SyncEngine {
     /// is the useful amount.
     #[cfg(all(target_os = "macos", not(no_tray)))]
     blind_alert_surfaced: bool,
+    /// PER-KEY: until when the black-output ladder stands down because the second-opinion
+    /// probe confirmed the screen is genuinely black (see [`BLIND_PROBE_STANDDOWN`]).
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    blind_probe_standdown: std::collections::HashMap<String, Instant>,
     /// Whether we've already shown the "restart your Mac" alert this session
     restart_alert_shown: bool,
     /// Linux: set when a previously-ready capture source dies mid-recording (e.g. the user
@@ -1162,6 +1222,8 @@ unintended app video."
             last_blind_observe_log: None,
             #[cfg(all(target_os = "macos", not(no_tray)))]
             blind_alert_surfaced: false,
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            blind_probe_standdown: std::collections::HashMap::new(),
             restart_alert_shown: false,
             #[cfg(target_os = "linux")]
             capture_lost: false,
@@ -2034,6 +2096,7 @@ unintended app video."
             if was_blind || first_healthy {
                 self.blind_alerted_keys.remove(&key);
                 self.blind_restarted_keys.remove(&key);
+                self.blind_probe_standdown.remove(&key);
                 clear_capture_dead_restart(&marker_key);
                 clear_capture_dead_restart(&format!("alerted:{marker_key}"));
             }
@@ -2055,6 +2118,16 @@ unintended app video."
             unsafe { crate::ui::tray_ffi::tray_screen_is_locked() },
             self.blind_content_seen.contains(&key),
         );
+
+        // Standing down after a confirmed genuinely-black screen: don't charge the clock,
+        // don't probe again yet. Expired entries are dropped so the ladder re-arms.
+        if let Some(until) = self.blind_probe_standdown.get(&key) {
+            if now < *until {
+                self.blind_since.remove(&key);
+                return;
+            }
+            self.blind_probe_standdown.remove(&key);
+        }
 
         let clock = self.blind_since.entry(key.clone()).or_insert(BlindClock {
             blind_for: Duration::ZERO,
@@ -2117,6 +2190,27 @@ unintended app video."
                 }
             }
             DeadSourceAction::Alert => {
+                // Same second opinion before bothering a human: if a fresh stream sees the
+                // same black the recording sees, the screen is genuinely black — no popup.
+                match run_sck_probe(&key) {
+                    SckProbeVerdict::Black => {
+                        self.blind_since.remove(&key);
+                        self.blind_probe_standdown
+                            .insert(key.clone(), now + BLIND_PROBE_STANDDOWN);
+                        info!(
+                            "Screen for '{}' is genuinely black (fresh stream agrees) — \
+                             suppressing the restart-your-Mac prompt",
+                            key
+                        );
+                        return;
+                    }
+                    verdict => {
+                        info!(
+                            "Second-opinion capture probe for '{}' before alert: {:?}",
+                            key, verdict
+                        );
+                    }
+                }
                 self.blind_alerted_keys.insert(key.clone());
                 error!(
                     "Capture output for '{}' is {:.1}% black after {}s and an automatic restart \
@@ -2158,6 +2252,34 @@ unintended app video."
                 }
             }
             DeadSourceAction::Restart => {
+                // Second opinion before acting: open a fresh, short-lived SCK stream for the
+                // same target and compare. A fresh stream seeing CONTENT while the recording
+                // is black proves the recorder's stream is wedged (restart fixes it — the
+                // manually-verified cure). A fresh stream seeing the SAME black means the
+                // screen genuinely shows black (an empty pure-#000 terminal): nothing is
+                // broken, so mark the key as genuine content and stand down entirely. No
+                // frames at all is the OS-wedge signature — restart once, then the popup's
+                // "restart your Mac" advice is actually right. Probe failure = fail open,
+                // proceed on the timer alone as before.
+                let verdict = run_sck_probe(&key);
+                info!(
+                    "Second-opinion capture probe for '{}': {:?} (recording {:.1}% black)",
+                    key,
+                    verdict,
+                    pct_black * 100.0
+                );
+                if verdict == SckProbeVerdict::Black {
+                    self.blind_since.remove(&key);
+                    self.blind_probe_standdown
+                        .insert(key.clone(), now + BLIND_PROBE_STANDDOWN);
+                    info!(
+                        "Screen for '{}' is genuinely black (fresh stream agrees) — not a \
+                         capture failure; standing down for {}s",
+                        key,
+                        BLIND_PROBE_STANDDOWN.as_secs()
+                    );
+                    return;
+                }
                 // First blind episode for this key: restart for a fresh capture context (the
                 // proven cure), if the shared backoff allows. Stamp the marker FIRST so the
                 // fresh process knows we already tried.
