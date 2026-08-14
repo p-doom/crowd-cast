@@ -167,15 +167,24 @@ pub fn register(runtime: &ObsRuntime) {
     );
 }
 
+/// Detach the probe. Registering a raw-video consumer forces OBS to download the mix to CPU
+/// on every frame, so the probe only stays attached while a recording is actually running —
+/// when nothing is being written, black output costs nothing and proves nothing. Removing a
+/// callback that isn't registered is a documented no-op (OBS searches its consumer list), so
+/// this is safe to call unconditionally.
+pub fn remove(runtime: &ObsRuntime) {
+    if let Err(e) = libobs_wrapper::run_with_obs!(runtime, move || unsafe {
+        libobs::obs_remove_raw_video_callback(Some(on_raw_video), std::ptr::null_mut());
+    }) {
+        debug!("black probe: detach failed: {}", e);
+    }
+}
+
 /// Re-attach after a `reset_video`, which rebuilds the video output the callback was
 /// connected to. Removing first (matched on the callback+param pair, hence the same null
 /// `param` used at registration) keeps this idempotent if the connection did survive.
 pub fn reregister(runtime: &ObsRuntime) {
-    if let Err(e) = libobs_wrapper::run_with_obs!(runtime, move || unsafe {
-        libobs::obs_remove_raw_video_callback(Some(on_raw_video), std::ptr::null_mut());
-    }) {
-        debug!("black probe: detach before re-attach failed: {}", e);
-    }
+    remove(runtime);
     register(runtime);
 }
 

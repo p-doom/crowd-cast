@@ -261,12 +261,21 @@ fn dead_source_action(
 #[cfg(all(target_os = "macos", not(no_tray)))]
 const BLACK_PCT_MIN: f32 = 0.97;
 
-/// How long the output must be continuously black, WITH the user actively working, before we
-/// escalate. Two minutes is far longer than any legitimate all-black moment (a screensaver
-/// wouldn't have input, a video letterbox has content) and negligible against the hours of
-/// black video the incident produced.
+/// How long a NEVER-verified source may stay continuously black, with the user actively
+/// working, before the automatic re-bind (process restart) fires. The success path is
+/// event-driven — the first real frame verifies the source within a sample or two of the app
+/// painting — so this is only the FAILURE deadline. 10s is far past any healthy app's first
+/// paint, and small enough that a born-black bind costs seconds of footage, not minutes.
 #[cfg(all(target_os = "macos", not(no_tray)))]
-const BLIND_ESCALATE_AFTER: Duration = Duration::from_secs(120);
+const BLIND_REBIND_AFTER: Duration = Duration::from_secs(10);
+
+/// How long past the (post-restart) blind clock the "restart your Mac" alert waits. Split
+/// from [`BLIND_REBIND_AFTER`] deliberately: the re-bind is a cheap ~2s blip worth firing
+/// aggressively, but the alert is a modal a participant has to read — if the automatic
+/// restart didn't cure the black, give the fresh bind a real chance (a genuinely slow first
+/// paint, a display still settling) before telling a human to reboot.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const BLIND_ALERT_AFTER: Duration = Duration::from_secs(60);
 
 /// How recent an input event must be for "the user is actively working" to hold. This is the
 /// gate that keeps a locked screen, a stepped-away machine or an about-to-idle session from
@@ -2057,10 +2066,18 @@ unintended app video."
             self.blind_restarted_keys.insert(key.clone());
         }
         let already_alerted = self.blind_alerted_keys.contains(&key);
+        // Two deadlines, one ladder: the cheap self-heal (restart) fires fast, the modal
+        // (alert) waits for the post-restart bind to have had a fair chance. Which one
+        // applies is exactly "has this episode already spent its restart".
+        let threshold = if already_restarted {
+            BLIND_ALERT_AFTER
+        } else {
+            BLIND_REBIND_AFTER
+        };
         let action = dead_source_action(
             blind_for,
             gates,
-            BLIND_ESCALATE_AFTER,
+            threshold,
             already_restarted,
             already_alerted,
         );
@@ -3581,6 +3598,12 @@ unintended app video."
             String::new()
         };
 
+        // Recording is live from here — attach the blackness probe for exactly this window
+        // (its raw-video tap costs a per-frame CPU download, so it must not outlive the
+        // recording; see set_black_probe_active).
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        self.capture_ctx.set_black_probe_active(true);
+
         info!(
             "Recording started: main_session={}, segment={}, output={:?}{}",
             main_session_id, self.segment_index, session.output_path, segment_info
@@ -3619,6 +3642,11 @@ unintended app video."
 
     /// Stop recording
     async fn stop_recording(&mut self) -> Result<()> {
+        // No recording, no probe: detach before tearing anything down so the raw-video
+        // download never outlives the frames it was watching. Idempotent if never attached.
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        self.capture_ctx.set_black_probe_active(false);
+
         if self.current_session.is_none() {
             debug!("No recording in progress");
             return Ok(());
@@ -3729,6 +3757,11 @@ unintended app video."
             return;
         }
 
+        // Paused output writes no frames, so black output proves nothing and the probe's
+        // per-frame download is pure cost (idle pauses can last a whole night) — detach.
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        self.capture_ctx.set_black_probe_active(false);
+
         info!("Pausing recording (video and keylog)...");
 
         // Pause the video recording — watchdog restarts the process if OBS hangs.
@@ -3778,6 +3811,10 @@ unintended app video."
         }
 
         info!("Resuming recording (video and keylog)...");
+
+        // Frames are about to be written again — re-attach the blackness probe.
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        self.capture_ctx.set_black_probe_active(true);
 
         let (frontmost_app, should_capture) = self.frontmost_capture_state();
         let desired_target = match self.prepare_active_capture_target(
@@ -4649,19 +4686,28 @@ mod tests {
                 dead_source_action(
                     secs(9999), // blind_for only ever grows once past the threshold
                     true,
-                    BLIND_ESCALATE_AFTER,
+                    BLIND_ALERT_AFTER, // an already-restarted episode runs on the alert deadline
                     blind_restart_consumed(marker, latched),
                     latched, // alerted implies we had already seen "restarted"
                 )
             };
             // t=0: no marker, nothing latched → the one automatic restart.
-            assert_eq!(latch(false, false), DeadSourceAction::Restart);
+            assert_eq!(
+                dead_source_action(
+                    secs(9999),
+                    true,
+                    BLIND_REBIND_AFTER,
+                    blind_restart_consumed(false, false),
+                    false
+                ),
+                DeadSourceAction::Restart
+            );
             // Fresh process, marker present, still black → alert (and latch it).
             assert_eq!(
                 dead_source_action(
                     secs(9999),
                     true,
-                    BLIND_ESCALATE_AFTER,
+                    BLIND_ALERT_AFTER,
                     blind_restart_consumed(true, false),
                     false
                 ),
@@ -4674,27 +4720,34 @@ mod tests {
 
         #[test]
         fn blind_ladder_escalates_restart_then_alert_then_hold() {
-            // Same decision fn as the dead-source ladder, fed the blind clock: below the
-            // threshold nothing happens; then one restart, then one alert, then hold.
+            // Same decision fn as the dead-source ladder, fed the blind clock — but with the
+            // SPLIT deadlines: the cheap re-bind fires at 10s, while the "restart your Mac"
+            // modal waits until the post-restart bind has had 60s to prove itself.
             assert_eq!(
-                dead_source_action(secs(119), true, BLIND_ESCALATE_AFTER, false, false),
+                dead_source_action(secs(9), true, BLIND_REBIND_AFTER, false, false),
                 DeadSourceAction::Wait
             );
             assert_eq!(
-                dead_source_action(secs(120), true, BLIND_ESCALATE_AFTER, false, false),
+                dead_source_action(secs(10), true, BLIND_REBIND_AFTER, false, false),
                 DeadSourceAction::Restart
             );
+            // A restarted episode is judged against the LONGER alert deadline: 10s of
+            // post-restart black is still Wait, not an instant modal.
             assert_eq!(
-                dead_source_action(secs(120), true, BLIND_ESCALATE_AFTER, true, false),
+                dead_source_action(secs(10), true, BLIND_ALERT_AFTER, true, false),
+                DeadSourceAction::Wait
+            );
+            assert_eq!(
+                dead_source_action(secs(60), true, BLIND_ALERT_AFTER, true, false),
                 DeadSourceAction::Alert
             );
             assert_eq!(
-                dead_source_action(secs(9999), true, BLIND_ESCALATE_AFTER, true, true),
+                dead_source_action(secs(9999), true, BLIND_ALERT_AFTER, true, true),
                 DeadSourceAction::Hold
             );
             // Gates unmet → Wait no matter how long the clock says.
             assert_eq!(
-                dead_source_action(secs(9999), false, BLIND_ESCALATE_AFTER, false, false),
+                dead_source_action(secs(9999), false, BLIND_REBIND_AFTER, false, false),
                 DeadSourceAction::Wait
             );
         }

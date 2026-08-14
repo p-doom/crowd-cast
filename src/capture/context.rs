@@ -131,6 +131,12 @@ pub struct CaptureContext {
     /// when false, behaves exactly like the pre-feature main-display-only path.
     #[cfg(target_os = "macos")]
     mac_multi_monitor_capture: bool,
+    /// Whether the output-blackness probe (PDOOM-1298) is currently attached. Driven by the
+    /// engine via `set_black_probe_active` so the probe's forced raw-video CPU download only
+    /// exists while a recording is running; also consulted after `reset_video`, which tears
+    /// down the video output the probe taps.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    black_probe_active: bool,
     /// macOS follow-focus: the display UUID each tracked app's SCK source is currently pointed
     /// at (bundle_id → uuid). PER-APP: single-active mode keeps a persistent source per target
     /// app (only the active scene is shown), so a single slot would be clobbered on every app
@@ -248,6 +254,8 @@ impl CaptureContext {
             follow_focus_unresolvable: None,
             #[cfg(target_os = "macos")]
             mac_multi_monitor_capture: false,
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            black_probe_active: false,
             #[cfg(target_os = "macos")]
             last_display_uuid: HashMap::new(),
         })
@@ -433,15 +441,42 @@ impl CaptureContext {
         info!("libobs context initialized successfully");
         self.context = Some(context);
 
-        // Tap the composited output so a source that comes up BLACK-but-valid-sized (the
-        // silent-black-recording incident, PDOOM-1298) has a signal the engine can escalate
-        // on — dimensions alone can't tell the two apart. Read-only; failures only log.
+        // The output-blackness probe (PDOOM-1298) is NOT attached by default: a raw-video
+        // consumer forces OBS to download the mix to CPU every frame, which is pure cost
+        // while no recording is running. The engine drives attachment for exactly the
+        // recording+unpaused windows via `set_black_probe_active`; if that intent was set
+        // before this (re)init existed to act on it, honor it now.
         #[cfg(all(target_os = "macos", not(no_tray)))]
-        if let Some(ctx) = self.context.as_ref() {
-            super::black_probe::register(ctx.runtime());
+        if self.black_probe_active {
+            if let Some(ctx) = self.context.as_ref() {
+                super::black_probe::register(ctx.runtime());
+            }
         }
 
         Ok(())
+    }
+
+    /// Attach or detach the output-blackness probe (PDOOM-1298). The engine calls this on
+    /// recording start/resume (attach) and stop/pause (detach), so the raw-video CPU download
+    /// the probe forces only exists while frames are actually being written — the only time
+    /// black output is evidence of anything. Idempotent: repeated calls with the same value
+    /// are no-ops, and detaching an unattached probe is safe.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    pub fn set_black_probe_active(&mut self, active: bool) {
+        if self.black_probe_active == active {
+            return;
+        }
+        let Some(ctx) = self.context.as_ref() else {
+            // No OBS context to (de)tach from; remember the intent for after init.
+            self.black_probe_active = active;
+            return;
+        };
+        if active {
+            super::black_probe::register(ctx.runtime());
+        } else {
+            super::black_probe::remove(ctx.runtime());
+        }
+        self.black_probe_active = active;
     }
 
     /// Enable or disable the macOS single-active-app capture strategy.
@@ -1029,7 +1064,9 @@ impl CaptureContext {
         // re-attach it before the sources come back — otherwise a display change would
         // silently disarm exactly the detector the post-display-change restarts need.
         #[cfg(all(target_os = "macos", not(no_tray)))]
-        super::black_probe::reregister(context.runtime());
+        if self.black_probe_active {
+            super::black_probe::reregister(context.runtime());
+        }
 
         // Recreate capture sources
         self.fully_recreate_sources()
