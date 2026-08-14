@@ -53,19 +53,27 @@ static FRAMES_SEEN: AtomicU64 = AtomicU64::new(0);
 /// an f32). Only meaningful once [`SAMPLE_SEQ`] is non-zero.
 static PCT_BLACK_MILLI: AtomicU32 = AtomicU32::new(0);
 
+/// NON-black pixel count of the most recent scanned frame. The engine uses its GROWTH to
+/// tell live-but-sparse content from a wedged capture: typing into a true-black-themed
+/// full-screen terminal stays above the black-percentage threshold indefinitely (each glyph
+/// is a handful of thumbnail pixels), but every keystroke ADDS ink — while a wedged frame's
+/// non-black count barely moves (menu-bar clock, cursor). Growth is the one signal the
+/// percentage can never provide.
+static NONBLACK_COUNT: AtomicU32 = AtomicU32::new(0);
+
 /// Monotonically increasing count of scanned frames. The engine uses it to tell a FRESH
 /// sample from a stale one: if the video thread stops delivering frames entirely, the last
 /// reading must not be re-counted as ongoing evidence.
 static SAMPLE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Fraction (0.0..=1.0) of the Y plane at or below [`BLACK_Y_MAX`].
+/// `(black, total)` pixel counts of the Y plane, black meaning at or below [`BLACK_Y_MAX`].
 ///
 /// `linesize` is the plane stride, which OBS may pad beyond `width` — the padding bytes are
 /// undefined and must never be counted. Total, panic-free and allocation-free: it is called
 /// from the OBS video thread, where a panic would unwind across an FFI boundary (UB).
-fn black_pixel_fraction(y_plane: &[u8], width: usize, height: usize, linesize: usize) -> f32 {
+fn black_pixel_counts(y_plane: &[u8], width: usize, height: usize, linesize: usize) -> (usize, usize) {
     if width == 0 || height == 0 || linesize < width {
-        return 0.0;
+        return (0, 0);
     }
     let mut black = 0usize;
     let mut total = 0usize;
@@ -77,7 +85,7 @@ fn black_pixel_fraction(y_plane: &[u8], width: usize, height: usize, linesize: u
             break;
         };
         // A short plane (shouldn't happen — OBS sizes it from the stride) truncates the scan
-        // rather than panicking; the fraction is then over the rows we actually saw.
+        // rather than panicking; the counts are then over the rows we actually saw.
         let Some(line) = y_plane.get(start..end) else {
             break;
         };
@@ -88,6 +96,12 @@ fn black_pixel_fraction(y_plane: &[u8], width: usize, height: usize, linesize: u
         }
         total += width;
     }
+    (black, total)
+}
+
+/// Fraction (0.0..=1.0) of the Y plane at or below [`BLACK_Y_MAX`].
+fn black_pixel_fraction(y_plane: &[u8], width: usize, height: usize, linesize: usize) -> f32 {
+    let (black, total) = black_pixel_counts(y_plane, width, height, linesize);
     if total == 0 {
         0.0
     } else {
@@ -120,9 +134,15 @@ unsafe extern "C" fn on_raw_video(_param: *mut c_void, frame: *mut libobs::video
         return;
     };
     let plane = std::slice::from_raw_parts(data, len);
-    let pct = black_pixel_fraction(plane, width, height, linesize);
+    let (black, total) = black_pixel_counts(plane, width, height, linesize);
+    let pct = if total == 0 {
+        0.0
+    } else {
+        black as f32 / total as f32
+    };
 
     PCT_BLACK_MILLI.store((pct * 1000.0) as u32, Ordering::Relaxed);
+    NONBLACK_COUNT.store(total.saturating_sub(black) as u32, Ordering::Relaxed);
     // Release-publish the reading: a reader that observes the new sequence number is
     // guaranteed to observe the percentage that goes with it.
     SAMPLE_SEQ.fetch_add(1, Ordering::Release);
@@ -188,16 +208,20 @@ pub fn reregister(runtime: &ObsRuntime) {
     register(runtime);
 }
 
-/// Latest reading as `(black_pixel_fraction, sample_sequence)`, or `None` until the probe has
-/// scanned its first frame. The sequence number only ever increases; callers compare it
-/// against the last one they consumed so a frozen video thread reads as "no new evidence"
-/// rather than as sustained blackness.
-pub fn output_black_stats() -> Option<(f32, u64)> {
+/// Latest reading as `(black_pixel_fraction, nonblack_pixel_count, sample_sequence)`, or
+/// `None` until the probe has scanned its first frame. The sequence number only ever
+/// increases; callers compare it against the last one they consumed so a frozen video thread
+/// reads as "no new evidence" rather than as sustained blackness.
+pub fn output_black_stats() -> Option<(f32, u32, u64)> {
     let seq = SAMPLE_SEQ.load(Ordering::Acquire);
     if seq == 0 {
         return None;
     }
-    Some((PCT_BLACK_MILLI.load(Ordering::Relaxed) as f32 / 1000.0, seq))
+    Some((
+        PCT_BLACK_MILLI.load(Ordering::Relaxed) as f32 / 1000.0,
+        NONBLACK_COUNT.load(Ordering::Relaxed),
+        seq,
+    ))
 }
 
 #[cfg(test)]

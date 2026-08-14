@@ -271,11 +271,22 @@ const BLIND_REBIND_AFTER: Duration = Duration::from_secs(10);
 
 /// How long past the (post-restart) blind clock the "restart your Mac" alert waits. Split
 /// from [`BLIND_REBIND_AFTER`] deliberately: the re-bind is a cheap ~2s blip worth firing
-/// aggressively, but the alert is a modal a participant has to read — if the automatic
-/// restart didn't cure the black, give the fresh bind a real chance (a genuinely slow first
-/// paint, a display still settling) before telling a human to reboot.
+/// aggressively, but the alert is a blocking modal a participant has to read. Red-team
+/// review showed a first-ever app launch can legitimately stay black well past a minute
+/// (Gatekeeper scan of a fresh download, Rosetta translation, a huge Electron workspace
+/// cold-starting), so the modal waits three minutes of GATED post-restart blackness —
+/// long past any launch, still same-session for a real wedge.
 #[cfg(all(target_os = "macos", not(no_tray)))]
-const BLIND_ALERT_AFTER: Duration = Duration::from_secs(60);
+const BLIND_ALERT_AFTER: Duration = Duration::from_secs(180);
+
+/// How many NEW non-black thumbnail pixels (above this episode's low-water mark) count as
+/// proof the capture is live. This is the defense for content the percentage threshold can
+/// never clear: a true-black (#000000) full-screen terminal stays >=97% black through any
+/// amount of typing (each glyph is a handful of thumbnail pixels), but typing ADDS ink —
+/// while a wedged frame's non-black count only jitters (menu-bar clock, cursor), well under
+/// this margin. ~30px is roughly a dozen typed characters at probe scale.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const INK_GROWTH_MIN: u32 = 30;
 
 /// How recent an input event must be for "the user is actively working" to hold. This is the
 /// gate that keeps a locked screen, a stepped-away machine or an about-to-idle session from
@@ -305,6 +316,10 @@ struct BlindClock {
     /// Anchor for the next increment, refreshed on every consumed sample — including ones
     /// that don't count — so a frozen stretch is never retroactively charged to the clock.
     last_sample_at: Instant,
+    /// Low-water mark of the non-black pixel count across this episode. Growth past it by
+    /// [`INK_GROWTH_MIN`] proves live content that the percentage threshold can't see
+    /// (typing into a true-black full-screen terminal) and verifies the key.
+    min_nonblack: u32,
 }
 
 /// Whether the black-output ladder is allowed to act right now. Pure so the gating is
@@ -353,6 +368,17 @@ fn blind_gates_met(
 #[cfg(all(target_os = "macos", not(no_tray)))]
 fn blind_restart_consumed(marker_present: bool, latched: bool) -> bool {
     marker_present || latched
+}
+
+/// Whether the non-black pixel count has grown enough past this episode's low-water mark to
+/// prove the capture is live (see [`INK_GROWTH_MIN`]). Pure for testability.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn ink_grew(min_nonblack: u32, nonblack: u32) -> bool {
+    // checked, not saturating: at a saturated threshold "grew past it" would degenerate to
+    // ">=" and a CONSTANT count at the ceiling would count as growth (caught by test).
+    min_nonblack
+        .checked_add(INK_GROWTH_MIN)
+        .is_some_and(|threshold| nonblack >= threshold)
 }
 
 #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
@@ -986,6 +1012,12 @@ pub struct SyncEngine {
     /// about the *non*-escalating majority — exactly what tuning [`BLACK_PCT_MIN`] needs.
     #[cfg(all(target_os = "macos", not(no_tray)))]
     last_blind_observe_log: Option<Instant>,
+    /// Whether the blind ladder has already surfaced its user-facing escalation (modal or
+    /// permission notification) this process. Per-KEY de-dupe alone still allows a systemic
+    /// wedge (everything black) to pop one modal per key — one actionable prompt per process
+    /// is the useful amount.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    blind_alert_surfaced: bool,
     /// Whether we've already shown the "restart your Mac" alert this session
     restart_alert_shown: bool,
     /// Linux: set when a previously-ready capture source dies mid-recording (e.g. the user
@@ -1148,6 +1180,8 @@ unintended app video."
             last_blind_hold_warn: None,
             #[cfg(all(target_os = "macos", not(no_tray)))]
             last_blind_observe_log: None,
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            blind_alert_surfaced: false,
             restart_alert_shown: false,
             #[cfg(target_os = "linux")]
             capture_lost: false,
@@ -1976,7 +2010,8 @@ unintended app video."
         /// real-world distribution of `pct_black` for sessions that never escalate.
         const BLIND_OBSERVE_LOG_EVERY: Duration = Duration::from_secs(300);
 
-        let Some((pct_black, seq)) = crate::capture::black_probe::output_black_stats() else {
+        let Some((pct_black, nonblack, seq)) = crate::capture::black_probe::output_black_stats()
+        else {
             return;
         };
         // Only ever count a sample once: if the video thread stalls, the last reading must
@@ -2000,7 +2035,9 @@ unintended app video."
             .is_none_or(|t| t.elapsed() >= BLIND_OBSERVE_LOG_EVERY)
         {
             self.last_blind_observe_log = Some(now);
-            debug!(
+            // info!, not debug!: the default shipped log filter drops debug, and the whole
+            // point of this line is building a field distribution from participant logs.
+            info!(
                 "black probe: output {:.1}% black for '{}' (escalation threshold {:.0}%)",
                 pct_black * 100.0,
                 key,
@@ -2042,7 +2079,26 @@ unintended app video."
         let clock = self.blind_since.entry(key.clone()).or_insert(BlindClock {
             blind_for: Duration::ZERO,
             last_sample_at: now,
+            min_nonblack: nonblack,
         });
+        // Ink growth = liveness. A wedged frame's non-black count only jitters (menu-bar
+        // clock, cursor); typed characters and repaints ADD pixels. This is the only signal
+        // that clears a true-black-themed full-screen terminal, whose percentage stays above
+        // the threshold through any amount of real use.
+        clock.min_nonblack = clock.min_nonblack.min(nonblack);
+        if ink_grew(clock.min_nonblack, nonblack) {
+            self.blind_since.remove(&key);
+            self.blind_content_seen.insert(key.clone());
+            self.blind_alerted_keys.remove(&key);
+            self.blind_restarted_keys.remove(&key);
+            clear_capture_dead_restart(&marker_key);
+            info!(
+                "Capture content verified for '{}' via ink growth ({} non-black px) — output \
+                 is sparse but live",
+                key, nonblack
+            );
+            return;
+        }
         // Charge at most one sample interval, so a stretch where we weren't consuming samples
         // (gates unmet, stalled video thread) freezes the clock instead of jumping it.
         let delta = now
@@ -2108,11 +2164,31 @@ unintended app video."
                     pct_black * 100.0,
                     blind_for.as_secs()
                 );
-                extern "C" {
-                    fn show_restart_mac_alert();
-                }
-                unsafe {
-                    show_restart_mac_alert();
+                // One user-facing escalation per process, across ALL keys: a systemic wedge
+                // makes every key blind, and a participant needs one actionable prompt, not
+                // one per app. (The per-key set above still stops the LADDER re-alerting.)
+                if !self.blind_alert_surfaced {
+                    self.blind_alert_surfaced = true;
+                    extern "C" {
+                        fn CGPreflightScreenCaptureAccess() -> bool;
+                        fn show_restart_mac_alert();
+                    }
+                    // A revoked/never-granted Screen Recording permission produces exactly
+                    // this black-forever signature, and no Mac restart will fix it — route
+                    // that case to the permission prompt instead of the reboot modal.
+                    if unsafe { CGPreflightScreenCaptureAccess() } {
+                        unsafe { show_restart_mac_alert() };
+                    } else {
+                        warn!(
+                            "Screen Recording permission is not granted — showing the \
+                             permission notification instead of the restart-your-Mac alert"
+                        );
+                        crate::ui::show_permissions_missing_notification(
+                            "crowd-cast does not have Screen Recording permission, so \
+                             recordings are black. Open System Settings > Privacy & \
+                             Security > Screen Recording and enable CrowdCast.",
+                        );
+                    }
                 }
             }
             DeadSourceAction::Restart => {
@@ -3812,10 +3888,6 @@ unintended app video."
 
         info!("Resuming recording (video and keylog)...");
 
-        // Frames are about to be written again — re-attach the blackness probe.
-        #[cfg(all(target_os = "macos", not(no_tray)))]
-        self.capture_ctx.set_black_probe_active(true);
-
         let (frontmost_app, should_capture) = self.frontmost_capture_state();
         let desired_target = match self.prepare_active_capture_target(
             frontmost_app.as_deref(),
@@ -3841,6 +3913,12 @@ unintended app video."
         }
 
         self.is_paused = false;
+
+        // Frames are actually being written again — re-attach the blackness probe. AFTER the
+        // success checks above: a failed resume stays paused, and a paused output must not
+        // keep paying the probe's per-frame download (red-team finding).
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        self.capture_ctx.set_black_probe_active(true);
 
         // Pause-drift correction: OBS's frame-time clock kept advancing while paused, but the
         // recording file accrued no frames, so the video timeline is seamless across the pause.
@@ -3900,6 +3978,16 @@ unintended app video."
                         "Successfully switched to display {} ({} sources recreated)",
                         display_id, count
                     );
+                    // Fresh sources: re-arm the black-output ladder like the sibling
+                    // display-change rebuild paths do — old clocks must not escalate the
+                    // new sources, and old good behavior must not vouch for them.
+                    #[cfg(all(target_os = "macos", not(no_tray)))]
+                    {
+                        self.blind_since.clear();
+                        self.blind_content_seen.clear();
+                        self.blind_alerted_keys.clear();
+                        self.blind_restarted_keys.clear();
+                    }
                     if let Some(app) = self
                         .capture_ctx
                         .active_capture_app()
@@ -4122,6 +4210,10 @@ unintended app video."
                             {
                                 self.blind_since.clear();
                                 self.blind_content_seen.clear();
+                                // Fresh source generation, fresh restart/alert budget (the
+                                // exec-surviving marker still throttles cross-process).
+                                self.blind_alerted_keys.clear();
+                                self.blind_restarted_keys.clear();
                             }
                         }
                     }
@@ -4166,8 +4258,11 @@ unintended app video."
             self.capture_dead_since.clear();
             // Same re-arm for the black-output ladder: the sources are being rebuilt, so a
             // blind clock accumulated against the OLD ones must not escalate the instant the
-            // new ones come up. (Restart markers are left alone, as above.)
+            // new ones come up. (Restart markers are left alone, as above.) The in-process
+            // restart/alert de-dupes reset with the source generation too.
             self.blind_since.clear();
+            self.blind_alerted_keys.clear();
+            self.blind_restarted_keys.clear();
             // "This source has produced real content" is a fact about the source set that
             // produced it, and that set is being torn down — a display-change/unlock rebuild
             // is one of the moments that births a black-at-birth source, so the ladder has to
@@ -4667,6 +4762,21 @@ mod tests {
         }
 
         #[test]
+        fn ink_growth_verifies_a_sparse_black_screen() {
+            // The true-black full-screen terminal: its percentage NEVER drops below the
+            // threshold no matter how much is typed, so growth of the non-black count is the
+            // only thing that can clear it. A dozen typed characters (~30 thumbnail px) must
+            // verify; the jitter a wedged frame produces (menu-bar clock, cursor — a few px)
+            // must not.
+            assert!(ink_grew(500, 500 + INK_GROWTH_MIN));
+            assert!(ink_grew(500, 500 + INK_GROWTH_MIN + 100));
+            assert!(!ink_grew(500, 500 + INK_GROWTH_MIN - 1));
+            assert!(!ink_grew(500, 500)); // constant count = wedge signature
+            assert!(!ink_grew(500, 480)); // shrinking (a `clear`) is not growth
+            assert!(!ink_grew(u32::MAX, u32::MAX)); // saturating add can't overflow-verify
+        }
+
+        #[test]
         fn a_source_that_has_ever_worked_never_escalates() {
             // The bug is a source that is black AT BIRTH. Once real content has come through
             // the current source set, an all-black stretch is the user's screen (a cleared
@@ -4731,14 +4841,21 @@ mod tests {
                 dead_source_action(secs(10), true, BLIND_REBIND_AFTER, false, false),
                 DeadSourceAction::Restart
             );
-            // A restarted episode is judged against the LONGER alert deadline: 10s of
-            // post-restart black is still Wait, not an instant modal.
+            // A restarted episode is judged against the LONGER alert deadline: post-restart
+            // black shorter than the deadline is still Wait, not an instant modal — sized
+            // for first-launch realities like a Gatekeeper scan or a huge cold workspace.
             assert_eq!(
-                dead_source_action(secs(10), true, BLIND_ALERT_AFTER, true, false),
+                dead_source_action(
+                    BLIND_ALERT_AFTER - secs(1),
+                    true,
+                    BLIND_ALERT_AFTER,
+                    true,
+                    false
+                ),
                 DeadSourceAction::Wait
             );
             assert_eq!(
-                dead_source_action(secs(60), true, BLIND_ALERT_AFTER, true, false),
+                dead_source_action(BLIND_ALERT_AFTER, true, BLIND_ALERT_AFTER, true, false),
                 DeadSourceAction::Alert
             );
             assert_eq!(
