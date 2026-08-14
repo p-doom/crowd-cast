@@ -261,13 +261,16 @@ fn dead_source_action(
 #[cfg(all(target_os = "macos", not(no_tray)))]
 const BLACK_PCT_MIN: f32 = 0.97;
 
-/// How long a NEVER-verified source may stay continuously black, with the user actively
-/// working, before the automatic re-bind (process restart) fires. The success path is
-/// event-driven — the first real frame verifies the source within a sample or two of the app
-/// painting — so this is only the FAILURE deadline. 10s is far past any healthy app's first
-/// paint, and small enough that a born-black bind costs seconds of footage, not minutes.
+/// How long a source that has never shown real content may stay continuously black, with
+/// the user actively working, before the automatic restart fires. The happy path needs no
+/// timer at all — the first real frame clears the source within a couple of seconds of the
+/// app painting; this deadline only bounds the failure case. 30s (not 10s) on purpose: a
+/// pure-#000 near-empty screen that is genuinely live (an empty black-themed terminal) reads
+/// as black no matter how long we wait, so a shorter deadline only widens that rare false
+/// trigger without making real recoveries meaningfully faster. Worst case cost of a false
+/// trigger stays one ~3s recorder restart, bounded further by the shared backoff.
 #[cfg(all(target_os = "macos", not(no_tray)))]
-const BLIND_REBIND_AFTER: Duration = Duration::from_secs(10);
+const BLIND_REBIND_AFTER: Duration = Duration::from_secs(30);
 
 /// How long past the (post-restart) blind clock the "restart your Mac" alert waits. Split
 /// from [`BLIND_REBIND_AFTER`] deliberately: the re-bind is a cheap ~2s blip worth firing
@@ -279,14 +282,6 @@ const BLIND_REBIND_AFTER: Duration = Duration::from_secs(10);
 #[cfg(all(target_os = "macos", not(no_tray)))]
 const BLIND_ALERT_AFTER: Duration = Duration::from_secs(180);
 
-/// How many NEW non-black thumbnail pixels (above this episode's low-water mark) count as
-/// proof the capture is live. This is the defense for content the percentage threshold can
-/// never clear: a true-black (#000000) full-screen terminal stays >=97% black through any
-/// amount of typing (each glyph is a handful of thumbnail pixels), but typing ADDS ink —
-/// while a wedged frame's non-black count only jitters (menu-bar clock, cursor), well under
-/// this margin. ~30px is roughly a dozen typed characters at probe scale.
-#[cfg(all(target_os = "macos", not(no_tray)))]
-const INK_GROWTH_MIN: u32 = 30;
 
 /// How recent an input event must be for "the user is actively working" to hold. This is the
 /// gate that keeps a locked screen, a stepped-away machine or an about-to-idle session from
@@ -316,10 +311,6 @@ struct BlindClock {
     /// Anchor for the next increment, refreshed on every consumed sample — including ones
     /// that don't count — so a frozen stretch is never retroactively charged to the clock.
     last_sample_at: Instant,
-    /// Low-water mark of the non-black pixel count across this episode. Growth past it by
-    /// [`INK_GROWTH_MIN`] proves live content that the percentage threshold can't see
-    /// (typing into a true-black full-screen terminal) and verifies the key.
-    min_nonblack: u32,
 }
 
 /// Whether the black-output ladder is allowed to act right now. Pure so the gating is
@@ -368,17 +359,6 @@ fn blind_gates_met(
 #[cfg(all(target_os = "macos", not(no_tray)))]
 fn blind_restart_consumed(marker_present: bool, latched: bool) -> bool {
     marker_present || latched
-}
-
-/// Whether the non-black pixel count has grown enough past this episode's low-water mark to
-/// prove the capture is live (see [`INK_GROWTH_MIN`]). Pure for testability.
-#[cfg(all(target_os = "macos", not(no_tray)))]
-fn ink_grew(min_nonblack: u32, nonblack: u32) -> bool {
-    // checked, not saturating: at a saturated threshold "grew past it" would degenerate to
-    // ">=" and a CONSTANT count at the ceiling would count as growth (caught by test).
-    min_nonblack
-        .checked_add(INK_GROWTH_MIN)
-        .is_some_and(|threshold| nonblack >= threshold)
 }
 
 #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
@@ -2010,8 +1990,7 @@ unintended app video."
         /// real-world distribution of `pct_black` for sessions that never escalate.
         const BLIND_OBSERVE_LOG_EVERY: Duration = Duration::from_secs(300);
 
-        let Some((pct_black, nonblack, seq)) = crate::capture::black_probe::output_black_stats()
-        else {
+        let Some((pct_black, seq)) = crate::capture::black_probe::output_black_stats() else {
             return;
         };
         // Only ever count a sample once: if the video thread stalls, the last reading must
@@ -2056,6 +2035,7 @@ unintended app video."
                 self.blind_alerted_keys.remove(&key);
                 self.blind_restarted_keys.remove(&key);
                 clear_capture_dead_restart(&marker_key);
+                clear_capture_dead_restart(&format!("alerted:{marker_key}"));
             }
             if was_blind {
                 info!(
@@ -2079,26 +2059,7 @@ unintended app video."
         let clock = self.blind_since.entry(key.clone()).or_insert(BlindClock {
             blind_for: Duration::ZERO,
             last_sample_at: now,
-            min_nonblack: nonblack,
         });
-        // Ink growth = liveness. A wedged frame's non-black count only jitters (menu-bar
-        // clock, cursor); typed characters and repaints ADD pixels. This is the only signal
-        // that clears a true-black-themed full-screen terminal, whose percentage stays above
-        // the threshold through any amount of real use.
-        clock.min_nonblack = clock.min_nonblack.min(nonblack);
-        if ink_grew(clock.min_nonblack, nonblack) {
-            self.blind_since.remove(&key);
-            self.blind_content_seen.insert(key.clone());
-            self.blind_alerted_keys.remove(&key);
-            self.blind_restarted_keys.remove(&key);
-            clear_capture_dead_restart(&marker_key);
-            info!(
-                "Capture content verified for '{}' via ink growth ({} non-black px) — output \
-                 is sparse but live",
-                key, nonblack
-            );
-            return;
-        }
         // Charge at most one sample interval, so a stretch where we weren't consuming samples
         // (gates unmet, stalled video thread) freezes the clock instead of jumping it.
         let delta = now
@@ -2164,11 +2125,16 @@ unintended app video."
                     pct_black * 100.0,
                     blind_for.as_secs()
                 );
-                // One user-facing escalation per process, across ALL keys: a systemic wedge
-                // makes every key blind, and a participant needs one actionable prompt, not
-                // one per app. (The per-key set above still stops the LADDER re-alerting.)
-                if !self.blind_alert_surfaced {
+                // One user-facing prompt per process across ALL keys, AND at most about one
+                // per hour across processes: the on-disk marker below survives our own
+                // restarts, and its reader prunes entries older than an hour. Without it, a
+                // machine that restarts on every display change would re-show the popup 180s
+                // into each new process for as long as the black state persists.
+                let alert_marker = format!("alerted:{marker_key}");
+                if !self.blind_alert_surfaced && capture_dead_restart_age(&alert_marker).is_none()
+                {
                     self.blind_alert_surfaced = true;
+                    note_capture_dead_restart(&alert_marker);
                     extern "C" {
                         fn CGPreflightScreenCaptureAccess() -> bool;
                         fn show_restart_mac_alert();
@@ -4762,21 +4728,6 @@ mod tests {
         }
 
         #[test]
-        fn ink_growth_verifies_a_sparse_black_screen() {
-            // The true-black full-screen terminal: its percentage NEVER drops below the
-            // threshold no matter how much is typed, so growth of the non-black count is the
-            // only thing that can clear it. A dozen typed characters (~30 thumbnail px) must
-            // verify; the jitter a wedged frame produces (menu-bar clock, cursor — a few px)
-            // must not.
-            assert!(ink_grew(500, 500 + INK_GROWTH_MIN));
-            assert!(ink_grew(500, 500 + INK_GROWTH_MIN + 100));
-            assert!(!ink_grew(500, 500 + INK_GROWTH_MIN - 1));
-            assert!(!ink_grew(500, 500)); // constant count = wedge signature
-            assert!(!ink_grew(500, 480)); // shrinking (a `clear`) is not growth
-            assert!(!ink_grew(u32::MAX, u32::MAX)); // saturating add can't overflow-verify
-        }
-
-        #[test]
         fn a_source_that_has_ever_worked_never_escalates() {
             // The bug is a source that is black AT BIRTH. Once real content has come through
             // the current source set, an all-black stretch is the user's screen (a cleared
@@ -4831,14 +4782,20 @@ mod tests {
         #[test]
         fn blind_ladder_escalates_restart_then_alert_then_hold() {
             // Same decision fn as the dead-source ladder, fed the blind clock — but with the
-            // SPLIT deadlines: the cheap re-bind fires at 10s, while the "restart your Mac"
-            // modal waits until the post-restart bind has had 60s to prove itself.
+            // split deadlines: the cheap restart fires at BLIND_REBIND_AFTER, while the
+            // "restart your Mac" popup waits the much longer BLIND_ALERT_AFTER post-restart.
             assert_eq!(
-                dead_source_action(secs(9), true, BLIND_REBIND_AFTER, false, false),
+                dead_source_action(
+                    BLIND_REBIND_AFTER - secs(1),
+                    true,
+                    BLIND_REBIND_AFTER,
+                    false,
+                    false
+                ),
                 DeadSourceAction::Wait
             );
             assert_eq!(
-                dead_source_action(secs(10), true, BLIND_REBIND_AFTER, false, false),
+                dead_source_action(BLIND_REBIND_AFTER, true, BLIND_REBIND_AFTER, false, false),
                 DeadSourceAction::Restart
             );
             // A restarted episode is judged against the LONGER alert deadline: post-restart
