@@ -53,6 +53,12 @@ bool tray_screen_was_unlocked(void);
 /* Returns true once if the native tray needs a process restart */
 bool tray_needs_restart(void);
 
+/* True while the login session's screen is locked (lock screen / login window).
+ * Conservatively true when the state can't be determined. ScreenCaptureKit
+ * legitimately returns black frames while locked, so the black-output watchdog
+ * needs this to tell "locked" from "capture is wedged". */
+bool tray_screen_is_locked(void);
+
 /* Last status-item health verdict, for the Rust side to log transitions into
  * the app log file (NSLog from the native layer only reaches the unified
  * system log, which participants don't send us). Values:

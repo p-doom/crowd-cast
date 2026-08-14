@@ -10,6 +10,11 @@
 //! - Ability to fix ScreenCaptureKit issues directly
 
 mod apps;
+// The probe itself is platform-neutral (and its luma maths is unit-tested everywhere), but
+// only macOS registers it today — the black-output recovery ladder that consumes it is
+// macOS-only, and an unread probe would cost every frame a downscale for nothing.
+#[cfg_attr(not(all(target_os = "macos", not(no_tray))), allow(dead_code))]
+pub(crate) mod black_probe;
 mod context;
 #[cfg(target_os = "linux")]
 pub(crate) mod focus;

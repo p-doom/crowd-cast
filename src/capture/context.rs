@@ -433,6 +433,14 @@ impl CaptureContext {
         info!("libobs context initialized successfully");
         self.context = Some(context);
 
+        // Tap the composited output so a source that comes up BLACK-but-valid-sized (the
+        // silent-black-recording incident, PDOOM-1298) has a signal the engine can escalate
+        // on — dimensions alone can't tell the two apart. Read-only; failures only log.
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        if let Some(ctx) = self.context.as_ref() {
+            super::black_probe::register(ctx.runtime());
+        }
+
         Ok(())
     }
 
@@ -1016,6 +1024,12 @@ impl CaptureContext {
             .reset_video(video_info)
             .context("Failed to reset video output")?;
         log_critical_operation("reset_video_and_recreate_sources: reset_video() completed");
+
+        // reset_video rebuilds the video output the blackness probe was connected to, so
+        // re-attach it before the sources come back — otherwise a display change would
+        // silently disarm exactly the detector the post-display-change restarts need.
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        super::black_probe::reregister(context.runtime());
 
         // Recreate capture sources
         self.fully_recreate_sources()
