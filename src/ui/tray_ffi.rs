@@ -61,6 +61,11 @@ extern "C" {
     /// Returns true (once) if the native tray needs a process restart
     pub fn tray_needs_restart() -> bool;
 
+    /// True while the login session's screen is locked (conservatively true when the
+    /// state can't be read). ScreenCaptureKit legitimately produces black frames while
+    /// locked, so the black-output watchdog uses this to avoid escalating on a lock screen.
+    pub fn tray_screen_is_locked() -> bool;
+
     /// Last status-item health verdict (see tray.h for values). Logged as
     /// transitions by the poll loop so participant log files record whether
     /// the menu-bar icon ever attached.
@@ -95,6 +100,11 @@ pub unsafe fn tray_screen_was_unlocked() -> bool {
 
 #[cfg(any(no_tray, target_os = "linux"))]
 pub unsafe fn tray_needs_restart() -> bool {
+    false
+}
+
+#[cfg(any(no_tray, target_os = "linux"))]
+pub unsafe fn tray_screen_is_locked() -> bool {
     false
 }
 

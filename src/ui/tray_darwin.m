@@ -489,6 +489,14 @@ bool tray_needs_restart(void) {
     return false;
 }
 
+// Exposed for the black-output watchdog: a locked screen makes ScreenCaptureKit hand us
+// legitimately black frames, which must never be mistaken for a wedged capture source. Keeps
+// screen_is_locked()'s conservative "unknown means locked" answer, which here means "don't
+// escalate" — the safe direction.
+bool tray_screen_is_locked(void) {
+    return screen_is_locked() ? true : false;
+}
+
 int tray_status_item_health_state(void) {
     return atomic_load(&statusItemHealthState);
 }

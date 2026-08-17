@@ -307,6 +307,174 @@ fn cached_window_probe_verdict(
     }
 }
 
+/// Fraction of the composited output that must read as capture-black before we treat the
+/// recording as blind. Deliberately near-total, with the 3% of headroom sized for what a
+/// black app-capture frame still shows: the menu-bar strip and the cursor (~1-2% of pixels).
+///
+/// This is NOT on its own a proof of a wedge. Sparse real content can also sit above 97% —
+/// a full-screen dark terminal showing one prompt line has ink in well under 1% of the
+/// probe's pixels (pinned by `black_probe`'s `sparse_real_content_also_reads_as_black`). What
+/// separates the two is [`blind_gates_met`]'s "this source has produced real content" gate,
+/// not this number.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const BLACK_PCT_MIN: f32 = 0.97;
+
+/// How long a source that has never shown real content may stay continuously black, with
+/// the user actively working, before we act. The happy path needs no timer at all — the
+/// first real frame clears the source within a couple of seconds of the app painting; this
+/// deadline only bounds the failure case. 10s is safe ONLY because no restart fires on the
+/// timer alone anymore: every action is first confirmed by the second-opinion probe
+/// (`run_sck_probe`), which stands down when a fresh stream sees the same black the
+/// recording sees (a genuinely black screen) — so the timer being early costs a 2.5s probe,
+/// not a restart.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const BLIND_REBIND_AFTER: Duration = Duration::from_secs(10);
+
+/// How long a key stands down after the second-opinion probe confirmed the screen is
+/// GENUINELY black (not a capture failure). Deliberately a stand-down rather than a
+/// permanent all-clear: the screen may paint real content minutes later while the
+/// recorder's stream stays wedged, and that must still be caught — just not by re-running
+/// a 2.5s probe every few seconds against someone working in a black terminal.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const BLIND_PROBE_STANDDOWN: Duration = Duration::from_secs(300);
+
+/// How long past the (post-restart) blind clock the "restart your Mac" alert waits. Split
+/// from [`BLIND_REBIND_AFTER`] deliberately: the re-bind is a cheap ~2s blip worth firing
+/// aggressively, but the alert is a blocking modal a participant has to read. Red-team
+/// review showed a first-ever app launch can legitimately stay black well past a minute
+/// (Gatekeeper scan of a fresh download, Rosetta translation, a huge Electron workspace
+/// cold-starting), so the modal waits three minutes of GATED post-restart blackness —
+/// long past any launch, still same-session for a real wedge.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const BLIND_ALERT_AFTER: Duration = Duration::from_secs(180);
+
+
+/// How recent an input event must be for "the user is actively working" to hold. This is the
+/// gate that keeps a locked screen, a stepped-away machine or an about-to-idle session from
+/// ever escalating: no input, no restart.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const INPUT_RECENT: Duration = Duration::from_secs(30);
+
+/// Ceiling on how much time a single probe sample may add to the blind clock. Samples arrive
+/// ~2s apart; a bigger gap means we stopped consuming them (gates unmet, or the video thread
+/// stalled), and that time must not be charged to "continuously black".
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const BLIND_SAMPLE_GAP_MAX: Duration = Duration::from_secs(5);
+
+/// Blind-clock key used when there is no single active app target (capture-all / display
+/// mode). Namespaced so it can never collide with a real app id.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+const BLIND_DISPLAY_KEY: &str = "__display__";
+
+/// Per-key blind clock for the black-output ladder. Kept as an accumulated duration rather
+/// than a "since" instant because the clock must FREEZE (not reset) while the gates are
+/// unmet — a user who steps away mid-incident shouldn't have the evidence thrown out, but
+/// their absence shouldn't count as "actively working through black video" either.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+struct BlindClock {
+    /// Time the output has been black with the gates held.
+    blind_for: Duration,
+    /// Anchor for the next increment, refreshed on every consumed sample — including ones
+    /// that don't count — so a frozen stretch is never retroactively charged to the clock.
+    last_sample_at: Instant,
+}
+
+/// Whether the black-output ladder is allowed to act right now. Pure so the gating is
+/// testable: this is the only thing standing between a legitimately-black screen and a
+/// process restart, so it must be exactly the conditions under which black video is
+/// definitely wrong — a live, unpaused session that is actually logging input, with the user
+/// demonstrably at the machine.
+///
+/// `screen_locked` is read from the login session rather than inferred from input recency:
+/// ScreenCaptureKit legitimately hands us black frames while the screen is locked, and a
+/// participant fumbling a password for two minutes must not cost them a recording restart.
+///
+/// `content_seen_since_sources_built` is the signature gate. The bug this ladder exists for
+/// is a source that comes up BLACK AT BIRTH and stays that way; a source that has produced
+/// real content since it was created is demonstrably wired up, so a later all-black stretch
+/// is the user's screen, not a wedge. Without this, any near-empty black-themed full-screen
+/// window (a freshly-cleared terminal, a dark scratch buffer) typed into for two minutes
+/// would read as >=97% black and earn an unwarranted restart. Cleared whenever the sources
+/// are rebuilt, because "it worked" is a property of the source set that produced it.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn blind_gates_met(
+    session_active: bool,
+    is_paused: bool,
+    capture_enabled: bool,
+    since_last_input: Duration,
+    screen_locked: bool,
+    content_seen_since_sources_built: bool,
+) -> bool {
+    session_active
+        && !is_paused
+        && capture_enabled
+        && since_last_input <= INPUT_RECENT
+        && !screen_locked
+        && !content_seen_since_sources_built
+}
+
+/// Whether this blind episode has already spent its one automatic restart.
+///
+/// `marker_present` is the exec-surviving on-disk memory — but it AGES OUT after an hour
+/// (see [`read_capture_dead_restart_map`]). A wedge that a restart cannot fix stays
+/// continuously black past that hour, so on the marker's expiry the ladder would read the
+/// key as a brand-new failure and restart again — an hourly restart-plus-"restart your Mac"
+/// modal loop through a participant's session. `latched` is the in-process flag that closes
+/// that: once an episode has been seen as already-restarted it stays that way until the
+/// output actually recovers (or the process exits).
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn blind_restart_consumed(marker_present: bool, latched: bool) -> bool {
+    marker_present || latched
+}
+
+/// What a fresh, short-lived ScreenCaptureKit stream saw for the same target the recording
+/// is keyed to (see `src/capture/sck_probe.m`). This is the second opinion that separates
+/// "the recorder's stream is wedged" from "the screen genuinely shows black".
+#[cfg(all(target_os = "macos", not(no_tray)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SckProbeVerdict {
+    /// Probe failed / timed out / target not visible to SCK — treat as if the probe does
+    /// not exist (fail open, proceed on the timer alone).
+    Unavailable,
+    /// A fresh stream delivered nothing at all — the OS-level wedge signature.
+    NoFrames,
+    /// A fresh stream delivered frames that are just as black as the recording: the screen
+    /// genuinely shows black. Restarting would fix nothing.
+    Black,
+    /// A fresh stream sees real content while the recording is black: the recorder's own
+    /// stream is wedged, and a restart is the proven fix.
+    Content,
+}
+
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn sck_probe_verdict(raw: std::os::raw::c_int) -> SckProbeVerdict {
+    match raw {
+        1 => SckProbeVerdict::NoFrames,
+        2 => SckProbeVerdict::Black,
+        3 => SckProbeVerdict::Content,
+        _ => SckProbeVerdict::Unavailable,
+    }
+}
+
+/// Run the second-opinion probe for `key` (an app bundle id, or the whole display for
+/// `__display__`). Blocks the engine thread for up to ~2.5s — only called at escalation
+/// decisions, which are rare by construction.
+#[cfg(all(target_os = "macos", not(no_tray)))]
+fn run_sck_probe(key: &str) -> SckProbeVerdict {
+    extern "C" {
+        fn sck_probe_capture(
+            bundle_id: *const std::os::raw::c_char,
+            budget_secs: f64,
+        ) -> std::os::raw::c_int;
+    }
+    let c_key = match std::ffi::CString::new(key) {
+        Ok(c) => c,
+        Err(_) => return SckProbeVerdict::Unavailable,
+    };
+    let raw = unsafe { sck_probe_capture(c_key.as_ptr(), 2.5) };
+    sck_probe_verdict(raw)
+}
+
 #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn restart_history_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "crowd-cast", "agent")
@@ -617,7 +785,7 @@ fn write_uploads_paused(paused: bool) {
 
 // --- Pending uploads manifest (persists upload queue across restarts) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingUploadEntry {
     chunk_id: String,
     session_id: String,
@@ -668,6 +836,26 @@ fn remove_pending_upload(chunk_id: &str) {
     if entries.len() != before {
         write_pending_uploads(&entries);
     }
+}
+
+fn remove_pending_uploads(chunk_ids: &[String]) {
+    if chunk_ids.is_empty() {
+        return;
+    }
+
+    let mut entries = read_pending_uploads();
+    if retain_unpurged_pending_uploads(&mut entries, chunk_ids) {
+        write_pending_uploads(&entries);
+    }
+}
+
+fn retain_unpurged_pending_uploads(
+    entries: &mut Vec<PendingUploadEntry>,
+    chunk_ids: &[String],
+) -> bool {
+    let before = entries.len();
+    entries.retain(|e| !chunk_ids.contains(&e.chunk_id));
+    entries.len() != before
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -778,6 +966,10 @@ struct PendingInputTransition {
 
 const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TRANSITION_INPUT_EVENTS: usize = 512;
+
+/// How long a finished segment is held before upload, so the panic button
+/// ("delete last 10 minutes") can still retract it.
+const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -915,6 +1107,57 @@ pub struct SyncEngine {
     /// memory lives in the marker file; this is only the in-process alert de-dupe.
     #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
     capture_alerted_apps: std::collections::HashSet<String>,
+    /// PER-KEY blind clocks for the black-output ladder (PDOOM-1298). A source that comes up
+    /// black-but-valid-sized passes every readiness check the dead-source watchdog makes, so
+    /// this runs as a PARALLEL ladder driven by the output blackness probe instead of by
+    /// source dimensions. Keyed by active video target (or `__display__` in capture-all mode)
+    /// for the same reason the dead clock is: one blind app must not be cleared by another
+    /// app recording fine.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    blind_since: std::collections::HashMap<String, BlindClock>,
+    /// PER-KEY: keys for which the "restart your Mac" alert has already been shown for a
+    /// blind output this process (in-process de-dupe; the persisted "already restarted"
+    /// memory lives in the `black:`-namespaced marker file).
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    blind_alerted_keys: std::collections::HashSet<String>,
+    /// PER-KEY: keys whose capture has produced real (non-black) content since the CURRENT
+    /// source set was built. Two jobs: it lets the recovery path clear a `black:` restart
+    /// marker left behind by the PREVIOUS process (where there is no blind clock to clear)
+    /// without re-reading the marker file on every sample, and it is the gate that keeps the
+    /// ladder to its actual bug — a source that never worked — instead of firing on a user
+    /// whose own screen went black (see [`blind_gates_met`]). Cleared when the sources are
+    /// rebuilt.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    blind_content_seen: std::collections::HashSet<String>,
+    /// PER-KEY: keys whose current blind episode has already consumed its one automatic
+    /// restart. In-process (not the marker file) precisely because the marker expires after
+    /// an hour while a wedge does not — see [`blind_restart_consumed`].
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    blind_restarted_keys: std::collections::HashSet<String>,
+    /// Sequence number of the last blackness sample consumed. A stalled video thread must
+    /// read as "no new evidence", not as ongoing blackness, so samples are only ever counted
+    /// once.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    last_black_probe_seq: u64,
+    /// Last time the black-output ladder logged its Hold state (throttles the warning to
+    /// once per [`BLIND_HOLD_WARN_EVERY`] while an unrecoverable wedge persists).
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    last_blind_hold_warn: Option<Instant>,
+    /// Last time the black-output ladder logged an ordinary blackness observation. Only
+    /// escalations used to log a percentage, which meant participant logs carried no data
+    /// about the *non*-escalating majority — exactly what tuning [`BLACK_PCT_MIN`] needs.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    last_blind_observe_log: Option<Instant>,
+    /// Whether the blind ladder has already surfaced its user-facing escalation (modal or
+    /// permission notification) this process. Per-KEY de-dupe alone still allows a systemic
+    /// wedge (everything black) to pop one modal per key — one actionable prompt per process
+    /// is the useful amount.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    blind_alert_surfaced: bool,
+    /// PER-KEY: until when the black-output ladder stands down because the second-opinion
+    /// probe confirmed the screen is genuinely black (see [`BLIND_PROBE_STANDDOWN`]).
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    blind_probe_standdown: std::collections::HashMap<String, Instant>,
     /// Whether we've already shown the "restart your Mac" alert this session
     restart_alert_shown: bool,
     /// Linux: set when a previously-ready capture source dies mid-recording (e.g. the user
@@ -1068,6 +1311,24 @@ unintended app video."
             capture_dead_since: std::collections::HashMap::new(),
             #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
             capture_alerted_apps: std::collections::HashSet::new(),
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            blind_since: std::collections::HashMap::new(),
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            blind_alerted_keys: std::collections::HashSet::new(),
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            blind_content_seen: std::collections::HashSet::new(),
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            blind_restarted_keys: std::collections::HashSet::new(),
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            last_black_probe_seq: 0,
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            last_blind_hold_warn: None,
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            last_blind_observe_log: None,
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            blind_alert_surfaced: false,
+            #[cfg(all(target_os = "macos", not(no_tray)))]
+            blind_probe_standdown: std::collections::HashMap::new(),
             restart_alert_shown: false,
             #[cfg(target_os = "linux")]
             capture_lost: false,
@@ -1165,7 +1426,6 @@ unintended app video."
 
     /// Graduate buffered segments older than 10 minutes to the upload task.
     fn graduate_upload_buffer(&mut self) {
-        const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
         let now = Instant::now();
 
         while let Some((created_at, _)) = self.upload_buffer.front() {
@@ -1196,12 +1456,13 @@ unintended app video."
         }
     }
 
-    /// Panic: delete all buffered segments from disk and clear the manifest.
+    /// Panic: delete all buffered segments from disk and remove them from the manifest.
     fn purge_upload_buffer(&mut self) {
         let count = self.upload_buffer.len();
         if count > 0 {
             info!("Panic: deleting {} buffered segment(s)", count);
         }
+        let mut purged_chunk_ids = Vec::with_capacity(count);
         while let Some((_, segment)) = self.upload_buffer.pop_front() {
             if let Some(ref video_path) = segment.chunk.video_path {
                 if let Err(e) = std::fs::remove_file(video_path) {
@@ -1215,8 +1476,9 @@ unintended app video."
             } else {
                 debug!("Deleted input: {:?}", segment.input_path);
             }
+            purged_chunk_ids.push(segment.chunk.chunk_id);
         }
-        write_pending_uploads(&[]);
+        remove_pending_uploads(&purged_chunk_ids);
     }
 
     fn active_video_target(&self) -> Option<&str> {
@@ -1999,6 +2261,284 @@ unintended app video."
         self.pause_recording();
     }
 
+    /// The black-output ladder (PDOOM-1298): recover from a capture source that is producing
+    /// BLACK frames at valid dimensions.
+    ///
+    /// WHY this exists alongside the dead-source watchdog: that watchdog's readiness test is
+    /// `width > 0 && height > 0`, which a black-but-alive SCK source passes forever. Sources
+    /// created at a transitional moment (an app that just launched, a display-change/unlock
+    /// restart) came up black for GPU-heavy apps and recorded hours of silent black video,
+    /// with every existing health check green. A process restart against the settled app
+    /// captures fine, so this reuses the same restart→alert→hold ladder, driven by the
+    /// composited-output blackness probe instead of by source dimensions.
+    ///
+    /// Nothing here is allowed to act unless the user is demonstrably working through it
+    /// (see [`blind_gates_met`]) — an unattended machine showing a black screen is not a bug.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    async fn check_output_blindness(&mut self) {
+        /// Throttle for the Hold-state warning (an already-restarted, already-alerted wedge
+        /// keeps sampling black; log it occasionally, not every 2s).
+        const BLIND_HOLD_WARN_EVERY: Duration = Duration::from_secs(300);
+        /// Throttle for the routine "here is what the probe is reading" line. Cheap enough
+        /// to leave on in shipped builds, which is the point: it is the only way to build a
+        /// real-world distribution of `pct_black` for sessions that never escalate.
+        const BLIND_OBSERVE_LOG_EVERY: Duration = Duration::from_secs(300);
+
+        let Some((pct_black, seq)) = crate::capture::black_probe::output_black_stats() else {
+            return;
+        };
+        // Only ever count a sample once: if the video thread stalls, the last reading must
+        // not keep accumulating as if it were fresh evidence.
+        if seq == self.last_black_probe_seq {
+            return;
+        }
+        self.last_black_probe_seq = seq;
+
+        let key = self
+            .active_video_target()
+            .unwrap_or(BLIND_DISPLAY_KEY)
+            .to_string();
+        let marker_key = format!("black:{key}");
+        let now = Instant::now();
+
+        // Routine visibility: without this, only already-escalated outliers ever reach a
+        // participant's log file and there is no field data to retune the thresholds with.
+        if self
+            .last_blind_observe_log
+            .is_none_or(|t| t.elapsed() >= BLIND_OBSERVE_LOG_EVERY)
+        {
+            self.last_blind_observe_log = Some(now);
+            // info!, not debug!: the default shipped log filter drops debug, and the whole
+            // point of this line is building a field distribution from participant logs.
+            info!(
+                "black probe: output {:.1}% black for '{}' (escalation threshold {:.0}%)",
+                pct_black * 100.0,
+                key,
+                BLACK_PCT_MIN * 100.0
+            );
+        }
+
+        if pct_black < BLACK_PCT_MIN {
+            // Real content is reaching the output — this key is healthy. Clear its blind
+            // clock, its alert/restart de-dupes and its restart marker (the marker may have
+            // been written by the PREVIOUS process just before the recovery restart, which
+            // is why a first healthy sample counts even with no clock to clear).
+            let was_blind = self.blind_since.remove(&key).is_some();
+            let first_healthy = self.blind_content_seen.insert(key.clone());
+            if was_blind || first_healthy {
+                self.blind_alerted_keys.remove(&key);
+                self.blind_restarted_keys.remove(&key);
+                self.blind_probe_standdown.remove(&key);
+                clear_capture_dead_restart(&marker_key);
+                clear_capture_dead_restart(&format!("alerted:{marker_key}"));
+            }
+            if was_blind {
+                info!(
+                    "Capture content recovered for '{}' — output no longer black ({:.1}%)",
+                    key,
+                    pct_black * 100.0
+                );
+            }
+            return;
+        }
+
+        let gates = blind_gates_met(
+            self.current_session.is_some(),
+            self.is_paused,
+            self.capture_enabled,
+            self.last_recorded_action_time.elapsed(),
+            unsafe { crate::ui::tray_ffi::tray_screen_is_locked() },
+            self.blind_content_seen.contains(&key),
+        );
+
+        // Standing down after a confirmed genuinely-black screen: don't charge the clock,
+        // don't probe again yet. Expired entries are dropped so the ladder re-arms.
+        if let Some(until) = self.blind_probe_standdown.get(&key) {
+            if now < *until {
+                self.blind_since.remove(&key);
+                return;
+            }
+            self.blind_probe_standdown.remove(&key);
+        }
+
+        let clock = self.blind_since.entry(key.clone()).or_insert(BlindClock {
+            blind_for: Duration::ZERO,
+            last_sample_at: now,
+        });
+        // Charge at most one sample interval, so a stretch where we weren't consuming samples
+        // (gates unmet, stalled video thread) freezes the clock instead of jumping it.
+        let delta = now
+            .saturating_duration_since(clock.last_sample_at)
+            .min(BLIND_SAMPLE_GAP_MAX);
+        clock.last_sample_at = now;
+        if gates {
+            clock.blind_for += delta;
+        }
+        let blind_for = clock.blind_for;
+
+        // "Already restarted for this key" is the presence of its `black:`-namespaced marker,
+        // which survives the exec — so a fresh process that is STILL blind for the same key
+        // knows not to restart again — LATCHED in-process, because the marker ages out after
+        // an hour and an unfixable wedge does not (see [`blind_restart_consumed`]).
+        let already_restarted = blind_restart_consumed(
+            capture_dead_restart_age(&marker_key).is_some(),
+            self.blind_restarted_keys.contains(&key),
+        );
+        if already_restarted {
+            self.blind_restarted_keys.insert(key.clone());
+        }
+        let already_alerted = self.blind_alerted_keys.contains(&key);
+        // Two deadlines, one ladder: the cheap self-heal (restart) fires fast, the modal
+        // (alert) waits for the post-restart bind to have had a fair chance. Which one
+        // applies is exactly "has this episode already spent its restart".
+        let threshold = if already_restarted {
+            BLIND_ALERT_AFTER
+        } else {
+            BLIND_REBIND_AFTER
+        };
+        let action = dead_source_action(
+            blind_for,
+            gates,
+            threshold,
+            already_restarted,
+            already_alerted,
+        );
+
+        match action {
+            DeadSourceAction::Wait => {}
+            DeadSourceAction::Hold => {
+                let due = self
+                    .last_blind_hold_warn
+                    .is_none_or(|t| t.elapsed() >= BLIND_HOLD_WARN_EVERY);
+                if due {
+                    self.last_blind_hold_warn = Some(now);
+                    warn!(
+                        "Capture output for '{}' still {:.1}% black after a restart and an alert \
+                         ({}s) — holding",
+                        key,
+                        pct_black * 100.0,
+                        blind_for.as_secs()
+                    );
+                }
+            }
+            DeadSourceAction::Alert => {
+                // Same second opinion before bothering a human: if a fresh stream sees the
+                // same black the recording sees, the screen is genuinely black — no popup.
+                match run_sck_probe(&key) {
+                    SckProbeVerdict::Black => {
+                        self.blind_since.remove(&key);
+                        self.blind_probe_standdown
+                            .insert(key.clone(), now + BLIND_PROBE_STANDDOWN);
+                        info!(
+                            "Screen for '{}' is genuinely black (fresh stream agrees) — \
+                             suppressing the restart-your-Mac prompt",
+                            key
+                        );
+                        return;
+                    }
+                    verdict => {
+                        info!(
+                            "Second-opinion capture probe for '{}' before alert: {:?}",
+                            key, verdict
+                        );
+                    }
+                }
+                self.blind_alerted_keys.insert(key.clone());
+                error!(
+                    "Capture output for '{}' is {:.1}% black after {}s and an automatic restart \
+                     — likely a system-level capture wedge; prompting for a machine restart",
+                    key,
+                    pct_black * 100.0,
+                    blind_for.as_secs()
+                );
+                // One user-facing prompt per process across ALL keys, AND at most about one
+                // per hour across processes: the on-disk marker below survives our own
+                // restarts, and its reader prunes entries older than an hour. Without it, a
+                // machine that restarts on every display change would re-show the popup 180s
+                // into each new process for as long as the black state persists.
+                let alert_marker = format!("alerted:{marker_key}");
+                if !self.blind_alert_surfaced && capture_dead_restart_age(&alert_marker).is_none()
+                {
+                    self.blind_alert_surfaced = true;
+                    note_capture_dead_restart(&alert_marker);
+                    extern "C" {
+                        fn CGPreflightScreenCaptureAccess() -> bool;
+                        fn show_restart_mac_alert();
+                    }
+                    // A revoked/never-granted Screen Recording permission produces exactly
+                    // this black-forever signature, and no Mac restart will fix it — route
+                    // that case to the permission prompt instead of the reboot modal.
+                    if unsafe { CGPreflightScreenCaptureAccess() } {
+                        unsafe { show_restart_mac_alert() };
+                    } else {
+                        warn!(
+                            "Screen Recording permission is not granted — showing the \
+                             permission notification instead of the restart-your-Mac alert"
+                        );
+                        crate::ui::show_permissions_missing_notification(
+                            "crowd-cast does not have Screen Recording permission, so \
+                             recordings are black. Open System Settings > Privacy & \
+                             Security > Screen Recording and enable CrowdCast.",
+                        );
+                    }
+                }
+            }
+            DeadSourceAction::Restart => {
+                // Second opinion before acting: open a fresh, short-lived SCK stream for the
+                // same target and compare. A fresh stream seeing CONTENT while the recording
+                // is black proves the recorder's stream is wedged (restart fixes it — the
+                // manually-verified cure). A fresh stream seeing the SAME black means the
+                // screen genuinely shows black (an empty pure-#000 terminal): nothing is
+                // broken, so mark the key as genuine content and stand down entirely. No
+                // frames at all is the OS-wedge signature — restart once, then the popup's
+                // "restart your Mac" advice is actually right. Probe failure = fail open,
+                // proceed on the timer alone as before.
+                let verdict = run_sck_probe(&key);
+                info!(
+                    "Second-opinion capture probe for '{}': {:?} (recording {:.1}% black)",
+                    key,
+                    verdict,
+                    pct_black * 100.0
+                );
+                if verdict == SckProbeVerdict::Black {
+                    self.blind_since.remove(&key);
+                    self.blind_probe_standdown
+                        .insert(key.clone(), now + BLIND_PROBE_STANDDOWN);
+                    info!(
+                        "Screen for '{}' is genuinely black (fresh stream agrees) — not a \
+                         capture failure; standing down for {}s",
+                        key,
+                        BLIND_PROBE_STANDDOWN.as_secs()
+                    );
+                    return;
+                }
+                // First blind episode for this key: restart for a fresh capture context (the
+                // proven cure), if the shared backoff allows. Stamp the marker FIRST so the
+                // fresh process knows we already tried.
+                if restart_allowed_with_backoff() {
+                    error!(
+                        "Capture output for '{}' has been {:.1}% black for {}s while recording \
+                         — restarting for a fresh capture context",
+                        key,
+                        pct_black * 100.0,
+                        blind_for.as_secs()
+                    );
+                    note_capture_dead_restart(&marker_key);
+                    self.input_backend.stop();
+                    self.stop_recording().await.ok();
+                    restart_process(); // replaces the process — never returns
+                }
+                warn!(
+                    "Capture output for '{}' {:.1}% black for {}s but restart deferred by \
+                     backoff; will retry",
+                    key,
+                    pct_black * 100.0,
+                    blind_for.as_secs()
+                );
+            }
+        }
+    }
+
     async fn run_capture_watchdog(&mut self) {
         let Some(watchdog) = self.pending_capture_watchdog.clone() else {
             return;
@@ -2353,7 +2893,7 @@ unintended app video."
             let mut retry_queue: BinaryHeap<RetryEntry> = BinaryHeap::new();
             let mut sequence: u64 = 0;
             let mut active_session_id: Option<String> = None;
-            let mut upload_pause_notified = false;
+            let mut upload_pause_last_notified_count = 0;
 
             // Semaphore limits concurrent uploads
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPLOADS));
@@ -2463,15 +3003,20 @@ unintended app video."
                                             next_attempt_at: now,
                                         },
                                     });
-                                    if retry_queue.len() >= UPLOAD_PAUSE_NOTIFY_THRESHOLD && !upload_pause_notified {
-                                        upload_pause_notified = true;
-                                        warn!("{} segments waiting to upload. Resume uploads from the tray menu.", UPLOAD_PAUSE_NOTIFY_THRESHOLD);
-                                        crate::ui::notifications::show_upload_queue_warning_notification();
+                                    let queued_count = retry_queue.len();
+                                    // Re-arm after each threshold-sized increase while uploads
+                                    // remain paused.
+                                    if queued_count.saturating_sub(upload_pause_last_notified_count)
+                                        >= UPLOAD_PAUSE_NOTIFY_THRESHOLD
+                                    {
+                                        upload_pause_last_notified_count = queued_count;
+                                        warn!("{} segments waiting to upload. Resume uploads from the tray menu.", queued_count);
+                                        crate::ui::notifications::show_upload_queue_warning_notification(queued_count);
                                     }
                                     continue;
                                 }
 
-                                upload_pause_notified = false;
+                                upload_pause_last_notified_count = 0;
                                 info!("Background upload starting for segment {}", chunk_id);
                                 spawn_upload(
                                     uploader.clone(),
@@ -2685,6 +3230,7 @@ unintended app video."
             if !pending.is_empty() {
                 let mut recovered = 0;
                 let mut cleaned = 0;
+                let mut still_held = 0;
                 for entry in &pending {
                     let input_exists = entry.input_path.exists();
                     if !input_exists {
@@ -2736,6 +3282,24 @@ unintended app video."
                         input_path: entry.input_path.clone(),
                     };
 
+                    // A segment still inside the panic hold goes back into the upload
+                    // buffer with its remaining hold time, so a panic press shortly
+                    // after a restart can still retract it.
+                    let age_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .saturating_sub(entry.buffered_at_epoch_s);
+                    if age_secs < UPLOAD_BUFFER_DELAY.as_secs() {
+                        let buffered_at = Instant::now()
+                            .checked_sub(Duration::from_secs(age_secs))
+                            .unwrap_or_else(Instant::now);
+                        self.upload_buffer.push_back((buffered_at, segment));
+                        recovered += 1;
+                        still_held += 1;
+                        continue;
+                    }
+
                     if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
                         error!(
                             "Failed to re-queue recovered segment {}: {}",
@@ -2750,6 +3314,12 @@ unintended app video."
                     info!(
                         "Recovered {} pending upload(s) from previous session",
                         recovered
+                    );
+                }
+                if still_held > 0 {
+                    info!(
+                        "{} recovered segment(s) still inside the 10-minute panic hold — resuming their hold instead of uploading now",
+                        still_held
                     );
                 }
                 if cleaned > 0 {
@@ -3086,6 +3656,10 @@ unintended app video."
                     self.check_display_changes().await;
                     self.graduate_upload_buffer();
                     self.check_capture_health();
+                    // Parallel to check_capture_health: catches the source that IS ready and
+                    // IS producing frames, but produces only black ones (PDOOM-1298).
+                    #[cfg(all(target_os = "macos", not(no_tray)))]
+                    self.check_output_blindness().await;
                     self.check_low_disk_space();
                     self.log_source_resolution_changes();
                     #[cfg(target_os = "linux")]
@@ -3511,6 +4085,12 @@ unintended app video."
             String::new()
         };
 
+        // Recording is live from here — attach the blackness probe for exactly this window
+        // (its raw-video tap costs a per-frame CPU download, so it must not outlive the
+        // recording; see set_black_probe_active).
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        self.capture_ctx.set_black_probe_active(true);
+
         info!(
             "Recording started: main_session={}, segment={}, output={:?}{}",
             main_session_id, self.segment_index, session.output_path, segment_info
@@ -3550,6 +4130,11 @@ unintended app video."
 
     /// Stop recording
     async fn stop_recording(&mut self) -> Result<()> {
+        // No recording, no probe: detach before tearing anything down so the raw-video
+        // download never outlives the frames it was watching. Idempotent if never attached.
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        self.capture_ctx.set_black_probe_active(false);
+
         if self.current_session.is_none() {
             debug!("No recording in progress");
             return Ok(());
@@ -3663,6 +4248,11 @@ unintended app video."
             return;
         }
 
+        // Paused output writes no frames, so black output proves nothing and the probe's
+        // per-frame download is pure cost (idle pauses can last a whole night) — detach.
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        self.capture_ctx.set_black_probe_active(false);
+
         info!("Pausing recording (video and keylog)...");
 
         // Pause the video recording — watchdog restarts the process if OBS hangs.
@@ -3742,6 +4332,12 @@ unintended app video."
 
         self.is_paused = false;
 
+        // Frames are actually being written again — re-attach the blackness probe. AFTER the
+        // success checks above: a failed resume stays paused, and a paused output must not
+        // keep paying the probe's per-frame download (red-team finding).
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        self.capture_ctx.set_black_probe_active(true);
+
         // Pause-drift correction: OBS's frame-time clock kept advancing while paused, but the
         // recording file accrued no frames, so the video timeline is seamless across the pause.
         // Shift recording_start_ns forward by the pause duration so current_recording_elapsed_us()
@@ -3803,6 +4399,16 @@ unintended app video."
                         "Successfully switched to display {} ({} sources recreated)",
                         display_id, count
                     );
+                    // Fresh sources: re-arm the black-output ladder like the sibling
+                    // display-change rebuild paths do — old clocks must not escalate the
+                    // new sources, and old good behavior must not vouch for them.
+                    #[cfg(all(target_os = "macos", not(no_tray)))]
+                    {
+                        self.blind_since.clear();
+                        self.blind_content_seen.clear();
+                        self.blind_alerted_keys.clear();
+                        self.blind_restarted_keys.clear();
+                    }
                     if let Some(app) = self
                         .capture_ctx
                         .active_capture_app()
@@ -4014,6 +4620,22 @@ unintended app video."
                             let restart_recording = self.current_session.is_some();
                             self.reinitialize_capture_for_display_change(restart_recording)
                                 .await;
+                            // This path rebuilds the very sources the blackness probe taps,
+                            // then returns without reaching the re-arm block below — so
+                            // re-arm the black-output ladder here too, or a clock built
+                            // against the OLD sources escalates the instant the new ones
+                            // come up. (`capture_dead_since` has the same gap at this call
+                            // site; left alone deliberately — changing the existing
+                            // dead-source watchdog's behavior is out of scope here.)
+                            #[cfg(not(no_tray))]
+                            {
+                                self.blind_since.clear();
+                                self.blind_content_seen.clear();
+                                // Fresh source generation, fresh restart/alert budget (the
+                                // exec-surviving marker still throttles cross-process).
+                                self.blind_alerted_keys.clear();
+                                self.blind_restarted_keys.clear();
+                            }
                         }
                     }
                 }
@@ -4055,6 +4677,18 @@ unintended app video."
         #[cfg(all(target_os = "macos", not(no_tray)))]
         {
             self.capture_dead_since.clear();
+            // Same re-arm for the black-output ladder: the sources are being rebuilt, so a
+            // blind clock accumulated against the OLD ones must not escalate the instant the
+            // new ones come up. (Restart markers are left alone, as above.) The in-process
+            // restart/alert de-dupes reset with the source generation too.
+            self.blind_since.clear();
+            self.blind_alerted_keys.clear();
+            self.blind_restarted_keys.clear();
+            // "This source has produced real content" is a fact about the source set that
+            // produced it, and that set is being torn down — a display-change/unlock rebuild
+            // is one of the moments that births a black-at-birth source, so the ladder has to
+            // re-arm rather than stay disabled by the old sources' good behavior.
+            self.blind_content_seen.clear();
         }
 
         let restart_recording = self.current_session.is_some();
@@ -4597,6 +5231,150 @@ mod tests {
         }
     }
 
+    // The black-output ladder (PDOOM-1298) reuses `dead_source_action` for its
+    // restart→alert→hold semantics; what is NEW and worth pinning is the gating that decides
+    // whether a black frame counts as evidence at all.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    mod blind_escalation {
+        use super::*;
+
+        fn secs(s: u64) -> Duration {
+            Duration::from_secs(s)
+        }
+
+        #[test]
+        fn gates_require_an_active_user_and_a_live_unpaused_session() {
+            // The happy case: recording, not paused, logging input, user just typed,
+            // unlocked, and this source has never once produced content.
+            assert!(blind_gates_met(true, false, true, secs(1), false, false));
+            // No session / paused / not logging input → a black frame proves nothing.
+            assert!(!blind_gates_met(false, false, true, secs(1), false, false));
+            assert!(!blind_gates_met(true, true, true, secs(1), false, false));
+            assert!(!blind_gates_met(true, false, false, secs(1), false, false));
+        }
+
+        #[test]
+        fn gates_close_once_input_goes_stale() {
+            // A stepped-away machine legitimately shows black; only recent input makes black
+            // video definitely wrong. Boundary is inclusive.
+            assert!(blind_gates_met(true, false, true, INPUT_RECENT, false, false));
+            assert!(!blind_gates_met(
+                true,
+                false,
+                true,
+                INPUT_RECENT + secs(1),
+                false,
+                false
+            ));
+        }
+
+        #[test]
+        fn a_locked_screen_never_escalates() {
+            // SCK hands us black frames while the screen is locked, and typing at the login
+            // window still counts as input — so lock state has to be asked for directly.
+            assert!(!blind_gates_met(true, false, true, secs(1), true, false));
+        }
+
+        #[test]
+        fn a_source_that_has_ever_worked_never_escalates() {
+            // The bug is a source that is black AT BIRTH. Once real content has come through
+            // the current source set, an all-black stretch is the user's screen (a cleared
+            // full-screen terminal, a dark scratch buffer) — not a wedge.
+            assert!(!blind_gates_met(true, false, true, secs(1), false, true));
+        }
+
+        #[test]
+        fn one_restart_per_episode_even_after_the_marker_expires() {
+            // The marker file drops entries older than an hour. A wedge a restart can't fix
+            // stays black straight through that expiry, so without the in-process latch the
+            // ladder would read it as a fresh failure and restart again — every hour, each
+            // time re-showing the "restart your Mac" modal.
+            //
+            // Episode timeline for one continuously-black key:
+            let latch = |marker, latched| {
+                dead_source_action(
+                    secs(9999), // blind_for only ever grows once past the threshold
+                    true,
+                    BLIND_ALERT_AFTER, // an already-restarted episode runs on the alert deadline
+                    blind_restart_consumed(marker, latched),
+                    latched, // alerted implies we had already seen "restarted"
+                )
+            };
+            // t=0: no marker, nothing latched → the one automatic restart.
+            assert_eq!(
+                dead_source_action(
+                    secs(9999),
+                    true,
+                    BLIND_REBIND_AFTER,
+                    blind_restart_consumed(false, false),
+                    false
+                ),
+                DeadSourceAction::Restart
+            );
+            // Fresh process, marker present, still black → alert (and latch it).
+            assert_eq!(
+                dead_source_action(
+                    secs(9999),
+                    true,
+                    BLIND_ALERT_AFTER,
+                    blind_restart_consumed(true, false),
+                    false
+                ),
+                DeadSourceAction::Alert
+            );
+            // t>1h: the marker has aged out, but the latch has not → hold, never restart.
+            assert_eq!(latch(false, true), DeadSourceAction::Hold);
+            assert_ne!(latch(false, true), DeadSourceAction::Restart);
+        }
+
+        #[test]
+        fn blind_ladder_escalates_restart_then_alert_then_hold() {
+            // Same decision fn as the dead-source ladder, fed the blind clock — but with the
+            // split deadlines: the cheap restart fires at BLIND_REBIND_AFTER, while the
+            // "restart your Mac" popup waits the much longer BLIND_ALERT_AFTER post-restart.
+            assert_eq!(
+                dead_source_action(
+                    BLIND_REBIND_AFTER - secs(1),
+                    true,
+                    BLIND_REBIND_AFTER,
+                    false,
+                    false
+                ),
+                DeadSourceAction::Wait
+            );
+            assert_eq!(
+                dead_source_action(BLIND_REBIND_AFTER, true, BLIND_REBIND_AFTER, false, false),
+                DeadSourceAction::Restart
+            );
+            // A restarted episode is judged against the LONGER alert deadline: post-restart
+            // black shorter than the deadline is still Wait, not an instant modal — sized
+            // for first-launch realities like a Gatekeeper scan or a huge cold workspace.
+            assert_eq!(
+                dead_source_action(
+                    BLIND_ALERT_AFTER - secs(1),
+                    true,
+                    BLIND_ALERT_AFTER,
+                    true,
+                    false
+                ),
+                DeadSourceAction::Wait
+            );
+            assert_eq!(
+                dead_source_action(BLIND_ALERT_AFTER, true, BLIND_ALERT_AFTER, true, false),
+                DeadSourceAction::Alert
+            );
+            assert_eq!(
+                dead_source_action(secs(9999), true, BLIND_ALERT_AFTER, true, true),
+                DeadSourceAction::Hold
+            );
+            // Gates unmet → Wait no matter how long the clock says.
+            assert_eq!(
+                dead_source_action(secs(9999), false, BLIND_REBIND_AFTER, false, false),
+                DeadSourceAction::Wait
+            );
+        }
+    }
+
     fn test_dir(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("crowd-cast-test-{}-{}", name, std::process::id()));
@@ -4658,6 +5436,46 @@ mod tests {
         assert!(!input2.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn purge_keeps_unpurged_pending_entries() {
+        let mut entries = ["keep-1", "purge-1", "keep-2", "purge-2"]
+            .into_iter()
+            .map(|chunk_id| PendingUploadEntry {
+                chunk_id: chunk_id.to_string(),
+                session_id: "test-session".to_string(),
+                video_path: None,
+                input_path: PathBuf::from(format!("{chunk_id}.json")),
+                buffered_at_epoch_s: 1,
+            })
+            .collect();
+        let chunk_ids = vec!["purge-1".to_string(), "purge-2".to_string()];
+
+        assert!(retain_unpurged_pending_uploads(&mut entries, &chunk_ids));
+        assert!(!entries.is_empty());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep-1", "keep-2"]
+        );
+    }
+
+    #[test]
+    fn purge_with_empty_chunk_ids_keeps_manifest_unchanged() {
+        let mut entries = vec![PendingUploadEntry {
+            chunk_id: "keep".to_string(),
+            session_id: "test-session".to_string(),
+            video_path: None,
+            input_path: PathBuf::from("keep.json"),
+            buffered_at_epoch_s: 1,
+        }];
+        let original = entries.clone();
+
+        assert!(!retain_unpurged_pending_uploads(&mut entries, &[]));
+        assert_eq!(entries, original);
     }
 
     #[test]

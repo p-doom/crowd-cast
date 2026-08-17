@@ -517,7 +517,7 @@ void notifications_show_update_completed(const char* version, const char* build)
 }
 
 // Show a warning when too many segments are queued while uploads are paused
-void notifications_show_upload_queue_warning(void) {
+void notifications_show_upload_queue_warning(unsigned long count) {
     if (!g_initialized) {
         NSLog(@"[CrowdCast] Notifications not initialized");
         return;
@@ -526,7 +526,9 @@ void notifications_show_upload_queue_warning(void) {
     @autoreleasepool {
         UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
         content.title = @"Uploads Paused";
-        content.body = @"50 segments waiting to upload. Resume uploads from the tray menu to free disk space.";
+        content.body = [NSString stringWithFormat:
+            @"%lu segments waiting to upload. Resume uploads from the tray menu to free disk space.",
+            count];
 
         NSString *identifier = [[NSUUID UUID] UUIDString];
         UNNotificationRequest *request = [UNNotificationRequest

@@ -4,6 +4,7 @@
  */
 
 #import <Cocoa/Cocoa.h>
+#include <stdatomic.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <UserNotifications/UserNotifications.h>
@@ -168,7 +169,7 @@ static BOOL g_wizard_running = NO;
     
     // Description
     NSTextField *desc = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 200, 450, 80)];
-    desc.stringValue = @"crowd-cast captures your screen and input data to help build better AI coding assistants.\n\nThis wizard will help you configure the app.";
+    desc.stringValue = @"crowd-cast captures your screen and input data.\n\nThis wizard will help you configure the app.";
     desc.bezeled = NO;
     desc.editable = NO;
     desc.drawsBackground = NO;
@@ -190,7 +191,7 @@ static BOOL g_wizard_running = NO;
 
     // Data notice
     NSTextField *notice = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 20, 450, 75)];
-    notice.stringValue = @"CrowdCast records screencasts and keyboard/mouse input only for the applications you select. This data is uploaded and will be published as part of an open research dataset under a Creative Commons license. You can pause or stop recording at any time from the menu bar.";
+    notice.stringValue = @"CrowdCast records screencasts and keyboard/mouse input only for the applications you select. This data is uploaded for research. You can pause or stop recording at any time from the menu bar.";
     notice.bezeled = NO;
     notice.editable = NO;
     notice.drawsBackground = NO;
@@ -1492,8 +1493,28 @@ int show_post_setup_signin_prompt(void) {
 // System Restart Alert
 // ============================================================================
 
-void show_restart_mac_alert(void) {
+// One "restart your Mac" modal in flight at a time, PROCESS-WIDE: three independent
+// subsystems can request it (the dead-source ladder, check_capture_health, and the
+// black-output ladder), each with its own Rust-side de-dupe that knows nothing about the
+// others. Without this guard two distinct failures in one session stack two copies of the
+// same focus-stealing critical alert (red-team finding).
+static atomic_bool restartAlertInFlight = false;
+
+// Lock state, exported by tray_darwin.m. A modal dispatched while the screen is locked
+// would queue behind the lock screen and ambush the participant the instant they unlock.
+extern bool tray_screen_is_locked(void);
+
+static void show_restart_mac_alert_when_visible(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (tray_screen_is_locked()) {
+            // Try again once the session is plausibly visible; the in-flight guard keeps
+            // this to a single waiter, so the retry chain can't accumulate.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                show_restart_mac_alert_when_visible();
+            });
+            return;
+        }
         [NSApp activateIgnoringOtherApps:YES];
 
         NSAlert *alert = [[NSAlert alloc] init];
@@ -1512,5 +1533,13 @@ void show_restart_mac_alert(void) {
         alert.window.level = NSFloatingWindowLevel;
 
         [alert runModal];
+        atomic_store(&restartAlertInFlight, false);
     });
+}
+
+void show_restart_mac_alert(void) {
+    if (atomic_exchange(&restartAlertInFlight, true)) {
+        return; // one copy is already showing or queued — never stack a second
+    }
+    show_restart_mac_alert_when_visible();
 }
