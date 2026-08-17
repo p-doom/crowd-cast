@@ -169,7 +169,7 @@ static BOOL g_wizard_running = NO;
     
     // Description
     NSTextField *desc = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 200, 450, 80)];
-    desc.stringValue = @"crowd-cast captures your screen and input data to help build better AI coding assistants.\n\nThis wizard will help you configure the app.";
+    desc.stringValue = @"crowd-cast captures your screen and input data.\n\nThis wizard will help you configure the app.";
     desc.bezeled = NO;
     desc.editable = NO;
     desc.drawsBackground = NO;
@@ -191,7 +191,7 @@ static BOOL g_wizard_running = NO;
 
     // Data notice
     NSTextField *notice = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 20, 450, 75)];
-    notice.stringValue = @"CrowdCast records screencasts and keyboard/mouse input only for the applications you select. This data is uploaded and will be published as part of an open research dataset under a Creative Commons license. You can pause or stop recording at any time from the menu bar.";
+    notice.stringValue = @"CrowdCast records screencasts and keyboard/mouse input only for the applications you select. This data is uploaded for research. You can pause or stop recording at any time from the menu bar.";
     notice.bezeled = NO;
     notice.editable = NO;
     notice.drawsBackground = NO;
