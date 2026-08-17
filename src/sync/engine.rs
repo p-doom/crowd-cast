@@ -741,6 +741,10 @@ struct PendingInputTransition {
 const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TRANSITION_INPUT_EVENTS: usize = 512;
 
+/// How long a finished segment is held before upload, so the panic button
+/// ("delete last 10 minutes") can still retract it.
+const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
+
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
     /// Configuration
@@ -1104,7 +1108,6 @@ unintended app video."
 
     /// Graduate buffered segments older than 10 minutes to the upload task.
     fn graduate_upload_buffer(&mut self) {
-        const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
         let now = Instant::now();
 
         while let Some((created_at, _)) = self.upload_buffer.front() {
@@ -2444,6 +2447,7 @@ unintended app video."
             if !pending.is_empty() {
                 let mut recovered = 0;
                 let mut cleaned = 0;
+                let mut still_held = 0;
                 for entry in &pending {
                     let input_exists = entry.input_path.exists();
                     if !input_exists {
@@ -2495,6 +2499,24 @@ unintended app video."
                         input_path: entry.input_path.clone(),
                     };
 
+                    // A segment still inside the panic hold goes back into the upload
+                    // buffer with its remaining hold time, so a panic press shortly
+                    // after a restart can still retract it.
+                    let age_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .saturating_sub(entry.buffered_at_epoch_s);
+                    if age_secs < UPLOAD_BUFFER_DELAY.as_secs() {
+                        let buffered_at = Instant::now()
+                            .checked_sub(Duration::from_secs(age_secs))
+                            .unwrap_or_else(Instant::now);
+                        self.upload_buffer.push_back((buffered_at, segment));
+                        recovered += 1;
+                        still_held += 1;
+                        continue;
+                    }
+
                     if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
                         error!(
                             "Failed to re-queue recovered segment {}: {}",
@@ -2509,6 +2531,12 @@ unintended app video."
                     info!(
                         "Recovered {} pending upload(s) from previous session",
                         recovered
+                    );
+                }
+                if still_held > 0 {
+                    info!(
+                        "{} recovered segment(s) still inside the 10-minute panic hold — resuming their hold instead of uploading now",
+                        still_held
                     );
                 }
                 if cleaned > 0 {
