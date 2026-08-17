@@ -2050,6 +2050,21 @@ unintended app video."
                 if let Some(app) = target_app.as_deref() {
                     self.schedule_capture_watchdog(app, 0);
                 } else {
+                    // Switching to a blank/untracked target: a dead-capture pause was tied to the
+                    // PREVIOUS (dead) app, and switching to None schedules no watchdog to carry the
+                    // auto-resume — so a lingering pause would strand the whole session (video +
+                    // keylog off, silently) until the user happened back onto a tracked app. We are
+                    // no longer showing the dead source, so release the pause here and let the
+                    // normal untracked-blank state govern (PDOOM-1274 macOS review: Hold-arm pause
+                    // + this pre-existing "None target clears the watchdog" path could deadlock the
+                    // only resume route). Applies on Windows too (PauseOnly pause + untracked switch).
+                    if self.capture_dead_paused {
+                        self.resume_recording();
+                        if !self.is_paused {
+                            self.capture_dead_paused = false;
+                            self.last_recorded_action_time = Instant::now();
+                        }
+                    }
                     self.clear_capture_watchdog();
                 }
                 self.update_capture_enabled(should_capture, target_app.as_deref());
