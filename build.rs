@@ -61,6 +61,14 @@ fn main() {
             .include("src/ui")
             .compile("wizard_darwin");
 
+        // Build the second-opinion ScreenCaptureKit probe (PDOOM-1298): a short-lived
+        // stream that checks whether the screen is actually capturable when the recording
+        // output looks black.
+        cc::Build::new()
+            .file("src/capture/sck_probe.m")
+            .flag("-fobjc-arc")
+            .compile("sck_probe");
+
         configure_sparkle();
 
         // Link frameworks
@@ -68,6 +76,10 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=UserNotifications");
         println!("cargo:rustc-link-lib=framework=ApplicationServices");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        // For the second-opinion capture probe (sck_probe.m).
+        println!("cargo:rustc-link-lib=framework=ScreenCaptureKit");
+        println!("cargo:rustc-link-lib=framework=CoreMedia");
+        println!("cargo:rustc-link-lib=framework=CoreVideo");
     }
 
     #[cfg(target_os = "linux")]
