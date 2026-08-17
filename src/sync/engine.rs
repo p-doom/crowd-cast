@@ -2409,7 +2409,10 @@ unintended app video."
         );
 
         match action {
-            DeadSourceAction::Wait => {}
+            // PauseOnly is unreachable here: this ladder passes `window_less = false` (a
+            // black-but-alive source has a window), and only a window-less input yields
+            // PauseOnly. Handled alongside Wait as a defensive no-op rather than a panic.
+            DeadSourceAction::Wait | DeadSourceAction::PauseOnly => {}
             DeadSourceAction::Hold => {
                 let due = self
                     .last_blind_hold_warn
