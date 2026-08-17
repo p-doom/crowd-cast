@@ -591,7 +591,11 @@ impl ScreenCaptureSource {
         let candidates = enumerate_capture_windows()?;
         let (hwnd, obs_id) = resolve_watchdog_target(&candidates, self.bound_hwnd, bundle_id)
             .ok_or_else(|| {
-                anyhow::anyhow!("No capturable window found for application '{}'", bundle_id)
+                // Typed so the watchdog can tell "window-less app" from a real refresh failure
+                // and keep its readiness probe alive instead of erroring out (PDOOM-1274).
+                anyhow::Error::new(NoCapturableWindow {
+                    app: bundle_id.to_string(),
+                })
             })?;
         WindowCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
             .context("Failed to create window capture updater")?
@@ -922,6 +926,49 @@ pub fn get_main_display_uuid() -> Result<String> {
     anyhow::bail!("Display UUID not available on this platform")
 }
 
+/// Typed "this app has no capturable window right now" signal (Windows). Raised (wrapped in
+/// `anyhow::Error`) by both window-resolution error sites — `update_application`'s watchdog
+/// refresh and `find_window_obs_id_for_app`'s creation-time lookup — so the engine can tell
+/// this apart from a real capture failure: some apps legitimately go window-less while still
+/// running (field evidence: Siemens NX `ugraf.exe` enumerates ZERO top-level windows while an
+/// in-app tool window is open, PDOOM-1274). That is not a wedge — a process restart cannot
+/// conjure a window — so the engine pauses recording and keeps probing instead of escalating
+/// or surfacing an error.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub(crate) struct NoCapturableWindow {
+    pub app: String,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Display for NoCapturableWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No capturable window found for application '{}'",
+            self.app
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl std::error::Error for NoCapturableWindow {}
+
+/// Whether `bundle_id` currently has at least one capturable top-level window (same matching
+/// rule as `find_window_obs_id_for_app`: exe file stem, case-insensitive). Used by the engine
+/// to distinguish "app is window-less" (pause, don't restart — see `NoCapturableWindow`) from
+/// a genuinely wedged capture stack. Fails OPEN: an enumeration error returns `true` so a
+/// transient enumeration failure never suppresses the escalation ladder.
+#[cfg(target_os = "windows")]
+pub(crate) fn app_has_capturable_window(bundle_id: &str) -> bool {
+    match enumerate_capture_windows() {
+        Ok(windows) => windows
+            .iter()
+            .any(|(_, _, stem)| stem.eq_ignore_ascii_case(bundle_id)),
+        Err(_) => true,
+    }
+}
+
 /// Enumerate every window OBS's `window_capture` could bind to right now, the same list
 /// `find_window_obs_id_for_app` searches. Each entry is `(hwnd, obs_id, exe_stem)`:
 /// - `hwnd`: numeric window handle (`isize`), for HWND-keyed follow-focus dedup.
@@ -968,7 +1015,11 @@ fn find_window_obs_id_for_app(bundle_id: &str) -> Result<(isize, String)> {
         .find(|(_, _, stem)| stem.eq_ignore_ascii_case(bundle_id))
         .map(|(hwnd, obs_id, _)| (hwnd, obs_id))
         .ok_or_else(|| {
-            anyhow::anyhow!("No capturable window found for application '{}'", bundle_id)
+            // Same typed signal as the refresh-time site in `update_application`, so
+            // creation-time and refresh-time behave identically for a window-less app.
+            anyhow::Error::new(NoCapturableWindow {
+                app: bundle_id.to_string(),
+            })
         })
 }
 

@@ -229,23 +229,81 @@ enum DeadSourceAction {
     Alert,
     /// Already restarted AND alerted for this app — sit tight (no restart, no re-alert).
     Hold,
+    /// The app has no capturable window at all (Windows) — pause recording, never restart:
+    /// a fresh process cannot conjure a window, and recording black meanwhile is worse than
+    /// pausing (the source stays probed and recording auto-resumes when a window appears).
+    PauseOnly,
 }
 
+/// How long an app's source must be continuously dead with NO capturable window before we
+/// pause recording. Shorter than the escalation threshold: pausing is cheap and reversible
+/// (auto-resumes when the window is back), so it need not wait out transient blips as long
+/// as a process restart must.
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
+const DEAD_PAUSE_AFTER: Duration = Duration::from_secs(5);
+
+/// Decision table, in precedence order:
+/// 1. preconditions unmet → Wait (a restart would wrongly un-pause; nothing to recover).
+/// 2. window-less and dead ≥ [`DEAD_PAUSE_AFTER`] → PauseOnly. A window-less app is not a
+///    wedge: the app is running but enumerates zero capturable windows, so restarting cannot
+///    conjure one — we pause instead of recording black (field evidence: PDOOM-1274, Siemens
+///    NX `ugraf.exe` in-app tool windows, 2026-08 — PR #134's ladder restarted futilely).
+/// 3. window-less but not yet 5s → Wait (give a closing/reopening window a beat).
+/// 4. dead < `escalate_after` → Wait.
+/// 5. restart → alert → hold ladder, per app (see the enum docs).
 #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
 fn dead_source_action(
     dead_for: Duration,
     preconditions_met: bool,
     escalate_after: Duration,
+    window_less: bool,
     already_restarted: bool,
     already_alerted: bool,
 ) -> DeadSourceAction {
-    if !preconditions_met || dead_for < escalate_after {
+    if !preconditions_met {
+        return DeadSourceAction::Wait;
+    }
+    if window_less {
+        return if dead_for >= DEAD_PAUSE_AFTER {
+            DeadSourceAction::PauseOnly
+        } else {
+            DeadSourceAction::Wait
+        };
+    }
+    if dead_for < escalate_after {
         return DeadSourceAction::Wait;
     }
     match (already_restarted, already_alerted) {
         (false, _) => DeadSourceAction::Restart,
         (true, false) => DeadSourceAction::Alert,
         (true, true) => DeadSourceAction::Hold,
+    }
+}
+
+/// Windows: minimum gap between needs-scene window probes for the same app (see the
+/// `needs_scene_window_probe` field — the pending-switch path polls at ~100ms, a window
+/// enumeration per tick is waste).
+#[cfg(target_os = "windows")]
+const NEEDS_SCENE_PROBE_MIN_GAP: Duration = Duration::from_secs(1);
+
+/// Pure throttle lookup for the needs-scene window probe: return the memoized verdict when it
+/// is for the same app and younger than `min_gap`, `None` when a fresh probe is due (different
+/// app, stale, or no memo). Plain data in/out so the throttle contract is unit-tested without
+/// any Win32 calls (same pattern as `sources::should_skip_unresolvable`).
+#[cfg(target_os = "windows")]
+fn cached_window_probe_verdict(
+    memo: &Option<(String, Instant, bool)>,
+    app: &str,
+    now: Instant,
+    min_gap: Duration,
+) -> Option<bool> {
+    match memo {
+        Some((memo_app, probed_at, verdict))
+            if memo_app == app && now.saturating_duration_since(*probed_at) < min_gap =>
+        {
+            Some(*verdict)
+        }
+        _ => None,
     }
 }
 
@@ -789,6 +847,13 @@ pub struct SyncEngine {
     last_resume_restart_at: Option<Instant>,
     /// Whether we're currently auto-paused due to idle (vs user-initiated pause)
     idle_paused: bool,
+    /// Whether we're currently auto-paused because the active capture source is dead /
+    /// window-less (PDOOM-1274/913). Distinct from `idle_paused` on purpose: an idle pause is
+    /// resumed by user input (`resume_from_idle`), but a dead-capture pause must resume ONLY
+    /// when the source is ready again (the watchdog's Ok(true) tick) — input while the app is
+    /// window-less must not un-pause into black video. Not cfg-gated: Linux simply never sets
+    /// it (its dead-source handling stops recording via `capture_lost` instead).
+    capture_dead_paused: bool,
     /// Idle timeout duration (cached from config, Duration::ZERO means disabled)
     idle_timeout: Duration,
     /// Whether to pause uploads during idle
@@ -807,6 +872,17 @@ pub struct SyncEngine {
     pending_app_switch: Option<PendingAppSwitch>,
     /// Pending active-source readiness watchdog
     pending_capture_watchdog: Option<PendingCaptureWatchdog>,
+    /// Windows: memoized `(app, probed_at, window_less)` verdict of the needs-scene window
+    /// probe in `apply_pending_app_switch`. That path runs on the ~100ms poll cadence while a
+    /// pending switch is parked on a window-less app, and a full window enumeration per tick
+    /// is a guaranteed-miss waste — so the verdict is reused for ~1s (same coarse rate as
+    /// `sources::UNRESOLVABLE_RETRY_TICKS`).
+    #[cfg(target_os = "windows")]
+    needs_scene_window_probe: Option<(String, Instant, bool)>,
+    /// Windows: the app we last warned about skipping a needs-scene restart for (window-less),
+    /// so the skip warns once per window-less episode instead of every poll tick.
+    #[cfg(target_os = "windows")]
+    needs_scene_no_window_warned: Option<String>,
     /// Last time the macOS canvas convergence check ran (throttled to ~1s).
     #[cfg(target_os = "macos")]
     last_canvas_convergence_check: Option<std::time::Instant>,
@@ -967,6 +1043,7 @@ unintended app video."
             #[cfg(not(target_os = "macos"))]
             last_resume_restart_at: None,
             idle_paused: false,
+            capture_dead_paused: false,
             idle_timeout,
             pause_uploads_on_idle,
             last_status_kind: None,
@@ -976,6 +1053,10 @@ unintended app video."
             capture_watchdog_timeout,
             pending_app_switch: None,
             pending_capture_watchdog: None,
+            #[cfg(target_os = "windows")]
+            needs_scene_window_probe: None,
+            #[cfg(target_os = "windows")]
+            needs_scene_no_window_warned: None,
             #[cfg(target_os = "macos")]
             last_canvas_convergence_check: None,
             segment_timer: None,
@@ -1276,10 +1357,14 @@ unintended app video."
             return;
         };
 
+        // A dead-capture pause is the one paused state the watchdog itself must keep watching
+        // (its Ok(true) is what resumes us) — so let it re-arm; every other pause still blocks
+        // re-arming. Belt-and-suspenders with the NoCapturableWindow re-schedule in
+        // run_capture_watchdog: covers a watchdog cleared by the stale-app path mid-pause.
         if !(self.single_active_app_capture
             && should_capture
             && self.current_session.is_some()
-            && !self.is_paused)
+            && (!self.is_paused || self.capture_dead_paused))
         {
             return;
         }
@@ -1647,6 +1732,34 @@ unintended app video."
         // binds late-appearing apps lazily (see gnome_follow_focus), so it never restarts.
         if let Some(app) = target_app.as_deref() {
             if self.capture_ctx.needs_scene_for_app(app) && !self.capture_ctx.is_gnome_dynamic() {
+                // Windows: this restart has NO backoff, and setup_capture in the fresh process
+                // resolves the app's window to create its scene — for a window-less app that
+                // fails again, and the loop restarts unboundedly (PDOOM-1274: part of Martin's
+                // 40 restarts/day under Siemens NX). Probe first and SKIP while window-less,
+                // leaving the pending switch parked so later ticks retry; once a window
+                // appears the probe passes and the restart below proceeds (and is then
+                // legitimate: it creates the missing scene). macOS/Linux: unchanged.
+                #[cfg(target_os = "windows")]
+                if self.needs_scene_restart_blocked_window_less(app) {
+                    // Re-park to retry ~1s later. Reusing `pending` verbatim would keep its
+                    // original, now-elapsed `scheduled_at`, making the pending-switch select arm
+                    // (`sleep_until`) instantly ready on every loop iteration — a 100%-CPU spin
+                    // (thousands of frontmost queries/sec) for the whole window-less episode.
+                    // Bump the deadline to the probe cadence so it retries at ~1s instead.
+                    self.pending_app_switch = Some(PendingAppSwitch {
+                        target_app: target_app.clone(),
+                        scheduled_at: Instant::now() + NEEDS_SCENE_PROBE_MIN_GAP,
+                    });
+                    // The frontmost app can't be captured yet; without pausing, recording keeps
+                    // running against the PREVIOUS app's scene — wrong content for the whole
+                    // episode (keylog is already gated off, but the video is not). Pause instead.
+                    // Resume happens when the window appears (the restart below then fires) or the
+                    // user switches to a capturable app (that switch schedules a watchdog that
+                    // resumes on Ok(true)).
+                    self.pause_for_dead_capture(app);
+                    self.update_capture_enabled(should_capture, target_app.as_deref());
+                    return;
+                }
                 info!(
                     "App '{}' wasn't running at startup — restarting to create its capture source",
                     app
@@ -1663,6 +1776,14 @@ unintended app video."
             Ok(switched) => {
                 if switched {
                     info!("Applied active capture switch to {:?}", target_app);
+                }
+                // A switch actually completed, so no window-less episode is parked anymore. Clear
+                // the once-per-episode warning latch; it is otherwise only reset when the SAME
+                // app's window returns, so an episode that ends by switching away would silence
+                // the log for the next one (PDOOM-1274).
+                #[cfg(target_os = "windows")]
+                {
+                    self.needs_scene_no_window_warned = None;
                 }
                 if let Some(app) = target_app.as_deref() {
                     self.schedule_capture_watchdog(app, 0);
@@ -1684,6 +1805,44 @@ unintended app video."
                 )));
             }
         }
+    }
+
+    /// Windows: whether the needs-scene process restart in `apply_pending_app_switch` must be
+    /// skipped because `app` currently has no capturable window (restarting cannot conjure one
+    /// — the fresh process would fail scene creation and restart again, unbounded, PDOOM-1274).
+    /// The underlying window enumeration is throttled through `needs_scene_window_probe`
+    /// (~1s per app) because the pending-switch path re-runs every ~100ms poll tick while the
+    /// switch stays parked. Warns once per window-less episode, per app.
+    #[cfg(target_os = "windows")]
+    fn needs_scene_restart_blocked_window_less(&mut self, app: &str) -> bool {
+        let now = Instant::now();
+        let window_less = match cached_window_probe_verdict(
+            &self.needs_scene_window_probe,
+            app,
+            now,
+            NEEDS_SCENE_PROBE_MIN_GAP,
+        ) {
+            Some(verdict) => verdict,
+            None => {
+                let verdict = !self.capture_ctx.active_app_has_capturable_window(app);
+                self.needs_scene_window_probe = Some((app.to_string(), now, verdict));
+                verdict
+            }
+        };
+        if window_less {
+            if self.needs_scene_no_window_warned.as_deref() != Some(app) {
+                warn!(
+                    "App '{}' needs a capture scene but has no capturable window; skipping the \
+                     scene-creating restart until a window appears (PDOOM-1274)",
+                    app
+                );
+                self.needs_scene_no_window_warned = Some(app.to_string());
+            }
+        } else if self.needs_scene_no_window_warned.as_deref() == Some(app) {
+            // Window is back: re-arm the once-per-episode warning for a future recurrence.
+            self.needs_scene_no_window_warned = None;
+        }
+        window_less
     }
 
     /// macOS + Windows: recover an active capture source that has been dead too long by
@@ -1732,6 +1891,15 @@ unintended app video."
         // marathon wedge re-restarts at most hourly — otherwise it's one restart per wedge.
         let already_restarted = capture_dead_restart_age(&app).is_some();
         let already_alerted = self.capture_alerted_apps.contains(&app);
+        // Windows: probe whether the app has ANY capturable window right now. A window-less
+        // app (Siemens NX opening an in-app tool window enumerates zero top-level windows,
+        // PDOOM-1274) is exempt from every restart path — a fresh process cannot conjure a
+        // window — and instead pauses recording after DEAD_PAUSE_AFTER. macOS/Linux have no
+        // window-less failure shape, so they always pass false.
+        #[cfg(target_os = "windows")]
+        let window_less = !self.capture_ctx.active_app_has_capturable_window(&app);
+        #[cfg(not(target_os = "windows"))]
+        let window_less = false;
         // Precondition: a live, unpaused session. Deliberately NOT `any_source_ever_ready` —
         // "no sources" must self-heal even from a dead-at-startup process (an unlock-restart
         // landing mid display-churn); the restart→alert→hold ladder is the loop guard.
@@ -1739,15 +1907,30 @@ unintended app video."
             dead_for,
             surface_failure,
             ESCALATE_AFTER,
+            window_less,
             already_restarted,
             already_alerted,
         );
 
         match action {
             DeadSourceAction::Wait => false,
+            // Window-less app: pause instead of recording black (PDOOM-1274). Return false so
+            // the caller falls through to refresh_active_capture_source — the refresh keeps the
+            // 1.5s readiness probe alive (its NoCapturableWindow error re-schedules the
+            // watchdog, see run_capture_watchdog), which is what auto-resumes us on recovery.
+            DeadSourceAction::PauseOnly => {
+                self.pause_for_dead_capture(&app);
+                false
+            }
             // Already restarted AND alerted for this app — sit tight; only ITS own recovery
-            // (Ok(true)) clears the state and re-arms.
-            DeadSourceAction::Hold => true,
+            // (Ok(true)) clears the state and re-arms. The ladder is exhausted, so also stop
+            // recording black while we hold (PDOOM-913 part A); after the pause,
+            // surface_failure goes false on later ticks → Wait → falls through to the refresh,
+            // which keeps the readiness probe alive — expected.
+            DeadSourceAction::Hold => {
+                self.pause_for_dead_capture(&app);
+                true
+            }
             DeadSourceAction::Alert => {
                 self.capture_alerted_apps.insert(app.clone());
                 error!(
@@ -1792,11 +1975,42 @@ unintended app video."
         }
     }
 
+    /// Pause recording (video + keylog, the idle-pause machinery) because the active capture
+    /// source is dead/window-less — every frame recorded meanwhile is black (PDOOM-1274/913).
+    /// Sets `capture_dead_paused` (NOT `idle_paused`: `resume_from_idle` keys on `idle_paused`,
+    /// and user input must not resume this pause — only the watchdog seeing the source ready
+    /// again does). No-op when there is no session or we are already paused (an idle/user pause
+    /// stays owned by its initiator).
+    #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
+    fn pause_for_dead_capture(&mut self, app: &str) {
+        if self.current_session.is_none() || self.is_paused {
+            return;
+        }
+        warn!(
+            "Capture source for '{}' is dead/window-less; pausing recording instead of \
+             recording black — PDOOM-1274/913",
+            app
+        );
+        // Set the flag BEFORE pausing so `pause_recording` (and later `resume_recording`)
+        // suppress their generic "Recording paused/resumed" toasts, which gate on it — mirroring
+        // how the idle path sets `idle_paused` first. Window-less periods are routine NX workflow;
+        // a toast pair per episode would be spam for a self-healing state the user can't act on.
+        self.capture_dead_paused = true;
+        self.pause_recording();
+    }
+
     async fn run_capture_watchdog(&mut self) {
         let Some(watchdog) = self.pending_capture_watchdog.clone() else {
             return;
         };
-        let surface_failure = self.current_session.is_some() && !self.is_paused;
+        // `capture_dead_paused` is the engine's OWN pause; unlike an idle/user pause it must not
+        // freeze the ladder. Otherwise, if the window returns but the source is genuinely wedged
+        // (the exact WGC/D3D failure #134 exists for), we would sit paused forever: the escalation
+        // that cures it never runs, and the Ok(true) resume never comes. Treating our own pause as
+        // "still surfacing failure" lets a window-present-but-dead source climb the restart ladder
+        // out of the pause; a still-window-less source just re-hits PauseOnly (a no-op re-pause).
+        let surface_failure =
+            self.current_session.is_some() && (!self.is_paused || self.capture_dead_paused);
 
         if self.capture_ctx.active_capture_app() != Some(watchdog.expected_app.as_str()) {
             debug!(
@@ -1828,6 +2042,37 @@ unintended app video."
                     self.capture_alerted_apps
                         .remove(watchdog.expected_app.as_str());
                     clear_capture_dead_restart(&watchdog.expected_app);
+                }
+                // Auto-resume a dead-capture pause: the source is ready again, so recording is
+                // no longer black. Success is read back from `is_paused` (`resume_recording`
+                // keeps it set when the source prep or the OBS resume call fails, see its early
+                // returns); on failure keep the watchdog armed so the next ready tick retries.
+                if self.capture_dead_paused {
+                    info!(
+                        "Capture source for '{}' is ready again; resuming the dead-capture pause",
+                        watchdog.expected_app
+                    );
+                    self.resume_recording();
+                    if !self.is_paused {
+                        self.capture_dead_paused = false;
+                        // Prevent an instant idle-pause (no input was recorded while paused)…
+                        self.last_recorded_action_time = Instant::now();
+                        // …and re-arm segment rotation now: the input-arm re-arm in the select
+                        // loop only fires on the NEXT input event, which may be a while.
+                        self.reset_segment_timer();
+                    } else {
+                        warn!(
+                            "Resume after dead-capture pause for '{}' did not stick; will retry \
+                             on the next ready tick",
+                            watchdog.expected_app
+                        );
+                        self.schedule_capture_watchdog(
+                            &watchdog.expected_app,
+                            watchdog.attempt + 1,
+                        );
+                        self.refresh_capture_enabled_from_frontmost();
+                        return;
+                    }
                 }
                 self.clear_capture_watchdog();
                 self.refresh_capture_enabled_from_frontmost();
@@ -1871,6 +2116,29 @@ unintended app video."
                         self.refresh_capture_enabled_from_frontmost();
                     }
                     Err(e) => {
+                        // Windows: "no capturable window" is an expected, self-healing state
+                        // (PDOOM-1274), not a refresh failure. Keep the readiness probe ALIVE by
+                        // re-scheduling instead of clearing — this is the primary keep-alive
+                        // through a dead-capture pause (`rearm_capture_recovery_if_needed`
+                        // refuses every OTHER pause; its capture_dead_paused carve-out only
+                        // backstops a watchdog cleared by the stale-app path) — and skipping the
+                        // Error status silences the ~1.6s EngineStatus::Error churn of a
+                        // window-less period. All other refresh errors keep today's behavior.
+                        #[cfg(target_os = "windows")]
+                        if e.downcast_ref::<crate::capture::NoCapturableWindow>().is_some() {
+                            debug!(
+                                "No capturable window for '{}' yet; keeping the readiness probe \
+                                 alive (attempt {})",
+                                watchdog.expected_app,
+                                watchdog.attempt + 1
+                            );
+                            self.schedule_capture_watchdog(
+                                &watchdog.expected_app,
+                                watchdog.attempt + 1,
+                            );
+                            self.refresh_capture_enabled_from_frontmost();
+                            return;
+                        }
                         self.clear_capture_watchdog();
                         error!(
                             "Failed to refresh active capture source for '{}': {}",
@@ -3256,6 +3524,7 @@ unintended app video."
         self.clear_pending_input_transition();
         self.is_paused = false; // Ensure not paused when starting
         self.idle_paused = false; // Ensure not idle-paused when starting
+        self.capture_dead_paused = false; // Fresh recording owns a fresh pause state
         self.last_recorded_action_time = Instant::now(); // Reset recorded-action timer
 
         self.emit_metadata_event(0);
@@ -3355,6 +3624,9 @@ unintended app video."
         self.segment_index = 0;
         self.is_paused = false;
         self.idle_paused = false;
+        // Never strand the dead-capture flag across a manual stop or a suspend/resume restart
+        // (it must only ever describe the CURRENT recording's pause).
+        self.capture_dead_paused = false;
         self.pending_app_switch = None;
         self.segment_timer = None;
         self.clear_capture_watchdog();
@@ -3417,9 +3689,12 @@ unintended app video."
         // When the pause is idle-initiated, `handle_idle_timeout` shows the more specific
         // "Recording paused (idle)" toast itself, so skip the generic one to avoid a double.
         // (`idle_paused` is set true before `pause_recording()` runs; it's false for a user pause.)
+        // A dead-capture pause (`capture_dead_paused`, also set first) is silent: it is automatic
+        // and self-healing, so we suppress its toast entirely (routine during NX tool-window use).
         if self.config.recording.notify_on_start_stop
             && notifications_authorized()
             && !self.idle_paused
+            && !self.capture_dead_paused
         {
             show_recording_paused_notification();
         }
@@ -3501,10 +3776,13 @@ unintended app video."
 
         // Same dedup as pause: on idle-resume, `resume_from_idle` shows "Recording resumed" itself
         // (after this returns), so skip the generic one here. `idle_paused` is still true during
-        // this call — it's cleared only once `resume_recording()` returns.
+        // this call — it's cleared only once `resume_recording()` returns. A dead-capture resume is
+        // likewise silent: `capture_dead_paused` is still set here (the watchdog clears it only
+        // after this returns), matching the suppressed pause toast.
         if self.config.recording.notify_on_start_stop
             && notifications_authorized()
             && !self.idle_paused
+            && !self.capture_dead_paused
         {
             show_recording_resumed_notification();
         }
@@ -4182,12 +4460,12 @@ mod tests {
         fn waits_until_dead_long_enough() {
             // Below the threshold → do nothing, regardless of the other flags.
             assert_eq!(
-                dead_source_action(dead(11), true, AFTER, false, false),
+                dead_source_action(dead(11), true, AFTER, false, false, false),
                 DeadSourceAction::Wait
             );
             // At/over the threshold, first failure for this app → restart.
             assert_eq!(
-                dead_source_action(dead(12), true, AFTER, false, false),
+                dead_source_action(dead(12), true, AFTER, false, false, false),
                 DeadSourceAction::Restart
             );
         }
@@ -4197,11 +4475,11 @@ mod tests {
             // No live/unpaused session → Wait even if dead for ages (a restart would wrongly
             // un-pause; with no session there is nothing to recover) — at any escalation stage.
             assert_eq!(
-                dead_source_action(dead(300), false, AFTER, false, false),
+                dead_source_action(dead(300), false, AFTER, false, false, false),
                 DeadSourceAction::Wait
             );
             assert_eq!(
-                dead_source_action(dead(300), false, AFTER, true, false),
+                dead_source_action(dead(300), false, AFTER, false, true, false),
                 DeadSourceAction::Wait
             );
         }
@@ -4212,16 +4490,109 @@ mod tests {
             // ONCE; then holds — never restarting or re-alerting for that app again until its
             // own source recovers (which the call site detects and clears its state).
             assert_eq!(
-                dead_source_action(dead(12), true, AFTER, false, false),
+                dead_source_action(dead(12), true, AFTER, false, false, false),
                 DeadSourceAction::Restart
             );
             assert_eq!(
-                dead_source_action(dead(12), true, AFTER, true, false),
+                dead_source_action(dead(12), true, AFTER, false, true, false),
                 DeadSourceAction::Alert
             );
             assert_eq!(
-                dead_source_action(dead(9999), true, AFTER, true, true),
+                dead_source_action(dead(9999), true, AFTER, false, true, true),
                 DeadSourceAction::Hold
+            );
+        }
+
+        #[test]
+        fn window_less_never_restarts_or_alerts() {
+            // A window-less app is exempt from EVERY restart/alert path — a fresh process
+            // cannot conjure a window (PDOOM-1274, Siemens NX tool windows) — at any ladder
+            // stage and however long dead.
+            assert_eq!(
+                dead_source_action(dead(60), true, AFTER, true, false, false),
+                DeadSourceAction::PauseOnly
+            );
+            assert_eq!(
+                dead_source_action(dead(60), true, AFTER, true, true, false),
+                DeadSourceAction::PauseOnly
+            );
+            assert_eq!(
+                dead_source_action(dead(60), true, AFTER, true, true, true),
+                DeadSourceAction::PauseOnly
+            );
+        }
+
+        #[test]
+        fn window_less_pauses_after_threshold() {
+            // Give a closing/reopening window a beat (< DEAD_PAUSE_AFTER → Wait), then pause.
+            assert_eq!(
+                dead_source_action(dead(4), true, AFTER, true, false, false),
+                DeadSourceAction::Wait
+            );
+            assert_eq!(
+                dead_source_action(dead(5), true, AFTER, true, false, false),
+                DeadSourceAction::PauseOnly
+            );
+            assert_eq!(
+                dead_source_action(dead(9999), true, AFTER, true, false, false),
+                DeadSourceAction::PauseOnly
+            );
+        }
+
+        #[test]
+        fn window_less_respects_preconditions() {
+            // Preconditions stay the FIRST guard: no live/unpaused session → never PauseOnly
+            // (pausing again while already paused would be meaningless anyway).
+            assert_eq!(
+                dead_source_action(dead(60), false, AFTER, true, false, false),
+                DeadSourceAction::Wait
+            );
+        }
+    }
+
+    // Windows: throttle contract of the needs-scene window probe (pure, no Win32 — same style
+    // as the escalation tests above).
+    #[cfg(target_os = "windows")]
+    mod needs_scene_probe {
+        use super::*;
+
+        #[test]
+        fn fresh_probe_when_no_memo() {
+            assert_eq!(
+                cached_window_probe_verdict(&None, "ugraf", Instant::now(), NEEDS_SCENE_PROBE_MIN_GAP),
+                None
+            );
+        }
+
+        #[test]
+        fn reuses_recent_verdict_for_same_app() {
+            let now = Instant::now();
+            let memo = Some(("ugraf".to_string(), now, true));
+            assert_eq!(
+                cached_window_probe_verdict(&memo, "ugraf", now, NEEDS_SCENE_PROBE_MIN_GAP),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn different_app_probes_immediately() {
+            // A real target change must never be delayed by another app's memo.
+            let now = Instant::now();
+            let memo = Some(("ugraf".to_string(), now, true));
+            assert_eq!(
+                cached_window_probe_verdict(&memo, "nx", now, NEEDS_SCENE_PROBE_MIN_GAP),
+                None
+            );
+        }
+
+        #[test]
+        fn stale_memo_probes_again() {
+            let then = Instant::now();
+            let memo = Some(("ugraf".to_string(), then, true));
+            let later = then + NEEDS_SCENE_PROBE_MIN_GAP;
+            assert_eq!(
+                cached_window_probe_verdict(&memo, "ugraf", later, NEEDS_SCENE_PROBE_MIN_GAP),
+                None
             );
         }
     }

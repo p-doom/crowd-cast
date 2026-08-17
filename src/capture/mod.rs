@@ -75,6 +75,10 @@ pub use sources::{get_main_display_resolution, get_main_display_uuid, ScreenCapt
 // map key and the session predicate used to gate the one-time monitor-pick wait.
 #[cfg(target_os = "linux")]
 pub(crate) use sources::{is_wayland_session, DISPLAY_CAPTURE_KEY};
+// Windows: typed "app has no capturable window" signal — the engine downcasts refresh errors
+// to it so a window-less app pauses instead of escalating (PDOOM-1274).
+#[cfg(target_os = "windows")]
+pub(crate) use sources::NoCapturableWindow;
 
 /// Events emitted by the capture system
 #[derive(Debug, Clone)]
