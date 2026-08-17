@@ -2396,10 +2396,14 @@ unintended app video."
         } else {
             BLIND_REBIND_AFTER
         };
+        // `window_less` is false here by construction: the black-output ladder only runs for a
+        // source with VALID dimensions that is producing black frames (it has a window), which is
+        // categorically not the window-less case, so restart stays the right cure (PDOOM-1298).
         let action = dead_source_action(
             blind_for,
             gates,
             threshold,
+            false,
             already_restarted,
             already_alerted,
         );
@@ -5296,6 +5300,7 @@ mod tests {
                     secs(9999), // blind_for only ever grows once past the threshold
                     true,
                     BLIND_ALERT_AFTER, // an already-restarted episode runs on the alert deadline
+                    false,             // window_less: a black-but-alive source has a window
                     blind_restart_consumed(marker, latched),
                     latched, // alerted implies we had already seen "restarted"
                 )
@@ -5306,6 +5311,7 @@ mod tests {
                     secs(9999),
                     true,
                     BLIND_REBIND_AFTER,
+                    false,
                     blind_restart_consumed(false, false),
                     false
                 ),
@@ -5317,6 +5323,7 @@ mod tests {
                     secs(9999),
                     true,
                     BLIND_ALERT_AFTER,
+                    false,
                     blind_restart_consumed(true, false),
                     false
                 ),
@@ -5338,12 +5345,20 @@ mod tests {
                     true,
                     BLIND_REBIND_AFTER,
                     false,
+                    false,
                     false
                 ),
                 DeadSourceAction::Wait
             );
             assert_eq!(
-                dead_source_action(BLIND_REBIND_AFTER, true, BLIND_REBIND_AFTER, false, false),
+                dead_source_action(
+                    BLIND_REBIND_AFTER,
+                    true,
+                    BLIND_REBIND_AFTER,
+                    false,
+                    false,
+                    false
+                ),
                 DeadSourceAction::Restart
             );
             // A restarted episode is judged against the LONGER alert deadline: post-restart
@@ -5354,22 +5369,30 @@ mod tests {
                     BLIND_ALERT_AFTER - secs(1),
                     true,
                     BLIND_ALERT_AFTER,
+                    false,
                     true,
                     false
                 ),
                 DeadSourceAction::Wait
             );
             assert_eq!(
-                dead_source_action(BLIND_ALERT_AFTER, true, BLIND_ALERT_AFTER, true, false),
+                dead_source_action(
+                    BLIND_ALERT_AFTER,
+                    true,
+                    BLIND_ALERT_AFTER,
+                    false,
+                    true,
+                    false
+                ),
                 DeadSourceAction::Alert
             );
             assert_eq!(
-                dead_source_action(secs(9999), true, BLIND_ALERT_AFTER, true, true),
+                dead_source_action(secs(9999), true, BLIND_ALERT_AFTER, false, true, true),
                 DeadSourceAction::Hold
             );
             // Gates unmet → Wait no matter how long the clock says.
             assert_eq!(
-                dead_source_action(secs(9999), false, BLIND_REBIND_AFTER, false, false),
+                dead_source_action(secs(9999), false, BLIND_REBIND_AFTER, false, false, false),
                 DeadSourceAction::Wait
             );
         }
