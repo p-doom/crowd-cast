@@ -53,7 +53,7 @@ mod ffi {
             version: *const c_char,
             build: *const c_char,
         );
-        pub fn notifications_show_upload_queue_warning();
+        pub fn notifications_show_upload_queue_warning(count: usize);
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -374,9 +374,9 @@ pub fn show_obs_download_started_notification() {
 
 /// Show notification warning that many segments are queued because uploads are paused
 #[cfg(target_os = "macos")]
-pub fn show_upload_queue_warning_notification() {
+pub fn show_upload_queue_warning_notification(count: usize) {
     unsafe {
-        ffi::notifications_show_upload_queue_warning();
+        ffi::notifications_show_upload_queue_warning(count);
     }
 
     debug!("Showed upload queue warning notification");
@@ -384,11 +384,12 @@ pub fn show_upload_queue_warning_notification() {
 
 /// Show upload queue warning notification (non-macOS).
 #[cfg(not(target_os = "macos"))]
-pub fn show_upload_queue_warning_notification() {
-    emit(
-        "Uploads paused",
-        "Many segments are waiting to upload — resume uploads from the tray menu.",
+pub fn show_upload_queue_warning_notification(count: usize) {
+    let body = format!(
+        "{} segments waiting to upload. Resume uploads from the tray menu to free disk space.",
+        count
     );
+    emit("Uploads paused", &body);
 }
 
 /// Show notification when post-wizard setup starts

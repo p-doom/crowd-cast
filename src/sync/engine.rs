@@ -727,7 +727,7 @@ fn write_uploads_paused(paused: bool) {
 
 // --- Pending uploads manifest (persists upload queue across restarts) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingUploadEntry {
     chunk_id: String,
     session_id: String,
@@ -778,6 +778,26 @@ fn remove_pending_upload(chunk_id: &str) {
     if entries.len() != before {
         write_pending_uploads(&entries);
     }
+}
+
+fn remove_pending_uploads(chunk_ids: &[String]) {
+    if chunk_ids.is_empty() {
+        return;
+    }
+
+    let mut entries = read_pending_uploads();
+    if retain_unpurged_pending_uploads(&mut entries, chunk_ids) {
+        write_pending_uploads(&entries);
+    }
+}
+
+fn retain_unpurged_pending_uploads(
+    entries: &mut Vec<PendingUploadEntry>,
+    chunk_ids: &[String],
+) -> bool {
+    let before = entries.len();
+    entries.retain(|e| !chunk_ids.contains(&e.chunk_id));
+    entries.len() != before
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -888,6 +908,10 @@ struct PendingInputTransition {
 
 const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TRANSITION_INPUT_EVENTS: usize = 512;
+
+/// How long a finished segment is held before upload, so the panic button
+/// ("delete last 10 minutes") can still retract it.
+const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -1321,7 +1345,6 @@ unintended app video."
 
     /// Graduate buffered segments older than 10 minutes to the upload task.
     fn graduate_upload_buffer(&mut self) {
-        const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
         let now = Instant::now();
 
         while let Some((created_at, _)) = self.upload_buffer.front() {
@@ -1352,12 +1375,13 @@ unintended app video."
         }
     }
 
-    /// Panic: delete all buffered segments from disk and clear the manifest.
+    /// Panic: delete all buffered segments from disk and remove them from the manifest.
     fn purge_upload_buffer(&mut self) {
         let count = self.upload_buffer.len();
         if count > 0 {
             info!("Panic: deleting {} buffered segment(s)", count);
         }
+        let mut purged_chunk_ids = Vec::with_capacity(count);
         while let Some((_, segment)) = self.upload_buffer.pop_front() {
             if let Some(ref video_path) = segment.chunk.video_path {
                 if let Err(e) = std::fs::remove_file(video_path) {
@@ -1371,8 +1395,9 @@ unintended app video."
             } else {
                 debug!("Deleted input: {:?}", segment.input_path);
             }
+            purged_chunk_ids.push(segment.chunk.chunk_id);
         }
-        write_pending_uploads(&[]);
+        remove_pending_uploads(&purged_chunk_ids);
     }
 
     fn active_video_target(&self) -> Option<&str> {
@@ -2600,7 +2625,7 @@ unintended app video."
             let mut retry_queue: BinaryHeap<RetryEntry> = BinaryHeap::new();
             let mut sequence: u64 = 0;
             let mut active_session_id: Option<String> = None;
-            let mut upload_pause_notified = false;
+            let mut upload_pause_last_notified_count = 0;
 
             // Semaphore limits concurrent uploads
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPLOADS));
@@ -2710,15 +2735,20 @@ unintended app video."
                                             next_attempt_at: now,
                                         },
                                     });
-                                    if retry_queue.len() >= UPLOAD_PAUSE_NOTIFY_THRESHOLD && !upload_pause_notified {
-                                        upload_pause_notified = true;
-                                        warn!("{} segments waiting to upload. Resume uploads from the tray menu.", UPLOAD_PAUSE_NOTIFY_THRESHOLD);
-                                        crate::ui::notifications::show_upload_queue_warning_notification();
+                                    let queued_count = retry_queue.len();
+                                    // Re-arm after each threshold-sized increase while uploads
+                                    // remain paused.
+                                    if queued_count.saturating_sub(upload_pause_last_notified_count)
+                                        >= UPLOAD_PAUSE_NOTIFY_THRESHOLD
+                                    {
+                                        upload_pause_last_notified_count = queued_count;
+                                        warn!("{} segments waiting to upload. Resume uploads from the tray menu.", queued_count);
+                                        crate::ui::notifications::show_upload_queue_warning_notification(queued_count);
                                     }
                                     continue;
                                 }
 
-                                upload_pause_notified = false;
+                                upload_pause_last_notified_count = 0;
                                 info!("Background upload starting for segment {}", chunk_id);
                                 spawn_upload(
                                     uploader.clone(),
@@ -2932,6 +2962,7 @@ unintended app video."
             if !pending.is_empty() {
                 let mut recovered = 0;
                 let mut cleaned = 0;
+                let mut still_held = 0;
                 for entry in &pending {
                     let input_exists = entry.input_path.exists();
                     if !input_exists {
@@ -2983,6 +3014,24 @@ unintended app video."
                         input_path: entry.input_path.clone(),
                     };
 
+                    // A segment still inside the panic hold goes back into the upload
+                    // buffer with its remaining hold time, so a panic press shortly
+                    // after a restart can still retract it.
+                    let age_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .saturating_sub(entry.buffered_at_epoch_s);
+                    if age_secs < UPLOAD_BUFFER_DELAY.as_secs() {
+                        let buffered_at = Instant::now()
+                            .checked_sub(Duration::from_secs(age_secs))
+                            .unwrap_or_else(Instant::now);
+                        self.upload_buffer.push_back((buffered_at, segment));
+                        recovered += 1;
+                        still_held += 1;
+                        continue;
+                    }
+
                     if let Err(e) = self.upload_tx.send(UploadMessage::Segment(segment)) {
                         error!(
                             "Failed to re-queue recovered segment {}: {}",
@@ -2997,6 +3046,12 @@ unintended app video."
                     info!(
                         "Recovered {} pending upload(s) from previous session",
                         recovered
+                    );
+                }
+                if still_held > 0 {
+                    info!(
+                        "{} recovered segment(s) still inside the 10-minute panic hold — resuming their hold instead of uploading now",
+                        still_held
                     );
                 }
                 if cleaned > 0 {
@@ -5010,6 +5065,46 @@ mod tests {
         assert!(!input2.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn purge_keeps_unpurged_pending_entries() {
+        let mut entries = ["keep-1", "purge-1", "keep-2", "purge-2"]
+            .into_iter()
+            .map(|chunk_id| PendingUploadEntry {
+                chunk_id: chunk_id.to_string(),
+                session_id: "test-session".to_string(),
+                video_path: None,
+                input_path: PathBuf::from(format!("{chunk_id}.json")),
+                buffered_at_epoch_s: 1,
+            })
+            .collect();
+        let chunk_ids = vec!["purge-1".to_string(), "purge-2".to_string()];
+
+        assert!(retain_unpurged_pending_uploads(&mut entries, &chunk_ids));
+        assert!(!entries.is_empty());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep-1", "keep-2"]
+        );
+    }
+
+    #[test]
+    fn purge_with_empty_chunk_ids_keeps_manifest_unchanged() {
+        let mut entries = vec![PendingUploadEntry {
+            chunk_id: "keep".to_string(),
+            session_id: "test-session".to_string(),
+            video_path: None,
+            input_path: PathBuf::from("keep.json"),
+            buffered_at_epoch_s: 1,
+        }];
+        let original = entries.clone();
+
+        assert!(!retain_unpurged_pending_uploads(&mut entries, &[]));
+        assert_eq!(entries, original);
     }
 
     #[test]
