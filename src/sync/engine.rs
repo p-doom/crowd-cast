@@ -4333,12 +4333,13 @@ unintended app video."
         // When the pause is idle-initiated, `handle_idle_timeout` shows the more specific
         // "Recording paused (idle)" toast itself, so skip the generic one to avoid a double.
         // (`idle_paused` is set true before `pause_recording()` runs; it's false for a user pause.)
-        // A dead-capture pause (`capture_dead_paused`, also set first) is silent: it is automatic
-        // and self-healing, so we suppress its toast entirely (routine during NX tool-window use).
+        // A dead-capture pause DOES toast (Mihir's call): it stops video AND keylog, and the tray
+        // icon is not a trustworthy fallback signal — it reports "Capturing" from session-open +
+        // events alone, so it read healthy through four days of 100%-black recordings in the field.
+        // Not telling the participant recording stopped is the worse failure than a stray toast.
         if self.config.recording.notify_on_start_stop
             && notifications_authorized()
             && !self.idle_paused
-            && !self.capture_dead_paused
         {
             show_recording_paused_notification();
         }
@@ -4426,13 +4427,11 @@ unintended app video."
 
         // Same dedup as pause: on idle-resume, `resume_from_idle` shows "Recording resumed" itself
         // (after this returns), so skip the generic one here. `idle_paused` is still true during
-        // this call — it's cleared only once `resume_recording()` returns. A dead-capture resume is
-        // likewise silent: `capture_dead_paused` is still set here (the watchdog clears it only
-        // after this returns), matching the suppressed pause toast.
+        // this call — it's cleared only once `resume_recording()` returns. A dead-capture resume
+        // toasts, pairing with its pause toast so the participant sees recording come back.
         if self.config.recording.notify_on_start_stop
             && notifications_authorized()
             && !self.idle_paused
-            && !self.capture_dead_paused
         {
             show_recording_resumed_notification();
         }
