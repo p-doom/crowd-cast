@@ -1649,7 +1649,39 @@ unintended app video."
         }
 
         match self.capture_ctx.active_source_is_ready() {
-            Ok(true) => {}
+            // Ready with no watchdog pending. The watchdog's own Ok(true) arm is the normal
+            // resume route, but it can only run if a watchdog is armed — and every path that
+            // clears one mid-pause (the stale-app path above, a switch that lands back on the
+            // same app) leaves nothing to re-arm it, because Ok(false) is the only arm that
+            // schedules. A dead-capture pause reaching this point would then never resume:
+            // video AND keylog off, silently, until something unrelated re-armed a watchdog.
+            // Resume here too rather than relying on that. Success is read back from
+            // `is_paused` (resume_recording keeps it set when source prep or the OBS resume
+            // call fails); on failure re-arm the watchdog so the next ready tick retries.
+            Ok(true) => {
+                if self.capture_dead_paused {
+                    info!(
+                        "Capture source for '{}' is ready again with no watchdog pending; \
+                         resuming the dead-capture pause",
+                        target_app
+                    );
+                    self.resume_recording();
+                    if !self.is_paused {
+                        self.capture_dead_paused = false;
+                        // Prevent an instant idle-pause (no input was recorded while paused)…
+                        self.last_recorded_action_time = Instant::now();
+                        // …and re-arm segment rotation now, mirroring the watchdog's resume.
+                        self.reset_segment_timer();
+                    } else {
+                        warn!(
+                            "Resume after dead-capture pause for '{}' did not stick; re-arming \
+                             the watchdog to retry",
+                            target_app
+                        );
+                        self.schedule_capture_watchdog(target_app, 0);
+                    }
+                }
+            }
             Ok(false) => self.schedule_capture_watchdog(target_app, 0),
             Err(e) => {
                 debug!(
