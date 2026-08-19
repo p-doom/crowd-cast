@@ -1394,6 +1394,24 @@ impl CaptureContext {
             && !self.app_scenes.contains_key(&canonical)
     }
 
+    /// Windows: whether `app` currently has at least one capturable top-level window (exe-stem
+    /// match, same rule the capture sources use). Lets the engine tell a window-less app (e.g.
+    /// Siemens NX while an in-app tool window is open, PDOOM-1274 — not a wedge, restart cannot
+    /// help) from a genuinely dead capture stack. Fails open on enumeration errors (see
+    /// `sources::app_has_capturable_window`).
+    #[cfg(target_os = "windows")]
+    pub fn active_app_has_capturable_window(&self, app: &str) -> bool {
+        super::sources::app_has_capturable_window(app)
+    }
+
+    /// Non-Windows stub: only Windows has the window-less-app failure shape, so report
+    /// "has a window" unconditionally (keeps the shared escalation call sites compiling).
+    #[cfg(not(target_os = "windows"))]
+    #[allow(dead_code)] // called only by the Windows escalation/needs-scene gates
+    pub fn active_app_has_capturable_window(&self, _app: &str) -> bool {
+        true
+    }
+
     /// True on a GNOME-Wayland session driving picker-free per-window capture via Mutter
     /// ScreenCast. In this mode capture follows the *focused window* dynamically (scenes are
     /// created lazily and the node source is re-pointed on focus changes), so the engine must
