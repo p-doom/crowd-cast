@@ -595,7 +595,13 @@ impl ScreenCaptureSource {
             // Strict enumeration has nothing: before declaring the app window-less, try the
             // permissive resolver — NX-style tool/owned windows are excluded from the strict
             // list but WGC captures them fine (PDOOM-1274, proven by the bind-zoo spike).
-            None => match permissive_window_for_app(bundle_id, None) {
+            // Prefer the CURRENTLY BOUND hwnd (the same bound-first rule
+            // `resolve_watchdog_target` applies on the strict path): follow-focus binds the
+            // FOCUSED tool window, and if this fallback re-resolved to "largest qualifying"
+            // instead, the two writers would hand the source back and forth (~2 black frames
+            // per flip) whenever they disagree — the exact churn #133's watchdog alignment
+            // eliminated. With no live bound window it falls back to largest-qualifying.
+            None => match permissive_window_for_app(bundle_id, self.bound_hwnd) {
                 Some((hwnd, obs_id, shape)) => {
                     info!(
                         "Permissive re-bind for '{}' (strict enumeration empty): {}",
@@ -1041,16 +1047,17 @@ pub(crate) fn enumerate_capture_windows() -> Result<Vec<(isize, String, String)>
 ///
 /// The obs_id is preferentially the strict enumeration's own string for that hwnd
 /// (authoritative encoder); constructed via `win_enum::build_obs_id` only for windows the
-/// strict list excludes (the usual case here). `foreground` biases selection to the window
-/// the user is actually in; see `win_enum::select_permissive_candidate` for the gates
-/// (hard title gate — crash guard —, visibility, minimum size).
+/// strict list excludes (the usual case here). `preferred` biases selection to a specific
+/// hwnd — the focused window (follow-focus) or the currently bound one (watchdog refresh);
+/// see `win_enum::select_permissive_candidate` for the gates (hard title gate — crash
+/// guard —, visibility, minimum size).
 #[cfg(target_os = "windows")]
 pub(crate) fn permissive_window_for_app(
     bundle_id: &str,
-    foreground: Option<isize>,
+    preferred: Option<isize>,
 ) -> Option<(isize, String, String)> {
     let raws = super::win_enum::raw_toplevel_windows();
-    let chosen = super::win_enum::select_permissive_candidate(&raws, bundle_id, foreground)?;
+    let chosen = super::win_enum::select_permissive_candidate(&raws, bundle_id, preferred)?;
     let obs_id = enumerate_capture_windows()
         .ok()
         .and_then(|strict| {

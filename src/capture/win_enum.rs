@@ -167,23 +167,25 @@ pub(crate) fn permissive_bindable(w: &RawWindow) -> bool {
 }
 
 /// Pure selection: the window of `stem` the permissive fallback should bind, from an
-/// unfiltered candidate list. Prefers the foreground window when it belongs to the app and
-/// qualifies (the user is IN it — the NX tool-window case); otherwise the largest
-/// qualifying window (the most plausible "main content" heuristic without a z-order read).
-/// Returns `None` when nothing qualifies — the caller then pauses (PDOOM-1274 behavior)
-/// and emits the window-less telemetry.
+/// unfiltered candidate list. `preferred` wins when it belongs to the app and qualifies —
+/// callers pass the FOCUSED window (follow-focus: the user is in it, the NX tool-window
+/// case) or the CURRENTLY BOUND one (watchdog refresh: keeps the two writers agreeing on
+/// one target, the #133 alignment rule). Otherwise the largest qualifying window (the most
+/// plausible "main content" heuristic without a z-order read). Returns `None` when nothing
+/// qualifies — the caller then pauses (PDOOM-1274 behavior) and emits the window-less
+/// telemetry.
 pub(crate) fn select_permissive_candidate<'a>(
     candidates: &'a [RawWindow],
     stem: &str,
-    foreground: Option<isize>,
+    preferred: Option<isize>,
 ) -> Option<&'a RawWindow> {
     let qualifying = || {
         candidates
             .iter()
             .filter(|w| w.exe_stem.eq_ignore_ascii_case(stem) && permissive_bindable(w))
     };
-    if let Some(fg) = foreground {
-        if let Some(w) = qualifying().find(|w| w.hwnd == fg) {
+    if let Some(pref) = preferred {
+        if let Some(w) = qualifying().find(|w| w.hwnd == pref) {
             return Some(w);
         }
     }
@@ -281,6 +283,20 @@ mod tests {
         let cands = [win(1, "ugraf", 5, 1920, 1080), win(2, "ugraf", 7, 800, 600)];
         let got = select_permissive_candidate(&cands, "ugraf", Some(2)).unwrap();
         assert_eq!(got.hwnd, 2);
+    }
+
+    /// The watchdog refresh passes the currently BOUND hwnd as `preferred`: while that
+    /// window stays alive and qualifying, a refresh must keep it — re-resolving to the
+    /// largest window instead would fight follow-focus over the target, ~2 black frames per
+    /// flip (the two-writer churn #133's watchdog alignment eliminated on the strict path).
+    #[test]
+    fn bound_window_stays_preferred_on_watchdog_refresh() {
+        let cands = [win(1, "ugraf", 5, 1920, 1080), win(2, "ugraf", 7, 800, 600)];
+        let got = select_permissive_candidate(&cands, "ugraf", Some(2)).unwrap();
+        assert_eq!(got.hwnd, 2, "live bound window must be kept");
+        // Bound window gone (closed): falls back to largest qualifying.
+        let got = select_permissive_candidate(&cands, "ugraf", Some(99)).unwrap();
+        assert_eq!(got.hwnd, 1);
     }
 
     #[test]
