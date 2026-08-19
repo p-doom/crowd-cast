@@ -2054,6 +2054,30 @@ unintended app video."
                     self.update_capture_enabled(should_capture, target_app.as_deref());
                     return;
                 }
+                // Windows: backoff-gate the restart itself. The probe above passes on any
+                // bindable window, including a PERMISSIVE candidate that may be transient (a
+                // modal dialog, a toolwindow-styled popup) — if it closes during the seconds
+                // the restart takes, the fresh process's setup_capture finds nothing, the app
+                // parks window-less again, and the next qualifying flash would restart again:
+                // one full process restart per flash, unbounded (adversarial review of PR
+                // #141; strict candidates are long-lived main windows, so pre-#141 this
+                // couldn't repeat fast). The shared backoff (15s doubling to 15min) caps the
+                // storm; on defer, park exactly like the window-less skip and retry.
+                #[cfg(target_os = "windows")]
+                if !restart_allowed_with_backoff() {
+                    warn!(
+                        "App '{}' needs a scene-creating restart but the restart backoff \
+                         deferred it; parking the switch to retry",
+                        app
+                    );
+                    self.pending_app_switch = Some(PendingAppSwitch {
+                        target_app: target_app.clone(),
+                        scheduled_at: Instant::now() + NEEDS_SCENE_PROBE_MIN_GAP,
+                    });
+                    self.pause_for_dead_capture(app);
+                    self.update_capture_enabled(should_capture, target_app.as_deref());
+                    return;
+                }
                 info!(
                     "App '{}' wasn't running at startup — restarting to create its capture source",
                     app
@@ -2133,7 +2157,12 @@ unintended app video."
         ) {
             Some(verdict) => verdict,
             None => {
-                let verdict = !self.capture_ctx.active_app_has_capturable_window(app);
+                // STRICT windows only: scene creation in the fresh process is strict-only
+                // (permissive obs_ids don't work at creation, see find_window_obs_id_for_app),
+                // so a restart for a permissive-only app would fail to create the scene and
+                // burn a restart for nothing. Such an app parks + pauses here until a strict
+                // window appears.
+                let verdict = !self.capture_ctx.active_app_has_strict_window(app);
                 self.needs_scene_window_probe = Some((app.to_string(), now, verdict));
                 verdict
             }
@@ -2141,8 +2170,8 @@ unintended app video."
         if window_less {
             if self.needs_scene_no_window_warned.as_deref() != Some(app) {
                 warn!(
-                    "App '{}' needs a capture scene but has no capturable window; skipping the \
-                     scene-creating restart until a window appears (PDOOM-1274)",
+                    "App '{}' needs a capture scene but has no strict-capturable window; \
+                     skipping the scene-creating restart until one appears (PDOOM-1274)",
                     app
                 );
                 self.needs_scene_no_window_warned = Some(app.to_string());
@@ -2187,19 +2216,6 @@ unintended app video."
 
         let app = watchdog.expected_app.clone();
         let now = Instant::now();
-        // Per-app dead clock: starts when THIS app first fails a readiness check, cleared only
-        // when THIS app becomes ready (the Ok(true) arm). Untouched by other apps.
-        let dead_since = *self.capture_dead_since.entry(app.clone()).or_insert(now);
-        let dead_for = now.saturating_duration_since(dead_since);
-
-        // "Already restarted for this app" is the mere PRESENCE of its marker — it persists
-        // until this app's OWN source recovers (Ok(true) clears it), not a time window. An
-        // earlier cut aged this out after 180s, which re-restarted a continuously-dead app
-        // every few minutes (caught dogfooding: Firefox restarted twice under a persistent
-        // wedge). The read layer prunes markers older than 1h purely as an orphan guard, so a
-        // marathon wedge re-restarts at most hourly — otherwise it's one restart per wedge.
-        let already_restarted = capture_dead_restart_age(&app).is_some();
-        let already_alerted = self.capture_alerted_apps.contains(&app);
         // Windows: probe whether the app has ANY capturable window right now. A window-less
         // app (Siemens NX opening an in-app tool window enumerates zero top-level windows,
         // PDOOM-1274) is exempt from every restart path — a fresh process cannot conjure a
@@ -2209,6 +2225,35 @@ unintended app video."
         let window_less = !self.capture_ctx.active_app_has_capturable_window(&app);
         #[cfg(not(target_os = "windows"))]
         let window_less = false;
+
+        // Per-app dead clock: starts when THIS app first fails a readiness check, cleared only
+        // when THIS app becomes ready (the Ok(true) arm). Untouched by other apps.
+        //
+        // While the app is WINDOW-LESS the clock is clamped to DEAD_PAUSE_AFTER: a window-less
+        // span is not evidence of a wedge (there was nothing to bind), so it must not count
+        // toward ESCALATE_AFTER. Without the clamp, the tick where a bindable window finally
+        // appears would see dead_for already past the escalation threshold and fire a Restart
+        // (or, post-restart, the "restart your machine" alert) BEFORE the refresh on that very
+        // tick could bind the new window in-place — a deterministic false escalation for any
+        // window-less episode ≥ 12s (adversarial review of PR #141). Clamped, not cleared:
+        // PauseOnly's own >= DEAD_PAUSE_AFTER threshold must keep holding through the episode.
+        let dead_since = *self.capture_dead_since.entry(app.clone()).or_insert(now);
+        let mut dead_for = now.saturating_duration_since(dead_since);
+        if window_less && dead_for > DEAD_PAUSE_AFTER {
+            if let Some(clamped) = now.checked_sub(DEAD_PAUSE_AFTER) {
+                self.capture_dead_since.insert(app.clone(), clamped);
+            }
+            dead_for = DEAD_PAUSE_AFTER;
+        }
+
+        // "Already restarted for this app" is the mere PRESENCE of its marker — it persists
+        // until this app's OWN source recovers (Ok(true) clears it), not a time window. An
+        // earlier cut aged this out after 180s, which re-restarted a continuously-dead app
+        // every few minutes (caught dogfooding: Firefox restarted twice under a persistent
+        // wedge). The read layer prunes markers older than 1h purely as an orphan guard, so a
+        // marathon wedge re-restarts at most hourly — otherwise it's one restart per wedge.
+        let already_restarted = capture_dead_restart_age(&app).is_some();
+        let already_alerted = self.capture_alerted_apps.contains(&app);
         // Precondition: a live, unpaused session. Deliberately NOT `any_source_ever_ready` —
         // "no sources" must self-heal even from a dead-at-startup process (an unlock-restart
         // landing mid display-churn); the restart→alert→hold ladder is the loop guard.
@@ -2300,10 +2345,16 @@ unintended app video."
              recording black — PDOOM-1274/913",
             app
         );
-        // Set the flag BEFORE pausing so `pause_recording` (and later `resume_recording`)
-        // suppress their generic "Recording paused/resumed" toasts, which gate on it — mirroring
-        // how the idle path sets `idle_paused` first. Window-less periods are routine NX workflow;
-        // a toast pair per episode would be spam for a self-healing state the user can't act on.
+        // Window-less telemetry (Windows; None elsewhere): describe the app's raw windows and
+        // the current foreground window, so a participant's shipped logs answer the "what shape
+        // is the uncapturable window" question passively — no diagnostic session needed. Once
+        // per pause episode by construction (this fn no-ops while already paused).
+        if let Some(diag) = self.capture_ctx.windowless_diagnostic(app) {
+            warn!("Window-less diagnostic for '{}': {}", app, diag);
+        }
+        // Set the flag BEFORE pausing, mirroring how the idle path sets `idle_paused` first:
+        // `pause_recording` and the resume paths read it to attribute the pause to the
+        // dead-capture machinery (auto-resume eligibility; see `capture_dead_paused`).
         self.capture_dead_paused = true;
         self.pause_recording();
     }
