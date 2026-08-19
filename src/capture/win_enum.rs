@@ -14,6 +14,17 @@
 
 use std::ffi::c_void;
 
+/// Win32 RECT. Declared identically to `window_geometry::Rect` — the `GetWindowRect` extern
+/// must agree across modules or rustc emits `clashing_extern_declarations`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn EnumWindows(
@@ -26,7 +37,7 @@ extern "system" {
     fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
     fn IsWindowVisible(hwnd: *mut c_void) -> i32;
     fn IsIconic(hwnd: *mut c_void) -> i32;
-    fn GetWindowRect(hwnd: *mut c_void, rect: *mut [i32; 4]) -> i32;
+    fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
     fn GetWindow(hwnd: *mut c_void, cmd: u32) -> *mut c_void;
 }
 #[link(name = "kernel32")]
@@ -103,13 +114,23 @@ pub(crate) fn raw_toplevel_windows() -> Vec<RawWindow> {
             let tlen = GetWindowTextW(h, title_buf.as_mut_ptr(), title_buf.len() as i32);
             let mut class_buf = [0u16; 256];
             let clen = GetClassNameW(h, class_buf.as_mut_ptr(), class_buf.len() as i32);
-            let mut rect = [0i32; 4];
+            let mut rect = Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
             GetWindowRect(h, &mut rect);
+            // A title that FILLS the buffer was truncated (possibly mid-surrogate-pair): a
+            // constructed obs_id from it could never exact-match OBS's own full-title read,
+            // so a bind would sit not-ready forever and ride the restart ladder. Report it as
+            // untitled — unbindable — which degrades to the pause (pre-#141 behavior).
+            let truncated = tlen.max(0) as usize >= title_buf.len() - 1;
             let title = String::from_utf16_lossy(&title_buf[..tlen.max(0) as usize]);
             out.push(RawWindow {
                 hwnd: h as isize,
                 pid,
-                title_len: title.chars().count(),
+                title_len: if truncated { 0 } else { title.chars().count() },
                 title,
                 class: String::from_utf16_lossy(&class_buf[..clen.max(0) as usize]),
                 exe_name,
@@ -119,8 +140,8 @@ pub(crate) fn raw_toplevel_windows() -> Vec<RawWindow> {
                 visible: IsWindowVisible(h) != 0,
                 iconic: IsIconic(h) != 0,
                 owner_hwnd: GetWindow(h, GW_OWNER) as isize,
-                width: rect[2] - rect[0],
-                height: rect[3] - rect[1],
+                width: rect.right - rect.left,
+                height: rect.bottom - rect.top,
             });
         }
     }

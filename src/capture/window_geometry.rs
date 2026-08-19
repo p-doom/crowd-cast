@@ -250,6 +250,13 @@ pub fn monitor_fit_for_app(bundle_id: &str, source_size: Option<(u32, u32)>) -> 
     }
 }
 
+/// The raw foreground HWND (0 when none), no gating of any kind. Used by the window-less
+/// telemetry, which must describe the foreground window even when it fails every gate —
+/// that is exactly the datum being collected (PDOOM-1274).
+pub(crate) fn foreground_hwnd() -> isize {
+    unsafe { GetForegroundWindow() as isize }
+}
+
 /// The current foreground window's HWND (as `isize`), but only if it belongs to `bundle_id`
 /// (case-insensitive executable file-stem match, the same rule as `window_exe_matches` and
 /// frontmost app resolution) AND is a real capturable window: visible, not minimized, and
@@ -274,13 +281,6 @@ pub fn monitor_fit_for_app(bundle_id: &str, source_size: Option<(u32, u32)>) -> 
 /// The pass/fail decision is factored into the pure `foreground_qualifies` gate so it can be
 /// unit-tested without live Win32 handles (see `foreground_gate_tests`); this function only
 /// reads the raw Win32 traits and feeds them to that gate.
-/// The raw foreground HWND (0 when none), no gating of any kind. Used by the window-less
-/// telemetry, which must describe the foreground window even when it fails every gate —
-/// that is exactly the datum being collected (PDOOM-1274).
-pub(crate) fn foreground_hwnd() -> isize {
-    unsafe { GetForegroundWindow() as isize }
-}
-
 pub(crate) fn foreground_window_of_app(bundle_id: &str) -> Option<isize> {
     unsafe {
         let hwnd = GetForegroundWindow();

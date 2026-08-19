@@ -1885,7 +1885,14 @@ impl CaptureContext {
                 bound.unwrap_or(0),
                 target_hwnd
             ),
-            Err(e) => warn!("Follow-focus: re-point failed for '{}': {}", app, e),
+            Err(e) => {
+                warn!("Follow-focus: re-point failed for '{}': {}", app, e);
+                // A failed OBS update leaves bound_hwnd unchanged, so the very next 100ms poll
+                // would retry this hwnd — a persistent updater failure would then pay the full
+                // enumeration cost at 10Hz. Back off exactly like an unresolvable window.
+                self.follow_focus_unresolvable =
+                    Some((target_hwnd, super::sources::UNRESOLVABLE_RETRY_TICKS));
+            }
         }
     }
 

@@ -589,33 +589,51 @@ impl ScreenCaptureSource {
         use libobs_wrapper::data::ObsObjectUpdater;
 
         let candidates = enumerate_capture_windows()?;
-        let (hwnd, obs_id) = match resolve_watchdog_target(&candidates, self.bound_hwnd, bundle_id)
-        {
-            Some((hwnd, obs_id)) => (hwnd, obs_id),
-            // Strict enumeration has nothing: before declaring the app window-less, try the
-            // permissive resolver — NX-style tool/owned windows are excluded from the strict
-            // list but WGC captures them fine (PDOOM-1274, proven by the bind-zoo spike).
-            // Prefer the CURRENTLY BOUND hwnd (the same bound-first rule
-            // `resolve_watchdog_target` applies on the strict path): follow-focus binds the
-            // FOCUSED tool window, and if this fallback re-resolved to "largest qualifying"
-            // instead, the two writers would hand the source back and forth (~2 black frames
-            // per flip) whenever they disagree — the exact churn #133's watchdog alignment
-            // eliminated. With no live bound window it falls back to largest-qualifying.
-            None => match permissive_window_for_app(bundle_id, self.bound_hwnd) {
-                Some((hwnd, obs_id, shape)) => {
-                    info!(
-                        "Permissive re-bind for '{}' (strict enumeration empty): {}",
-                        bundle_id, shape
-                    );
-                    (hwnd, obs_id)
-                }
-                // Typed so the watchdog can tell "window-less app" from a real refresh failure
-                // and keep its readiness probe alive instead of erroring out (PDOOM-1274).
-                None => {
-                    return Err(anyhow::Error::new(NoCapturableWindow {
-                        app: bundle_id.to_string(),
-                    }))
-                }
+        // Bound-first must also cover a PERMISSIVELY bound window (absent from the strict list
+        // by definition): without this, a not-ready tick while bound to an NX tool window would
+        // fall through resolve_watchdog_target to the strict first-exe-match — re-binding the
+        // app's main window while follow-focus re-binds the focused tool window on the next
+        // 100ms poll, a two-writer flip war at watchdog cadence (~4 black frames per cycle) for
+        // as long as the source stays not-ready (adversarial review of PR #141). Same
+        // bound-first rule as the strict path, extended to the permissive world.
+        let bound_permissive = self.bound_hwnd.and_then(|b| {
+            if select_window_by_handle(&candidates, b).is_some() {
+                return None; // strict path below keeps it
+            }
+            permissive_window_for_app(bundle_id, Some(b)).filter(|(h, _, _)| *h == b)
+        });
+        let (hwnd, obs_id) = match bound_permissive {
+            Some((hwnd, obs_id, shape)) => {
+                debug!(
+                    "Watchdog refresh keeping permissively-bound window for '{}': {}",
+                    bundle_id, shape
+                );
+                (hwnd, obs_id)
+            }
+            None => match resolve_watchdog_target(&candidates, self.bound_hwnd, bundle_id) {
+                Some((hwnd, obs_id)) => (hwnd, obs_id),
+                // Strict enumeration has nothing: before declaring the app window-less, try
+                // the permissive resolver — NX-style tool/owned windows are excluded from the
+                // strict list but WGC captures them fine (PDOOM-1274, proven by the bind-zoo
+                // spike). Prefer the currently bound hwnd (already handled above when alive);
+                // with no live bound window this falls back to largest-qualifying.
+                None => match permissive_window_for_app(bundle_id, self.bound_hwnd) {
+                    Some((hwnd, obs_id, shape)) => {
+                        info!(
+                            "Permissive re-bind for '{}' (strict enumeration empty): {}",
+                            bundle_id, shape
+                        );
+                        (hwnd, obs_id)
+                    }
+                    // Typed so the watchdog can tell "window-less app" from a real refresh
+                    // failure and keep its readiness probe alive instead of erroring out
+                    // (PDOOM-1274).
+                    None => {
+                        return Err(anyhow::Error::new(NoCapturableWindow {
+                            app: bundle_id.to_string(),
+                        }))
+                    }
+                },
             },
         };
         WindowCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
@@ -1045,12 +1063,15 @@ pub(crate) fn enumerate_capture_windows() -> Result<Vec<(isize, String, String)>
 /// with a hidden owner, both proven WGC-capturable by the bind-zoo spike. Returns
 /// `(hwnd, obs_id, one-line shape description for the log)`.
 ///
-/// The obs_id is preferentially the strict enumeration's own string for that hwnd
-/// (authoritative encoder); constructed via `win_enum::build_obs_id` only for windows the
-/// strict list excludes (the usual case here). `preferred` biases selection to a specific
-/// hwnd — the focused window (follow-focus) or the currently bound one (watchdog refresh);
-/// see `win_enum::select_permissive_candidate` for the gates (hard title gate — crash
-/// guard —, visibility, minimum size).
+/// The obs_id is CONSTRUCTED via `win_enum::build_obs_id` (encoding pinned to
+/// libobs-window-helper's by unit test). No strict-enumeration cross-lookup: every caller
+/// reaches this only when the strict list has no window of the app's exe stem, and the
+/// selection only returns windows of that stem, so a strict hit is impossible by
+/// construction — an earlier cut paid a full extra enumeration per call for that never-hit
+/// lookup. `preferred` biases selection to a specific hwnd — the focused window
+/// (follow-focus) or the currently bound one (watchdog refresh); see
+/// `win_enum::select_permissive_candidate` for the gates (hard title gate — crash guard —,
+/// visibility, minimum size).
 #[cfg(target_os = "windows")]
 pub(crate) fn permissive_window_for_app(
     bundle_id: &str,
@@ -1058,17 +1079,7 @@ pub(crate) fn permissive_window_for_app(
 ) -> Option<(isize, String, String)> {
     let raws = super::win_enum::raw_toplevel_windows();
     let chosen = super::win_enum::select_permissive_candidate(&raws, bundle_id, preferred)?;
-    let obs_id = enumerate_capture_windows()
-        .ok()
-        .and_then(|strict| {
-            strict
-                .into_iter()
-                .find(|(h, _, _)| *h == chosen.hwnd)
-                .map(|(_, id, _)| id)
-        })
-        .unwrap_or_else(|| {
-            super::win_enum::build_obs_id(&chosen.title, &chosen.class, &chosen.exe_name)
-        });
+    let obs_id = super::win_enum::build_obs_id(&chosen.title, &chosen.class, &chosen.exe_name);
     Some((chosen.hwnd, obs_id, super::win_enum::describe_window(chosen)))
 }
 
