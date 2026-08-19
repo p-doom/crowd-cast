@@ -2300,10 +2300,16 @@ unintended app video."
              recording black — PDOOM-1274/913",
             app
         );
-        // Set the flag BEFORE pausing so `pause_recording` (and later `resume_recording`)
-        // suppress their generic "Recording paused/resumed" toasts, which gate on it — mirroring
-        // how the idle path sets `idle_paused` first. Window-less periods are routine NX workflow;
-        // a toast pair per episode would be spam for a self-healing state the user can't act on.
+        // Window-less telemetry (Windows; None elsewhere): describe the app's raw windows and
+        // the current foreground window, so a participant's shipped logs answer the "what shape
+        // is the uncapturable window" question passively — no diagnostic session needed. Once
+        // per pause episode by construction (this fn no-ops while already paused).
+        if let Some(diag) = self.capture_ctx.windowless_diagnostic(app) {
+            warn!("Window-less diagnostic for '{}': {}", app, diag);
+        }
+        // Set the flag BEFORE pausing, mirroring how the idle path sets `idle_paused` first:
+        // `pause_recording` and the resume paths read it to attribute the pause to the
+        // dead-capture machinery (auto-resume eligibility; see `capture_dead_paused`).
         self.capture_dead_paused = true;
         self.pause_recording();
     }
