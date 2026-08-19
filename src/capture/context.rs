@@ -1883,6 +1883,31 @@ impl CaptureContext {
             .and_then(|(_, source)| source.bound_hwnd())
     }
 
+    /// SPIKE-ONLY (spike/permissive-bind-zoo): re-point the active source at an ARBITRARY
+    /// hwnd/obs_id pair, bypassing every enumeration filter and dedup. Measures whether OBS's
+    /// `window_capture` (WGC) will bind windows the strict enumeration excludes (untitled,
+    /// WS_EX_TOOLWINDOW, owned-with-hidden-owner) — the question that decides the PDOOM-1274
+    /// permissive-fallback design. Never ship this: production re-points go through
+    /// `apply_focused_window_to_active`'s gates.
+    /// SPIKE-ONLY (spike/permissive-bind-zoo): the strict enumeration, verbatim, so the driver
+    /// can (a) cross-validate its constructed obs_ids and (b) record which zoo windows the
+    /// strict list excludes. `(hwnd, obs_id, exe_stem)` triples.
+    #[cfg(target_os = "windows")]
+    pub fn spike_strict_enum(&self) -> Result<Vec<(isize, String, String)>> {
+        super::sources::enumerate_capture_windows()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn spike_bind_active_to(&mut self, hwnd: isize, obs_id: &str) -> Result<()> {
+        let Some(app) = self.active_capture_app.clone() else {
+            anyhow::bail!("no active capture app");
+        };
+        let Some((_, source)) = self.app_scenes.get_mut(app.as_str()) else {
+            anyhow::bail!("no scene for active app '{app}'");
+        };
+        source.update_to_window(hwnd, obs_id)
+    }
+
     /// Apply the monitor-level fit to the active app's capture source: scale the
     /// window by its monitor's 1080-shortest-edge factor and place it at its real
     /// on-monitor position. Re-applied each poll so it tracks the window as it

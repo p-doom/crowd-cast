@@ -162,7 +162,10 @@ fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     if std::env::var_os("CROWD_CAST_LOG_PATH").is_none() {
         let raw_args: Vec<String> = std::env::args().collect();
-        if let Some(pos) = raw_args.iter().position(|a| a == "--e2e-follow-focus") {
+        if let Some(pos) = raw_args
+            .iter()
+            .position(|a| a == "--e2e-follow-focus" || a == "--spike-bind-zoo")
+        {
             if let Some(out_dir) = raw_args.get(pos + 1) {
                 std::env::set_var(
                     "CROWD_CAST_LOG_PATH",
@@ -367,6 +370,36 @@ fn main() -> Result<()> {
         {
             let _ = pos;
             eprintln!("--e2e-follow-focus is windows only");
+            std::process::exit(1);
+        }
+    }
+
+    // SPIKE-ONLY (spike/permissive-bind-zoo): can OBS window_capture (WGC) bind windows the
+    // strict enumeration excludes (untitled / WS_EX_TOOLWINDOW / owned-with-hidden-owner)?
+    // Drives the window-zoo exe through each shape and binds by constructed obs_id.
+    if let Some(pos) = args.iter().position(|a| a == "--spike-bind-zoo") {
+        #[cfg(target_os = "windows")]
+        {
+            let usage = "usage: --spike-bind-zoo <out_dir> <zoo_exe> <dwell_secs>";
+            let out_dir = args.get(pos + 1).ok_or_else(|| anyhow::anyhow!(usage))?;
+            let zoo = args.get(pos + 2).ok_or_else(|| anyhow::anyhow!(usage))?;
+            let dwell: u64 = args
+                .get(pos + 3)
+                .ok_or_else(|| anyhow::anyhow!(usage))?
+                .parse()
+                .map_err(|_| anyhow::anyhow!(usage))?;
+            match spike_bind_zoo(std::path::Path::new(out_dir), zoo, dwell) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!("spike-bind-zoo failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = pos;
+            eprintln!("--spike-bind-zoo is windows only");
             std::process::exit(1);
         }
     }
@@ -912,6 +945,355 @@ fn e2e_follow_focus(out_dir: &std::path::Path, exe: &str, secs: u64) -> Result<(
         Ok(())
     })();
     let _ = ctx.stop_recording();
+    body?;
+
+    let summary = serde_json::json!({
+        "mp4": mp4_path.to_string_lossy(),
+        "log": log_path.to_string_lossy(),
+        "start_time_ns": start_time_ns,
+    });
+    println!("{summary}");
+    Ok(())
+}
+
+/// SPIKE-ONLY (spike/permissive-bind-zoo): raw Win32 helpers for unfiltered window inspection.
+/// Self-contained on purpose — production code must keep going through the strict enumeration.
+#[cfg(target_os = "windows")]
+mod spike_win {
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(
+            callback: unsafe extern "system" fn(*mut c_void, isize) -> i32,
+            data: isize,
+        ) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
+        fn GetWindowTextW(hwnd: *mut c_void, buf: *mut u16, max: i32) -> i32;
+        fn GetClassNameW(hwnd: *mut c_void, buf: *mut u16, max: i32) -> i32;
+        fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
+        fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        fn IsIconic(hwnd: *mut c_void) -> i32;
+        fn GetWindowRect(hwnd: *mut c_void, rect: *mut [i32; 4]) -> i32;
+        fn GetWindow(hwnd: *mut c_void, cmd: u32) -> *mut c_void;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn QueryFullProcessImageNameW(
+            process: *mut c_void,
+            flags: u32,
+            name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    const GWL_STYLE: i32 = -16;
+    const GWL_EXSTYLE: i32 = -20;
+    const GW_OWNER: u32 = 4;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct RawWindow {
+        pub hwnd: isize,
+        pub pid: u32,
+        pub title: String,
+        pub class: String,
+        pub exe: String,
+        pub style: isize,
+        pub ex_style: isize,
+        pub visible: bool,
+        pub iconic: bool,
+        pub owner_hwnd: isize,
+        pub rect: [i32; 4],
+    }
+
+    /// Every top-level window of `pid`, with zero filtering beyond process identity.
+    pub fn raw_windows_of_pid(target_pid: u32) -> Vec<RawWindow> {
+        unsafe extern "system" fn collect(hwnd: *mut c_void, data: isize) -> i32 {
+            let out = &mut *(data as *mut Vec<*mut c_void>);
+            out.push(hwnd);
+            1
+        }
+        let mut handles: Vec<*mut c_void> = Vec::new();
+        unsafe {
+            EnumWindows(collect, &mut handles as *mut _ as isize);
+        }
+        let mut out = Vec::new();
+        for h in handles {
+            unsafe {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(h, &mut pid);
+                if pid != target_pid {
+                    continue;
+                }
+                let mut title_buf = [0u16; 512];
+                let tlen = GetWindowTextW(h, title_buf.as_mut_ptr(), title_buf.len() as i32);
+                let mut class_buf = [0u16; 256];
+                let clen = GetClassNameW(h, class_buf.as_mut_ptr(), class_buf.len() as i32);
+                let mut rect = [0i32; 4];
+                GetWindowRect(h, &mut rect);
+                out.push(RawWindow {
+                    hwnd: h as isize,
+                    pid,
+                    title: String::from_utf16_lossy(&title_buf[..tlen.max(0) as usize]),
+                    class: String::from_utf16_lossy(&class_buf[..clen.max(0) as usize]),
+                    exe: exe_name_of_pid(pid).unwrap_or_default(),
+                    style: GetWindowLongPtrW(h, GWL_STYLE),
+                    ex_style: GetWindowLongPtrW(h, GWL_EXSTYLE),
+                    visible: IsWindowVisible(h) != 0,
+                    iconic: IsIconic(h) != 0,
+                    owner_hwnd: GetWindow(h, GW_OWNER) as isize,
+                    rect,
+                });
+            }
+        }
+        out
+    }
+
+    /// Exe file NAME (with extension) for a pid, matching what libobs-window-helper embeds in
+    /// obs_id (`full_exe.file_name()`).
+    fn exe_name_of_pid(pid: u32) -> Option<String> {
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return None;
+            }
+            let mut buf = [0u16; 1024];
+            let mut size = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut size);
+            CloseHandle(process);
+            if ok == 0 {
+                return None;
+            }
+            let full = String::from_utf16_lossy(&buf[..size as usize]);
+            full.rsplit(['\\', '/']).next().map(str::to_string)
+        }
+    }
+
+    /// obs_id construction replicated from libobs-window-helper (`encode_string` + join):
+    /// `title:class:exe` with `#`→`#22` then `:`→`#3A`, applied per part in that order.
+    /// The spike cross-validates this against a strict-enumeration obs_id at runtime.
+    pub fn build_obs_id(title: &str, class: &str, exe: &str) -> String {
+        fn enc(s: &str) -> String {
+            s.replace('#', "#22").replace(':', "#3A")
+        }
+        format!("{}:{}:{}", enc(title), enc(class), enc(exe))
+    }
+}
+
+/// SPIKE-ONLY (spike/permissive-bind-zoo): for each pathological window shape spawned by the
+/// window-zoo exe, attempt to bind OBS `window_capture` (WGC) to it via a CONSTRUCTED obs_id
+/// (bypassing the strict enumeration) and report readiness + dimensions. Recording runs across
+/// all scenarios so offline luma analysis can verify frames are genuinely live (the zoo blinks
+/// at 2Hz). Answers the PDOOM-1274 design question: which excluded window shapes can WGC
+/// actually capture?
+#[cfg(target_os = "windows")]
+fn spike_bind_zoo(out_dir: &std::path::Path, zoo_exe: &str, dwell_secs: u64) -> Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    // Titled shapes first: binding an UNTITLED window's obs_id (empty title segment) crashes
+    // OBS natively (AV in win-capture.dll!wc_tick, reproduced 2/2), killing the process and
+    // everything after it — so the crashers run last, as their own confirmed result.
+    const SCENARIOS: &[&str] = &[
+        "toolwindow",
+        "owned-hidden-owner",
+        "untitled",
+        "untitled-toolwindow",
+    ];
+
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("Failed to create output dir {:?}", out_dir))?;
+
+    // Long-lived control zoo: gives setup_capture a titled, plain window so the scene exists,
+    // and is the known-good re-bind target between scenarios.
+    let total_secs = (SCENARIOS.len() as u64) * (dwell_secs + 10) + 30;
+    let mut control = std::process::Command::new(zoo_exe)
+        .args(["control", &total_secs.to_string()])
+        .spawn()
+        .context("Failed to spawn control zoo")?;
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let zoo_stem = std::path::Path::new(zoo_exe)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("window_zoo")
+        .to_ascii_lowercase();
+
+    let runtime = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+    let mut ctx = runtime
+        .block_on(capture::CaptureContext::new(out_dir.to_path_buf()))
+        .context("Failed to create capture context")?;
+    let targets = vec![zoo_stem.clone()];
+    ctx.set_single_active_app_capture(true);
+    ctx.set_target_apps(&targets);
+    ctx.initialize().context("Failed to initialize libobs")?;
+    ctx.setup_capture(&targets, &std::collections::HashMap::new())
+        .context("Failed to set up capture")?;
+    ctx.switch_active_app_capture(Some(&zoo_stem))
+        .context("Failed to activate capture scene")?;
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !ctx.active_source_is_ready().unwrap_or(false) {
+        if Instant::now() >= ready_deadline {
+            anyhow::bail!("control capture never became ready");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Control window + validated obs_id construction: the strict enumeration must agree with
+    // our raw construction for the same hwnd, or every later constructed id is suspect.
+    let control_pid = control.id();
+    let control_raw = spike_win::raw_windows_of_pid(control_pid)
+        .into_iter()
+        .find(|w| w.visible && w.title == "ZooControl")
+        .context("control zoo window not found in raw enumeration")?;
+    let strict = ctx.spike_strict_enum()?;
+    let strict_ctl = strict
+        .iter()
+        .find(|(h, _, _)| *h == control_raw.hwnd)
+        .context("control window missing from strict enumeration")?;
+    let constructed =
+        spike_win::build_obs_id(&control_raw.title, &control_raw.class, &control_raw.exe);
+    anyhow::ensure!(
+        constructed == strict_ctl.1,
+        "obs_id construction mismatch: constructed={constructed:?} strict={:?}",
+        strict_ctl.1
+    );
+
+    let session_id = format!(
+        "spike-bind-zoo-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let session = ctx
+        .start_recording(session_id)
+        .context("Failed to start recording")?;
+    let mp4_path = session.output_path.clone();
+    let start_time_ns = session.start_time_ns;
+
+    let log_path = out_dir.join("spike_log.jsonl");
+    let mut log = std::fs::File::create(&log_path)?;
+    let start = Instant::now();
+    let mut emit = |log: &mut std::fs::File,
+                    ctx: &capture::CaptureContext,
+                    mut event: serde_json::Value|
+     -> Result<()> {
+        if let Some(obj) = event.as_object_mut() {
+            obj.insert(
+                "wall_ms".to_string(),
+                serde_json::json!(start.elapsed().as_millis() as u64),
+            );
+            let frame_time = match ctx.get_video_frame_time() {
+                Ok(ns) => serde_json::json!(ns),
+                Err(_) => serde_json::Value::Null,
+            };
+            obj.insert("frame_time_ns".to_string(), frame_time);
+        }
+        writeln!(log, "{event}")?;
+        Ok(())
+    };
+    emit(
+        &mut log,
+        &ctx,
+        serde_json::json!({"event": "recording_start", "start_time_ns": start_time_ns,
+                           "obs_id_construction_validated": true}),
+    )?;
+
+    let control_obs_id = constructed;
+    let body = (|| -> Result<()> {
+        for scenario in SCENARIOS {
+            let mut child = std::process::Command::new(zoo_exe)
+                .args([*scenario, &(dwell_secs + 15).to_string()])
+                .spawn()
+                .with_context(|| format!("Failed to spawn zoo scenario {scenario}"))?;
+            std::thread::sleep(Duration::from_millis(1500));
+
+            let raws = spike_win::raw_windows_of_pid(child.id());
+            let strict_now = ctx.spike_strict_enum()?;
+            for w in &raws {
+                let in_strict = strict_now.iter().any(|(h, _, _)| *h == w.hwnd);
+                emit(&mut log, &ctx, serde_json::json!({
+                    "event": "raw_window", "scenario": scenario, "in_strict_enum": in_strict,
+                    "win": w,
+                }))?;
+            }
+
+            // The blink window: visible, not iconic, the 800x600 one (excludes hidden owners).
+            let target = raws
+                .iter()
+                .find(|w| w.visible && !w.iconic && (w.rect[2] - w.rect[0]) >= 700)
+                .cloned();
+            let Some(target) = target else {
+                emit(&mut log, &ctx, serde_json::json!({
+                    "event": "verdict", "scenario": scenario, "error": "no visible zoo window found",
+                }))?;
+                let _ = child.kill();
+                continue;
+            };
+
+            let obs_id = spike_win::build_obs_id(&target.title, &target.class, &target.exe);
+            emit(&mut log, &ctx, serde_json::json!({
+                "event": "bind_start", "scenario": scenario, "hwnd": target.hwnd, "obs_id": obs_id,
+            }))?;
+            let bind_result = ctx.spike_bind_active_to(target.hwnd, &obs_id);
+
+            let mut ready = false;
+            let mut dims: Option<(u32, u32)> = None;
+            let mut ms_to_ready: Option<u64> = None;
+            if bind_result.is_ok() {
+                // Settle past the WGC session reset (~2 frames) so the readiness poll reads the
+                // NEW binding, not stale readiness left over from the control window.
+                std::thread::sleep(Duration::from_millis(600));
+                let t0 = Instant::now();
+                let deadline = t0 + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    if ctx.active_source_is_ready().unwrap_or(false) {
+                        ready = true;
+                        ms_to_ready = Some(t0.elapsed().as_millis() as u64);
+                        dims = ctx.active_source_dimensions().ok().flatten();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            emit(&mut log, &ctx, serde_json::json!({
+                "event": "verdict", "scenario": scenario, "hwnd": target.hwnd,
+                "bind_call_ok": bind_result.is_ok(),
+                "bind_err": bind_result.err().map(|e| format!("{e:#}")),
+                "ready": ready, "ms_to_ready": ms_to_ready, "dims": dims,
+            }))?;
+
+            // Dwell so the recording holds this shape long enough for offline luma analysis.
+            std::thread::sleep(Duration::from_secs(dwell_secs));
+            emit(&mut log, &ctx, serde_json::json!({
+                "event": "dwell_end", "scenario": scenario,
+            }))?;
+
+            // Restore the known-good control binding between scenarios.
+            ctx.spike_bind_active_to(control_raw.hwnd, &control_obs_id)?;
+            let t0 = Instant::now();
+            while !ctx.active_source_is_ready().unwrap_or(false) {
+                if t0.elapsed() > Duration::from_secs(3) {
+                    anyhow::bail!("control re-bind never became ready after {scenario}");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            emit(&mut log, &ctx, serde_json::json!({
+                "event": "control_restored", "scenario": scenario,
+            }))?;
+            let _ = child.kill();
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Ok(())
+    })();
+    let _ = ctx.stop_recording();
+    let _ = control.kill();
     body?;
 
     let summary = serde_json::json!({
