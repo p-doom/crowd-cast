@@ -1412,6 +1412,15 @@ impl CaptureContext {
         true
     }
 
+    /// Whether `app` has a STRICT-enumeration window — the only kind scene CREATION can bind.
+    /// The needs-scene restart gate keys on this rather than the permissive-inclusive probe:
+    /// restarting for a permissive-only app would fail scene creation in the fresh process and
+    /// burn the restart for nothing (see `sources::app_has_strict_window`).
+    #[cfg(target_os = "windows")]
+    pub fn active_app_has_strict_window(&self, app: &str) -> bool {
+        super::sources::app_has_strict_window(app)
+    }
+
     /// True on a GNOME-Wayland session driving picker-free per-window capture via Mutter
     /// ScreenCast. In this mode capture follows the *focused window* dynamically (scenes are
     /// created lazily and the node source is re-pointed on focus changes), so the engine must

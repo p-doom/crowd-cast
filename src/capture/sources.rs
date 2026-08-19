@@ -1014,6 +1014,21 @@ pub(crate) fn app_has_capturable_window(bundle_id: &str) -> bool {
     }
 }
 
+/// Whether `bundle_id` has a STRICT-enumeration window right now — the only kind scene
+/// CREATION can bind (see `find_window_obs_id_for_app`). The needs-scene restart gate keys
+/// on this, not on `app_has_capturable_window`: restarting for a permissive-only app would
+/// fail scene creation in the fresh process and burn the restart for nothing. Fails OPEN
+/// like its sibling (an enumeration error must not wedge the needs-scene path).
+#[cfg(target_os = "windows")]
+pub(crate) fn app_has_strict_window(bundle_id: &str) -> bool {
+    match enumerate_capture_windows() {
+        Ok(windows) => windows
+            .iter()
+            .any(|(_, _, stem)| stem.eq_ignore_ascii_case(bundle_id)),
+        Err(_) => true,
+    }
+}
+
 /// Enumerate every window OBS's `window_capture` could bind to right now, the same list
 /// `find_window_obs_id_for_app` searches. Each entry is `(hwnd, obs_id, exe_stem)`:
 /// - `hwnd`: numeric window handle (`isize`), for HWND-keyed follow-focus dedup.
@@ -1089,28 +1104,23 @@ pub(crate) fn permissive_window_for_app(
 /// the HWND (so the two callers can seed `bound_hwnd`).
 #[cfg(target_os = "windows")]
 fn find_window_obs_id_for_app(bundle_id: &str) -> Result<(isize, String)> {
-    if let Some(found) = enumerate_capture_windows()?
+    // STRICT-ONLY, deliberately: creating a `window_capture` source with a permissively
+    // constructed obs_id does not work — E2E showed a source CREATED against a toolwindow id
+    // either crashes OBS (racy, the PDOOM-1324 shape) or never delivers frames, while the
+    // UPDATE path (re-pointing an existing source, `update_to_window`/`update_application`)
+    // captures the same window fine. So permissive binding is scoped to re-points on scenes
+    // that already exist; an app that is tool-window-only at scene-creation time stays
+    // NoCapturableWindow and rides #140's parked-pause until a strict window appears.
+    enumerate_capture_windows()?
         .into_iter()
         .find(|(_, _, stem)| stem.eq_ignore_ascii_case(bundle_id))
         .map(|(hwnd, obs_id, _)| (hwnd, obs_id))
-    {
-        return Ok(found);
-    }
-    // Same permissive fallback as the refresh-time site in `update_application`: an app whose
-    // only windows are NX-style tool/owned shapes still gets its scene created (otherwise the
-    // needs-scene path parks it as window-less until a strict window appears, PDOOM-1274).
-    if let Some((hwnd, obs_id, shape)) = permissive_window_for_app(bundle_id, None) {
-        info!(
-            "Permissive window match for '{}' at scene creation (strict enumeration empty): {}",
-            bundle_id, shape
-        );
-        return Ok((hwnd, obs_id));
-    }
-    // Same typed signal as the refresh-time site in `update_application`, so
-    // creation-time and refresh-time behave identically for a window-less app.
-    Err(anyhow::Error::new(NoCapturableWindow {
-        app: bundle_id.to_string(),
-    }))
+        .ok_or_else(|| {
+            // Same typed signal as the refresh-time site in `update_application`.
+            anyhow::Error::new(NoCapturableWindow {
+                app: bundle_id.to_string(),
+            })
+        })
 }
 
 /// Pure follow-focus dedup / trigger decision. `foreground` is the HWND the caller has already

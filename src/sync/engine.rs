@@ -2157,7 +2157,12 @@ unintended app video."
         ) {
             Some(verdict) => verdict,
             None => {
-                let verdict = !self.capture_ctx.active_app_has_capturable_window(app);
+                // STRICT windows only: scene creation in the fresh process is strict-only
+                // (permissive obs_ids don't work at creation, see find_window_obs_id_for_app),
+                // so a restart for a permissive-only app would fail to create the scene and
+                // burn a restart for nothing. Such an app parks + pauses here until a strict
+                // window appears.
+                let verdict = !self.capture_ctx.active_app_has_strict_window(app);
                 self.needs_scene_window_probe = Some((app.to_string(), now, verdict));
                 verdict
             }
@@ -2165,8 +2170,8 @@ unintended app video."
         if window_less {
             if self.needs_scene_no_window_warned.as_deref() != Some(app) {
                 warn!(
-                    "App '{}' needs a capture scene but has no capturable window; skipping the \
-                     scene-creating restart until a window appears (PDOOM-1274)",
+                    "App '{}' needs a capture scene but has no strict-capturable window; \
+                     skipping the scene-creating restart until one appears (PDOOM-1274)",
                     app
                 );
                 self.needs_scene_no_window_warned = Some(app.to_string());
