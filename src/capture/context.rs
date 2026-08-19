@@ -1412,15 +1412,6 @@ impl CaptureContext {
         true
     }
 
-    /// Whether `app` has a STRICT-enumeration window — the only kind scene CREATION can bind.
-    /// The needs-scene restart gate keys on this rather than the permissive-inclusive probe:
-    /// restarting for a permissive-only app would fail scene creation in the fresh process and
-    /// burn the restart for nothing (see `sources::app_has_strict_window`).
-    #[cfg(target_os = "windows")]
-    pub fn active_app_has_strict_window(&self, app: &str) -> bool {
-        super::sources::app_has_strict_window(app)
-    }
-
     /// True on a GNOME-Wayland session driving picker-free per-window capture via Mutter
     /// ScreenCast. In this mode capture follows the *focused window* dynamically (scenes are
     /// created lazily and the node source is re-pointed on focus changes), so the engine must
@@ -1853,35 +1844,19 @@ impl CaptureContext {
                 return;
             }
         };
-        let obs_id = match super::sources::select_window_by_handle(&candidates, target_hwnd) {
-            Some(obs_id) => obs_id.to_string(),
-            // The foreground window is not in OBS's strict enumeration. Before backing off,
-            // try the permissive resolver on exactly this hwnd: the standing real case is an
-            // NX-style tool/modal window (WS_EX_TOOLWINDOW or owned-with-hidden-owner) that
-            // the strict list excludes but WGC captures fine (PDOOM-1274; proven by the
-            // bind-zoo spike). The exact-hwnd requirement keeps this a follow-focus decision
-            // — never a fallback to a DIFFERENT window of the app (that rule from #133
-            // stands: absent-and-unbindable means keep the current binding).
-            None => match super::sources::permissive_window_for_app(&app, Some(target_hwnd)) {
-                Some((hwnd, obs_id, shape)) if hwnd == target_hwnd => {
-                    info!("Follow-focus: permissive bind for '{}': {}", app, shape);
-                    obs_id
-                }
-                _ => {
-                    // Genuinely unresolvable: closed since the GetForegroundWindow read, a UWP
-                    // parent whose child libobs surfaces instead, or unbindable by the
-                    // permissive gates (e.g. untitled — the crash guard; never bind those).
-                    // Keep the current binding, and back off before retrying this hwnd.
-                    self.follow_focus_unresolvable =
-                        Some((target_hwnd, super::sources::UNRESOLVABLE_RETRY_TICKS));
-                    debug!(
-                        "Follow-focus: target window {:#x} not bindable for '{}' (strict or permissive); keeping current binding",
-                        target_hwnd, app
-                    );
-                    return;
-                }
-            },
+        let Some(obs_id) = super::sources::select_window_by_handle(&candidates, target_hwnd) else {
+            // The foreground window is not in OBS's enumeration right now (e.g. closed since the
+            // GetForegroundWindow read, or a UWP parent whose child libobs surfaces instead).
+            // No fallback: keep the current binding, and back off before retrying this hwnd.
+            self.follow_focus_unresolvable =
+                Some((target_hwnd, super::sources::UNRESOLVABLE_RETRY_TICKS));
+            debug!(
+                "Follow-focus: target window {:#x} not in current enumeration for '{}'; keeping current binding",
+                target_hwnd, app
+            );
+            return;
         };
+        let obs_id = obs_id.to_string();
         self.follow_focus_unresolvable = None;
 
         let Some((_, source)) = self.app_scenes.get_mut(app.as_str()) else {
@@ -1894,47 +1869,8 @@ impl CaptureContext {
                 bound.unwrap_or(0),
                 target_hwnd
             ),
-            Err(e) => {
-                warn!("Follow-focus: re-point failed for '{}': {}", app, e);
-                // A failed OBS update leaves bound_hwnd unchanged, so the very next 100ms poll
-                // would retry this hwnd — a persistent updater failure would then pay the full
-                // enumeration cost at 10Hz. Back off exactly like an unresolvable window.
-                self.follow_focus_unresolvable =
-                    Some((target_hwnd, super::sources::UNRESOLVABLE_RETRY_TICKS));
-            }
+            Err(e) => warn!("Follow-focus: re-point failed for '{}': {}", app, e),
         }
-    }
-
-    /// The window-less telemetry (PDOOM-1274): when an app is about to be dead-capture
-    /// paused because NOTHING is bindable (strict or permissive), describe what its raw
-    /// top-level windows actually look like — plus the current foreground window even when
-    /// it belongs to another process (the "helper process draws NX's tool window" theory
-    /// needs exactly that datum). Shipped logs then answer the window-shape question
-    /// passively, with no participant-run diagnostic. Called once per pause episode, so no
-    /// extra throttling is needed.
-    #[cfg(target_os = "windows")]
-    pub fn windowless_diagnostic(&self, app: &str) -> Option<String> {
-        let raws = super::win_enum::raw_toplevel_windows();
-        let mut lines: Vec<String> = raws
-            .iter()
-            .filter(|w| w.exe_stem.eq_ignore_ascii_case(app))
-            .map(|w| format!("app-window {}", super::win_enum::describe_window(w)))
-            .collect();
-        if lines.is_empty() {
-            lines.push(format!("no top-level windows at all for '{app}'"));
-        }
-        let fg = super::window_geometry::foreground_hwnd();
-        if let Some(w) = raws.iter().find(|w| w.hwnd == fg) {
-            lines.push(format!("foreground {}", super::win_enum::describe_window(w)));
-        }
-        Some(lines.join("; "))
-    }
-
-    /// Non-Windows: the window-less diagnostic has no meaning (no window enumeration on the
-    /// macOS SCK path); the engine logs the pause without it.
-    #[cfg(not(target_os = "windows"))]
-    pub fn windowless_diagnostic(&self, _app: &str) -> Option<String> {
-        None
     }
 
     /// Apply the monitor-level fit to the active app's capture source: scale the

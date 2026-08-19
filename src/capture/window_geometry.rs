@@ -250,13 +250,6 @@ pub fn monitor_fit_for_app(bundle_id: &str, source_size: Option<(u32, u32)>) -> 
     }
 }
 
-/// The raw foreground HWND (0 when none), no gating of any kind. Used by the window-less
-/// telemetry, which must describe the foreground window even when it fails every gate —
-/// that is exactly the datum being collected (PDOOM-1274).
-pub(crate) fn foreground_hwnd() -> isize {
-    unsafe { GetForegroundWindow() as isize }
-}
-
 /// The current foreground window's HWND (as `isize`), but only if it belongs to `bundle_id`
 /// (case-insensitive executable file-stem match, the same rule as `window_exe_matches` and
 /// frontmost app resolution) AND is a real capturable window: visible, not minimized, and

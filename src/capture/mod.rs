@@ -29,8 +29,6 @@ mod recording;
 mod recovery;
 mod sources;
 #[cfg(target_os = "windows")]
-pub(crate) mod win_enum;
-#[cfg(target_os = "windows")]
 mod window_geometry;
 #[cfg(target_os = "linux")]
 pub(crate) mod wayland_output;
