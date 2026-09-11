@@ -336,7 +336,14 @@ fn main() -> Result<()> {
     std::env::remove_var(POST_SETUP_ENV);
 
     // Create tokio runtime for async operations
-    let runtime = tokio::runtime::Runtime::new()?;
+    // Four workers, not one-per-core. This runtime carries a ~100ms poll loop, upload tasks
+    // and timers -- all idle or IO-bound -- so the default (8 threads on an M2, more on a Pro)
+    // bought nothing but scheduler overhead and stack memory. Four leaves headroom for the
+    // `block_in_place` call sites, which park a worker while they run.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
 
     // Initialize notifications early (best effort - non-fatal if it fails)
     let (notification_tx, notification_rx) = mpsc::unbounded_channel();

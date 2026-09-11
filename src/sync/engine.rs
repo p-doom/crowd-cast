@@ -1078,6 +1078,8 @@ pub struct SyncEngine {
     /// Last time the macOS canvas convergence check ran (throttled to ~1s).
     #[cfg(target_os = "macos")]
     last_canvas_convergence_check: Option<std::time::Instant>,
+    /// Last time the display set was polled (see [`DISPLAY_CHECK_INTERVAL`]).
+    last_display_check: Option<Instant>,
     /// Segment rotation timer — fires every `segment_duration_secs` to split
     /// the recording into manageable chunks. Stored as a struct field so that
     /// every code path that starts/stops recording (including display recovery)
@@ -1302,6 +1304,7 @@ unintended app video."
             needs_scene_no_window_warned: None,
             #[cfg(target_os = "macos")]
             last_canvas_convergence_check: None,
+            last_display_check: None,
             segment_timer: None,
             pending_input_transition: None,
             last_emitted_context: None,
