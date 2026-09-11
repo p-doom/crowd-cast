@@ -49,13 +49,7 @@ extern "C" {
 
     /// Free memory allocated by the wizard for selected_apps
     fn wizard_free_result(config: *mut WizardConfig);
-}
 
-// Seeding the picker with the saved selection is implemented natively on macOS only for
-// now; the GTK half is written but has not been run on a Linux host, so Linux keeps the
-// no-op stub until someone tests it (see PDOOM-1393).
-#[cfg(target_os = "macos")]
-extern "C" {
     /// Seed the picker with the selection already saved in the config. Must be called
     /// after `wizard_set_apps`, which clears the selection.
     fn wizard_set_selection(apps: *const *const c_char, count: usize, capture_all: bool);
@@ -142,7 +136,7 @@ pub fn set_available_apps(apps: &[AppInfoWrapper]) {
 /// them rather than having them silently kept (or, on Linux, silently dropped).
 ///
 /// Call this *after* [`set_available_apps`]: the native side clears the selection there.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn set_current_selection(apps: &[String], capture_all: bool) {
     let c_apps: Vec<CString> = apps
         .iter()
@@ -250,8 +244,7 @@ pub fn open_notifications_settings() {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn set_available_apps(_apps: &[AppInfoWrapper]) {}
 
-// Linux and Windows: no native seeding yet, so the picker keeps its current behaviour.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn set_current_selection(_apps: &[String], _capture_all: bool) {}
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
