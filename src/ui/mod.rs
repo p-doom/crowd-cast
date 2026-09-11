@@ -8,6 +8,8 @@ mod aumid_windows;
 #[cfg(target_os = "linux")]
 pub(crate) mod appcast_sig;
 pub mod notifications;
+#[cfg(target_os = "macos")]
+mod notification_center;
 #[cfg(target_os = "linux")]
 pub mod notify_linux;
 mod platform_tray;
