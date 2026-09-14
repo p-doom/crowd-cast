@@ -148,27 +148,41 @@ jobs:
       # one (the latest macOS build, or the carried copy from the previous Windows
       # release). The macOS Sparkle appcast still points at its own immutable asset,
       # so auto-update is untouched; this is purely the human download.
-      - name: Carry forward the latest macOS download (CrowdCast.dmg)
+      - name: Carry forward the other platforms' downloads
         if: ${{ github.event.inputs.channel != 'dev' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Best-effort: never fail the release over the carried download.
+          # A new release takes over /releases/latest, and the docs download buttons all
+          # point at /releases/latest/download/<asset>. So EVERY platform's asset has to
+          # ride along on every prod release, or the other platforms' buttons 404 the
+          # moment this one publishes. That is exactly what happened on win-v1.0.9+23,
+          # which carried only CrowdCast.dmg and took both Linux buttons down with it.
+          # The macOS publisher and linux-release.yml already carry the full set.
+          # Best-effort: never fail the release over a carried download.
           $repo = "${{ github.repository }}"
-          $dmgTag = $null
+          $wanted = @('CrowdCast.dmg', 'crowd-cast-agent-x86_64', 'install-linux.sh', 'logo.png')
           try {
             $tags = (gh release list --repo $repo --limit 40 --json tagName,createdAt |
               ConvertFrom-Json | Sort-Object { [datetime]$_.createdAt } -Descending).tagName
-            foreach ($t in $tags) {
-              $names = (gh release view $t --repo $repo --json assets | ConvertFrom-Json).assets.name
-              if ($names -contains 'CrowdCast.dmg') { $dmgTag = $t; break }
-            }
-            if ($dmgTag) {
-              gh release download $dmgTag --repo $repo --pattern 'CrowdCast.dmg' --dir dist
-              Write-Host "Carried forward CrowdCast.dmg from $dmgTag"
-            } else {
-              Write-Host "No macOS CrowdCast.dmg found yet; shipping Windows-only (mac button stays 404 until macOS releases)."
+            # Cache each release's asset names: without it this re-queries every release
+            # once per wanted asset.
+            $assetsByTag = @{}
+            foreach ($name in $wanted) {
+              $srcTag = $null
+              foreach ($t in $tags) {
+                if (-not $assetsByTag.ContainsKey($t)) {
+                  $assetsByTag[$t] = (gh release view $t --repo $repo --json assets | ConvertFrom-Json).assets.name
+                }
+                if ($assetsByTag[$t] -contains $name) { $srcTag = $t; break }
+              }
+              if ($srcTag) {
+                gh release download $srcTag --repo $repo --pattern $name --dir dist
+                Write-Host "Carried forward $name from $srcTag"
+              } else {
+                Write-Host "No $name in any release yet; that platform's button stays 404 until it releases."
+              }
             }
           } catch {
             Write-Host "Carry-forward skipped (non-fatal): $_"
@@ -190,12 +204,15 @@ jobs:
 
             ## What's changed
             <!-- Add the user-facing changes for this release. -->
-          # CrowdCast.dmg is carried forward (above) and may be absent on a very
-          # first release, so do not fail if it is missing.
+          # Everything but the .exe is carried forward (above) and may be absent on a
+          # very first release, so do not fail if one is missing.
           fail_on_unmatched_files: false
           files: |
             dist/crowd-cast-setup.exe
             dist/CrowdCast.dmg
+            dist/crowd-cast-agent-x86_64
+            dist/install-linux.sh
+            dist/logo.png
 
       - name: Configure AWS credentials
         # dev builds never publish an appcast, so no AWS access is needed.
