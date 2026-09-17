@@ -156,6 +156,26 @@ fn main() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    // On Windows, suppress the loader's hard-error dialogs before any libobs or
+    // graphics initialization. OBS's hardware-encoder plugins probe for optional
+    // encoders by dynamically loading system DLLs (e.g. obs-nvenc.dll LoadLibrary's
+    // "nvEncodeAPI64.dll"). A *missing* DLL fails cleanly and OBS degrades down the
+    // NVENC -> AMF -> QSV -> x264 fallback chain, but a *corrupt* one (a half-finished
+    // NVIDIA driver update leaves nvEncodeAPI64.dll damaged, STATUS_INVALID_IMAGE_FORMAT
+    // 0xc000012f) trips the Windows loader into a modal "Bad Image" dialog that blocks
+    // launch. SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX makes the loader return the
+    // failure to OBS's LoadLibrary instead, so a damaged optional-encoder DLL degrades to
+    // a graceful fallback rather than a blocking popup. We deliberately do NOT set
+    // SEM_NOGPFAULTERRORBOX: Windows Error Reporting stays enabled for genuine crashes,
+    // which the crash handler initialized just below relies on.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Diagnostics::Debug::{
+            SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOOPENFILEERRORBOX,
+        };
+        let _ = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    }
+
     // Initialize logging
     let _log_guard = logging::init_logging()?;
 
