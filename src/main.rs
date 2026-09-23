@@ -469,6 +469,9 @@ fn main() -> Result<()> {
 
     // Bootstrap OBS binaries if needed
     info!("Bootstrapping OBS binaries...");
+    // On the NVIDIA proprietary driver, OBS's DMA-BUF screencast import renders black; force the
+    // bundled obs-pipewire plugin onto shared-memory buffers before it initializes.
+    capture::force_pipewire_shm_if_needed();
     let mut capture_ctx =
         match runtime.block_on(capture::CaptureContext::new(get_output_directory(&config))) {
             Ok(ctx) => ctx,
