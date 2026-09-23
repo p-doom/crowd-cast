@@ -104,6 +104,7 @@ add_obs_plugin(linux-pipewire PLATFORMS LINUX FREEBSD OPENBSD)
 add_obs_plugin(linux-pulseaudio PLATFORMS LINUX FREEBSD OPENBSD)
 add_obs_plugin(obs-ffmpeg)
 add_obs_plugin(obs-outputs)
+add_obs_plugin(obs-x264)
 PLUGINS
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX="$STAGE" -DCMAKE_PREFIX_PATH="$STAGE" \
@@ -135,7 +136,7 @@ PLUGSRC=""
 for c in "$OBSLIB_DIR/obs-plugins" "$STAGE/lib64/obs-plugins" "$STAGE/lib/obs-plugins"; do
   [ -d "$c" ] && PLUGSRC="$c" && break; done
 echo "plugin dir: $PLUGSRC"
-for p in linux-pipewire linux-capture linux-pulseaudio obs-ffmpeg obs-outputs; do
+for p in linux-pipewire linux-capture linux-pulseaudio obs-ffmpeg obs-outputs obs-x264; do
   cp -av "$PLUGSRC/$p.so" "$BUNDLE/lib/obs-plugins/" 2>/dev/null || echo "WARN: $p.so not found"
 done
 
@@ -150,7 +151,7 @@ echo "::: relocate (RUNPATH=\$ORIGIN; non-transitive -> stamp every object)"
 find "$BUNDLE/lib" -maxdepth 1 -name '*.so*' -type f -exec patchelf --set-rpath '$ORIGIN' {} \; 2>/dev/null || true
 find "$BUNDLE/lib/obs-plugins" -name '*.so' -type f -exec patchelf --set-rpath '$ORIGIN:$ORIGIN/..' {} \; 2>/dev/null || true
 
-echo "::: SMOKE GATE 1 — mp4_output (obs-outputs) + ffmpeg_muxer (obs-ffmpeg) must be registered"
+echo "::: SMOKE GATE 1 — mp4_output (obs-outputs) + ffmpeg_muxer (obs-ffmpeg) + obs_x264 (obs-x264) must be registered"
 # grep -a directly on the file (NOT `strings | grep -q`): under `set -o pipefail`, grep -q
 # closes the pipe on first match, strings gets SIGPIPE (141), and the pipeline reports
 # failure even though the match succeeded -- a false negative. grep -a on a file avoids it.
@@ -158,7 +159,9 @@ grep -aq "mp4_output" "$BUNDLE/lib/obs-plugins/obs-outputs.so" \
   || { echo "FATAL: mp4_output absent from obs-outputs.so — bundle would repeat the recording bug"; exit 3; }
 grep -aq "ffmpeg_muxer" "$BUNDLE/lib/obs-plugins/obs-ffmpeg.so" \
   || { echo "FATAL: ffmpeg_muxer absent from obs-ffmpeg.so"; exit 3; }
-echo "OK: mp4_output + ffmpeg_muxer present"
+grep -aq "obs_x264" "$BUNDLE/lib/obs-plugins/obs-x264.so" 2>/dev/null \
+  || { echo "FATAL: obs-x264.so missing or has no obs_x264 encoder — recording would have no video encoder"; exit 3; }
+echo "OK: mp4_output + ffmpeg_muxer + obs_x264 present"
 
 echo "::: max glibc symbol required by libobs (forward-compat audit)"
 objdump -T "$BUNDLE/lib/"libobs.so* 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 || true
