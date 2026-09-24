@@ -3455,8 +3455,15 @@ unintended app video."
         // Recover pending uploads from previous session
         if self.uploader.is_configured() {
             let mut pending = read_pending_uploads();
-            let known: HashSet<String> = pending.iter().map(|e| e.chunk_id.clone()).collect();
-            let adopted = adopt_orphaned_segments(&self.output_dir, &known);
+            // Only when uploads delete their files is "still on disk" a proxy for "not yet
+            // uploaded"; with delete_after_upload off every finished segment would be
+            // re-adopted and re-uploaded on each restart.
+            let adopted = if self.delete_after_upload {
+                let known: HashSet<String> = pending.iter().map(|e| e.chunk_id.clone()).collect();
+                adopt_orphaned_segments(&self.output_dir, &known)
+            } else {
+                Vec::new()
+            };
             if !adopted.is_empty() {
                 warn!(
                     "Adopted {} orphaned segment(s) from {:?} into the upload queue (no manifest entry pointed at them)",
