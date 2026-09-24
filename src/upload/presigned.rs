@@ -120,13 +120,32 @@ impl Uploader {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
 
-        let presign_response: PresignResponse = req
+        let response = req
             .send()
             .await
-            .context("Failed to request pre-signed URL")?
-            .json()
+            .context("Failed to request pre-signed URL")?;
+        let status = response.status();
+        let body = response
+            .text()
             .await
-            .context("Failed to parse pre-signed URL response")?;
+            .context("Failed to read pre-signed URL response")?;
+        // Keep the status and (a slice of) the body in the error: a gateway or Lambda rejection
+        // used to surface only as "missing field `uploadUrl`", which hid the real cause.
+        let preview = || body.chars().take(300).collect::<String>();
+        if !status.is_success() {
+            anyhow::bail!(
+                "Pre-signed URL request returned HTTP {} — {}",
+                status,
+                preview()
+            );
+        }
+        let presign_response: PresignResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "Failed to parse pre-signed URL response (HTTP {}): {}",
+                status,
+                preview()
+            )
+        })?;
 
         Ok(presign_response)
     }

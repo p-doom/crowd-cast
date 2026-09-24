@@ -11,9 +11,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -895,6 +895,59 @@ fn retain_unpurged_pending_uploads(
     entries.len() != before
 }
 
+/// Finished segments on disk that no manifest entry points at. A finished segment is written
+/// as `input_<session>_seg<NNNN>.msgpack` (plus, normally, `recording_<same>.mp4`) and put in
+/// the manifest in the same breath, so such a pair without an entry means an earlier build
+/// dropped it — the retry give-up that used to remove entries after two hours, or a manifest
+/// write that failed. Adopting them on startup turns every such loss that still has its files
+/// into a plain late upload.
+///
+/// `_partial_` flush files belong to the segment currently recording and are skipped; so is a
+/// video with no events file (a segment killed mid-recording has nothing to upload it under).
+fn adopt_orphaned_segments(
+    dir: &Path,
+    known_chunk_ids: &HashSet<String>,
+) -> Vec<PendingUploadEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut adopted = Vec::new();
+    for entry in entries.flatten() {
+        let input_path = entry.path();
+        let Some(stem) = input_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("input_"))
+            .and_then(|n| n.strip_suffix(".msgpack"))
+        else {
+            continue;
+        };
+        if stem.contains("_partial_") || known_chunk_ids.contains(stem) {
+            continue;
+        }
+        let Some(seg_at) = stem.rfind("_seg") else {
+            continue;
+        };
+        let video_path = dir.join(format!("recording_{stem}.mp4"));
+        let buffered_at_epoch_s = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        adopted.push(PendingUploadEntry {
+            chunk_id: stem.to_string(),
+            session_id: stem[..seg_at].to_string(),
+            video_path: video_path.exists().then_some(video_path),
+            input_path,
+            buffered_at_epoch_s,
+        });
+    }
+    adopted.sort_by(|a, b| a.chunk_id.cmp(&b.chunk_id));
+    adopted
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusKind {
     Idle,
@@ -1007,6 +1060,13 @@ const MAX_TRANSITION_INPUT_EVENTS: usize = 512;
 /// How long a finished segment is held before upload, so the panic button
 /// ("delete last 10 minutes") can still retract it.
 const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
+
+/// Whether a segment that fails to upload is held — in the retry queue and the on-disk
+/// manifest — until it succeeds, instead of being dropped after a two-hour retry window, and
+/// whether finished segment files with no manifest entry are adopted on startup. Live on macOS
+/// only until the same behaviour has been exercised on Windows and Linux hardware; the code
+/// compiles and is checked on every platform.
+const HOLD_SEGMENTS_UNTIL_UPLOADED: bool = cfg!(target_os = "macos");
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -3072,7 +3132,15 @@ unintended app video."
         uploads_paused: Arc<AtomicBool>,
     ) {
         const BASE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
-        const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2 * 60 * 60);
+        // Upper bound on the wait between attempts. Where segments are held until uploaded
+        // there is no give-up, so this alone governs how fast a machine drains once it is back
+        // online — fifteen minutes, with the jitter below spreading the reconnect burst.
+        // Elsewhere the previous two-hour cap and two-hour give-up window still apply.
+        const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(if HOLD_SEGMENTS_UNTIL_UPLOADED {
+            15 * 60
+        } else {
+            2 * 60 * 60
+        });
         const MAX_RETRY_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
         const UPLOAD_PAUSE_NOTIFY_THRESHOLD: usize = 50;
         const MAX_CONCURRENT_UPLOADS: usize = 3;
@@ -3277,7 +3345,11 @@ unintended app video."
                             let item = entry.item;
                             let chunk_id = item.segment.chunk.chunk_id.clone();
 
-                            if now.duration_since(item.first_failed_at) >= MAX_RETRY_WINDOW {
+                            // Off macOS the previous behaviour stands: two hours after the
+                            // first failure the segment is dropped from the manifest.
+                            if !HOLD_SEGMENTS_UNTIL_UPLOADED
+                                && now.duration_since(item.first_failed_at) >= MAX_RETRY_WINDOW
+                            {
                                 warn!(
                                     "Giving up on segment {} after {} attempts (retry window exceeded)",
                                     chunk_id, item.attempts
@@ -3414,7 +3486,25 @@ unintended app video."
 
         // Recover pending uploads from previous session
         if self.uploader.is_configured() {
-            let pending = read_pending_uploads();
+            let mut pending = read_pending_uploads();
+            // Only when uploads delete their files is "still on disk" a proxy for "not yet
+            // uploaded"; with delete_after_upload off every finished segment would be
+            // re-adopted and re-uploaded on each restart.
+            let adopted = if HOLD_SEGMENTS_UNTIL_UPLOADED && self.delete_after_upload {
+                let known: HashSet<String> = pending.iter().map(|e| e.chunk_id.clone()).collect();
+                adopt_orphaned_segments(&self.output_dir, &known)
+            } else {
+                Vec::new()
+            };
+            if !adopted.is_empty() {
+                warn!(
+                    "Adopted {} orphaned segment(s) from {:?} into the upload queue (no manifest entry pointed at them)",
+                    adopted.len(),
+                    self.output_dir
+                );
+                pending.extend(adopted);
+                write_pending_uploads(&pending);
+            }
             if !pending.is_empty() {
                 let mut recovered = 0;
                 let mut cleaned = 0;
@@ -3422,9 +3512,9 @@ unintended app video."
                 for entry in &pending {
                     let input_exists = entry.input_path.exists();
                     if !input_exists {
-                        debug!(
-                            "Skipping orphaned segment {} (msgpack missing)",
-                            entry.chunk_id
+                        warn!(
+                            "Dropping segment {} from the upload manifest: its events file {:?} is gone",
+                            entry.chunk_id, entry.input_path
                         );
                         cleaned += 1;
                         continue;
@@ -5714,6 +5804,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["keep-1", "keep-2"]
         );
+    }
+
+    #[test]
+    fn adopts_orphaned_segment_files_and_skips_live_and_known_ones() {
+        let dir = test_dir("adopt-orphans");
+        let touch = |name: &str| std::fs::write(dir.join(name), b"x").unwrap();
+        // events + video → adopted with the video
+        touch("input_aaaa_seg0001.msgpack");
+        touch("recording_aaaa_seg0001.mp4");
+        // events only (video already purged) → adopted keylog-only
+        touch("input_aaaa_seg0002.msgpack");
+        // flush files of the segment currently recording, and its video → skipped
+        touch("input_bbbb_seg0003_partial_1700000000.msgpack");
+        touch("recording_bbbb_seg0003.mp4");
+        // already in the manifest → skipped
+        touch("input_cccc_seg0004.msgpack");
+        touch("recording_cccc_seg0004.mp4");
+        let known: HashSet<String> = ["cccc_seg0004".to_string()].into_iter().collect();
+
+        let adopted = adopt_orphaned_segments(&dir, &known);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            adopted
+                .iter()
+                .map(|e| e.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aaaa_seg0001", "aaaa_seg0002"]
+        );
+        assert_eq!(adopted[0].session_id, "aaaa");
+        assert!(adopted[0]
+            .video_path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("recording_aaaa_seg0001.mp4")));
+        assert!(adopted[1].video_path.is_none());
+        assert!(adopted[0].input_path.ends_with("input_aaaa_seg0001.msgpack"));
+        assert!(adopted.iter().all(|e| e.buffered_at_epoch_s > 0));
+    }
+
+    #[test]
+    fn segments_are_held_until_uploaded_on_macos_only() {
+        assert_eq!(HOLD_SEGMENTS_UNTIL_UPLOADED, cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn adopting_from_a_missing_directory_yields_nothing() {
+        let dir = test_dir("adopt-missing").join("does-not-exist");
+        assert!(adopt_orphaned_segments(&dir, &HashSet::new()).is_empty());
     }
 
     #[test]
