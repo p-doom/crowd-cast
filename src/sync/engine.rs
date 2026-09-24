@@ -992,6 +992,7 @@ struct UploadResult {
     chunk_id: String,
     segment: CompletedSegment,
     attempts: u32,
+    first_failed_at: Instant,
     result: Result<()>,
 }
 
@@ -999,6 +1000,7 @@ struct UploadResult {
 struct RetryItem {
     segment: CompletedSegment,
     attempts: u32,
+    first_failed_at: Instant,
     next_attempt_at: Instant,
 }
 
@@ -1058,6 +1060,13 @@ const MAX_TRANSITION_INPUT_EVENTS: usize = 512;
 /// How long a finished segment is held before upload, so the panic button
 /// ("delete last 10 minutes") can still retract it.
 const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
+
+/// Whether a segment that fails to upload is held — in the retry queue and the on-disk
+/// manifest — until it succeeds, instead of being dropped after a two-hour retry window, and
+/// whether finished segment files with no manifest entry are adopted on startup. Live on macOS
+/// only until the same behaviour has been exercised on Windows and Linux hardware; the code
+/// compiles and is checked on every platform.
+const HOLD_SEGMENTS_UNTIL_UPLOADED: bool = cfg!(target_os = "macos");
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -3123,12 +3132,16 @@ unintended app video."
         uploads_paused: Arc<AtomicBool>,
     ) {
         const BASE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
-        // Upper bound on the wait between attempts. There is deliberately no give-up: a
-        // segment that fails to upload stays in the queue (and in the on-disk manifest) until
-        // it succeeds, however long the machine is offline or uploads stay paused. Fifteen
-        // minutes keeps the drain quick once connectivity returns; the jitter below spreads
-        // the reconnect burst.
-        const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
+        // Upper bound on the wait between attempts. Where segments are held until uploaded
+        // there is no give-up, so this alone governs how fast a machine drains once it is back
+        // online — fifteen minutes, with the jitter below spreading the reconnect burst.
+        // Elsewhere the previous two-hour cap and two-hour give-up window still apply.
+        const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(if HOLD_SEGMENTS_UNTIL_UPLOADED {
+            15 * 60
+        } else {
+            2 * 60 * 60
+        });
+        const MAX_RETRY_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
         const UPLOAD_PAUSE_NOTIFY_THRESHOLD: usize = 50;
         const MAX_CONCURRENT_UPLOADS: usize = 3;
 
@@ -3170,6 +3183,7 @@ unintended app video."
                 segment: CompletedSegment,
                 chunk_id: String,
                 attempts: u32,
+                first_failed_at: Option<Instant>,
                 delete_after_upload: bool,
                 semaphore: Arc<tokio::sync::Semaphore>,
                 result_tx: mpsc::UnboundedSender<UploadResult>,
@@ -3207,6 +3221,7 @@ unintended app video."
                         chunk_id,
                         segment,
                         attempts,
+                        first_failed_at: first_failed_at.unwrap_or_else(Instant::now),
                         result,
                     });
                 });
@@ -3240,6 +3255,7 @@ unintended app video."
                                         item: RetryItem {
                                             segment,
                                             attempts: 0,
+                                            first_failed_at: now,
                                             next_attempt_at: now,
                                         },
                                     });
@@ -3263,6 +3279,7 @@ unintended app video."
                                     segment,
                                     chunk_id,
                                     0,
+                                    None,
                                     delete_after_upload,
                                     semaphore.clone(),
                                     result_tx.clone(),
@@ -3273,7 +3290,7 @@ unintended app video."
 
                     // Branch 2: Results from completed upload tasks
                     Some(upload_result) = result_rx.recv() => {
-                        let UploadResult { chunk_id, segment, attempts, result } = upload_result;
+                        let UploadResult { chunk_id, segment, attempts, first_failed_at, result } = upload_result;
                         match result {
                             Ok(()) => {
                                 info!("Successfully uploaded segment {}", chunk_id);
@@ -3294,6 +3311,7 @@ unintended app video."
                                 let retry_item = RetryItem {
                                     segment,
                                     attempts: attempt,
+                                    first_failed_at,
                                     next_attempt_at: now + delay,
                                 };
                                 sequence = sequence.wrapping_add(1);
@@ -3327,6 +3345,19 @@ unintended app video."
                             let item = entry.item;
                             let chunk_id = item.segment.chunk.chunk_id.clone();
 
+                            // Off macOS the previous behaviour stands: two hours after the
+                            // first failure the segment is dropped from the manifest.
+                            if !HOLD_SEGMENTS_UNTIL_UPLOADED
+                                && now.duration_since(item.first_failed_at) >= MAX_RETRY_WINDOW
+                            {
+                                warn!(
+                                    "Giving up on segment {} after {} attempts (retry window exceeded)",
+                                    chunk_id, item.attempts
+                                );
+                                remove_pending_upload(&chunk_id);
+                                continue;
+                            }
+
                             info!(
                                 "Retrying upload for segment {} (attempt {})",
                                 chunk_id,
@@ -3338,6 +3369,7 @@ unintended app video."
                                 item.segment,
                                 chunk_id,
                                 item.attempts,
+                                Some(item.first_failed_at),
                                 delete_after_upload,
                                 semaphore.clone(),
                                 result_tx.clone(),
@@ -3458,7 +3490,7 @@ unintended app video."
             // Only when uploads delete their files is "still on disk" a proxy for "not yet
             // uploaded"; with delete_after_upload off every finished segment would be
             // re-adopted and re-uploaded on each restart.
-            let adopted = if self.delete_after_upload {
+            let adopted = if HOLD_SEGMENTS_UNTIL_UPLOADED && self.delete_after_upload {
                 let known: HashSet<String> = pending.iter().map(|e| e.chunk_id.clone()).collect();
                 adopt_orphaned_segments(&self.output_dir, &known)
             } else {
@@ -5809,6 +5841,11 @@ mod tests {
         assert!(adopted[1].video_path.is_none());
         assert!(adopted[0].input_path.ends_with("input_aaaa_seg0001.msgpack"));
         assert!(adopted.iter().all(|e| e.buffered_at_epoch_s > 0));
+    }
+
+    #[test]
+    fn segments_are_held_until_uploaded_on_macos_only() {
+        assert_eq!(HOLD_SEGMENTS_UNTIL_UPLOADED, cfg!(target_os = "macos"));
     }
 
     #[test]
