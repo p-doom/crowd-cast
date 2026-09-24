@@ -11,9 +11,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -895,6 +895,59 @@ fn retain_unpurged_pending_uploads(
     entries.len() != before
 }
 
+/// Finished segments on disk that no manifest entry points at. A finished segment is written
+/// as `input_<session>_seg<NNNN>.msgpack` (plus, normally, `recording_<same>.mp4`) and put in
+/// the manifest in the same breath, so such a pair without an entry means an earlier build
+/// dropped it — the retry give-up that used to remove entries after two hours, or a manifest
+/// write that failed. Adopting them on startup turns every such loss that still has its files
+/// into a plain late upload.
+///
+/// `_partial_` flush files belong to the segment currently recording and are skipped; so is a
+/// video with no events file (a segment killed mid-recording has nothing to upload it under).
+fn adopt_orphaned_segments(
+    dir: &Path,
+    known_chunk_ids: &HashSet<String>,
+) -> Vec<PendingUploadEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut adopted = Vec::new();
+    for entry in entries.flatten() {
+        let input_path = entry.path();
+        let Some(stem) = input_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("input_"))
+            .and_then(|n| n.strip_suffix(".msgpack"))
+        else {
+            continue;
+        };
+        if stem.contains("_partial_") || known_chunk_ids.contains(stem) {
+            continue;
+        }
+        let Some(seg_at) = stem.rfind("_seg") else {
+            continue;
+        };
+        let video_path = dir.join(format!("recording_{stem}.mp4"));
+        let buffered_at_epoch_s = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        adopted.push(PendingUploadEntry {
+            chunk_id: stem.to_string(),
+            session_id: stem[..seg_at].to_string(),
+            video_path: video_path.exists().then_some(video_path),
+            input_path,
+            buffered_at_epoch_s,
+        });
+    }
+    adopted.sort_by(|a, b| a.chunk_id.cmp(&b.chunk_id));
+    adopted
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusKind {
     Idle,
@@ -939,7 +992,6 @@ struct UploadResult {
     chunk_id: String,
     segment: CompletedSegment,
     attempts: u32,
-    first_failed_at: Instant,
     result: Result<()>,
 }
 
@@ -947,7 +999,6 @@ struct UploadResult {
 struct RetryItem {
     segment: CompletedSegment,
     attempts: u32,
-    first_failed_at: Instant,
     next_attempt_at: Instant,
 }
 
@@ -3072,8 +3123,12 @@ unintended app video."
         uploads_paused: Arc<AtomicBool>,
     ) {
         const BASE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
-        const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2 * 60 * 60);
-        const MAX_RETRY_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
+        // Upper bound on the wait between attempts. There is deliberately no give-up: a
+        // segment that fails to upload stays in the queue (and in the on-disk manifest) until
+        // it succeeds, however long the machine is offline or uploads stay paused. Fifteen
+        // minutes keeps the drain quick once connectivity returns; the jitter below spreads
+        // the reconnect burst.
+        const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
         const UPLOAD_PAUSE_NOTIFY_THRESHOLD: usize = 50;
         const MAX_CONCURRENT_UPLOADS: usize = 3;
 
@@ -3115,7 +3170,6 @@ unintended app video."
                 segment: CompletedSegment,
                 chunk_id: String,
                 attempts: u32,
-                first_failed_at: Option<Instant>,
                 delete_after_upload: bool,
                 semaphore: Arc<tokio::sync::Semaphore>,
                 result_tx: mpsc::UnboundedSender<UploadResult>,
@@ -3153,7 +3207,6 @@ unintended app video."
                         chunk_id,
                         segment,
                         attempts,
-                        first_failed_at: first_failed_at.unwrap_or_else(Instant::now),
                         result,
                     });
                 });
@@ -3187,7 +3240,6 @@ unintended app video."
                                         item: RetryItem {
                                             segment,
                                             attempts: 0,
-                                            first_failed_at: now,
                                             next_attempt_at: now,
                                         },
                                     });
@@ -3211,7 +3263,6 @@ unintended app video."
                                     segment,
                                     chunk_id,
                                     0,
-                                    None,
                                     delete_after_upload,
                                     semaphore.clone(),
                                     result_tx.clone(),
@@ -3222,7 +3273,7 @@ unintended app video."
 
                     // Branch 2: Results from completed upload tasks
                     Some(upload_result) = result_rx.recv() => {
-                        let UploadResult { chunk_id, segment, attempts, first_failed_at, result } = upload_result;
+                        let UploadResult { chunk_id, segment, attempts, result } = upload_result;
                         match result {
                             Ok(()) => {
                                 info!("Successfully uploaded segment {}", chunk_id);
@@ -3243,7 +3294,6 @@ unintended app video."
                                 let retry_item = RetryItem {
                                     segment,
                                     attempts: attempt,
-                                    first_failed_at,
                                     next_attempt_at: now + delay,
                                 };
                                 sequence = sequence.wrapping_add(1);
@@ -3277,15 +3327,6 @@ unintended app video."
                             let item = entry.item;
                             let chunk_id = item.segment.chunk.chunk_id.clone();
 
-                            if now.duration_since(item.first_failed_at) >= MAX_RETRY_WINDOW {
-                                warn!(
-                                    "Giving up on segment {} after {} attempts (retry window exceeded)",
-                                    chunk_id, item.attempts
-                                );
-                                remove_pending_upload(&chunk_id);
-                                continue;
-                            }
-
                             info!(
                                 "Retrying upload for segment {} (attempt {})",
                                 chunk_id,
@@ -3297,7 +3338,6 @@ unintended app video."
                                 item.segment,
                                 chunk_id,
                                 item.attempts,
-                                Some(item.first_failed_at),
                                 delete_after_upload,
                                 semaphore.clone(),
                                 result_tx.clone(),
@@ -3414,7 +3454,18 @@ unintended app video."
 
         // Recover pending uploads from previous session
         if self.uploader.is_configured() {
-            let pending = read_pending_uploads();
+            let mut pending = read_pending_uploads();
+            let known: HashSet<String> = pending.iter().map(|e| e.chunk_id.clone()).collect();
+            let adopted = adopt_orphaned_segments(&self.output_dir, &known);
+            if !adopted.is_empty() {
+                warn!(
+                    "Adopted {} orphaned segment(s) from {:?} into the upload queue (no manifest entry pointed at them)",
+                    adopted.len(),
+                    self.output_dir
+                );
+                pending.extend(adopted);
+                write_pending_uploads(&pending);
+            }
             if !pending.is_empty() {
                 let mut recovered = 0;
                 let mut cleaned = 0;
@@ -3422,9 +3473,9 @@ unintended app video."
                 for entry in &pending {
                     let input_exists = entry.input_path.exists();
                     if !input_exists {
-                        debug!(
-                            "Skipping orphaned segment {} (msgpack missing)",
-                            entry.chunk_id
+                        warn!(
+                            "Dropping segment {} from the upload manifest: its events file {:?} is gone",
+                            entry.chunk_id, entry.input_path
                         );
                         cleaned += 1;
                         continue;
@@ -5714,6 +5765,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["keep-1", "keep-2"]
         );
+    }
+
+    #[test]
+    fn adopts_orphaned_segment_files_and_skips_live_and_known_ones() {
+        let dir = test_dir("adopt-orphans");
+        let touch = |name: &str| std::fs::write(dir.join(name), b"x").unwrap();
+        // events + video → adopted with the video
+        touch("input_aaaa_seg0001.msgpack");
+        touch("recording_aaaa_seg0001.mp4");
+        // events only (video already purged) → adopted keylog-only
+        touch("input_aaaa_seg0002.msgpack");
+        // flush files of the segment currently recording, and its video → skipped
+        touch("input_bbbb_seg0003_partial_1700000000.msgpack");
+        touch("recording_bbbb_seg0003.mp4");
+        // already in the manifest → skipped
+        touch("input_cccc_seg0004.msgpack");
+        touch("recording_cccc_seg0004.mp4");
+        let known: HashSet<String> = ["cccc_seg0004".to_string()].into_iter().collect();
+
+        let adopted = adopt_orphaned_segments(&dir, &known);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            adopted
+                .iter()
+                .map(|e| e.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aaaa_seg0001", "aaaa_seg0002"]
+        );
+        assert_eq!(adopted[0].session_id, "aaaa");
+        assert!(adopted[0]
+            .video_path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("recording_aaaa_seg0001.mp4")));
+        assert!(adopted[1].video_path.is_none());
+        assert!(adopted[0].input_path.ends_with("input_aaaa_seg0001.msgpack"));
+        assert!(adopted.iter().all(|e| e.buffered_at_epoch_s > 0));
+    }
+
+    #[test]
+    fn adopting_from_a_missing_directory_yields_nothing() {
+        let dir = test_dir("adopt-missing").join("does-not-exist");
+        assert!(adopt_orphaned_segments(&dir, &HashSet::new()).is_empty());
     }
 
     #[test]
