@@ -13,6 +13,9 @@ mod auth;
 mod capture;
 mod config;
 mod crash;
+// Windows-only native-crash & session diagnostics (PDOOM-1448).
+#[cfg(target_os = "windows")]
+mod crash_win;
 mod data;
 mod input;
 mod installer;
@@ -467,6 +470,13 @@ fn main() -> Result<()> {
         warn!("Screen Recording permission not granted - capture may not work");
     }
 
+    // Sentinel for "the previous run did not exit cleanly" (PDOOM-1448, part 3). Created
+    // here, past the wizard/setup re-exec, before OBS bootstrap + init (the native-crash
+    // hotspot) and the whole run loop. Windows-only behavior; a no-op on other platforms.
+    // Every intentional exit below clears it, so its presence next launch means a native
+    // crash, a kill, or a logoff/shutdown.
+    crash::begin_run_marker(&log_dir);
+
     // Bootstrap OBS binaries if needed
     info!("Bootstrapping OBS binaries...");
     let mut capture_ctx =
@@ -474,6 +484,7 @@ fn main() -> Result<()> {
             Ok(ctx) => ctx,
             Err(e) => {
                 error!("Failed to bootstrap OBS binaries: {}", e);
+                crash::clear_run_marker();
                 std::process::exit(1);
             }
         };
@@ -541,6 +552,7 @@ fn main() -> Result<()> {
                     std::thread::sleep(std::time::Duration::from_secs(delay));
                 } else {
                     error!("Failed to {}: {}", step, e);
+                    crash::clear_run_marker();
                     std::process::exit(1);
                 }
             }
@@ -674,6 +686,12 @@ fn main() -> Result<()> {
             }
         }
 
+        // Watch for logoff/shutdown via a hidden top-level window (PDOOM-1448, part 4).
+        // The console-control handler above does NOT receive WM_QUERYENDSESSION/
+        // WM_ENDSESSION for a GUI-subsystem process, so a session end would otherwise be
+        // indistinguishable from a native crash.
+        crash_win::watch_session_end();
+
         // Register for resume-from-suspend so a recording that slept gets restarted fresh
         // (keylog↔video re-zero); the engine's wall-clock-gap check is the fallback if this
         // registration fails. Callback mode needs no window. The subscribe-params struct is
@@ -770,6 +788,11 @@ fn main() -> Result<()> {
     let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst) || ui::was_quit_requested();
     #[cfg(no_tray)]
     let intentional = INTENTIONAL_EXIT.load(Ordering::SeqCst);
+
+    // This is a logged, deliberate termination (either exit code), so record it as a
+    // clean exit: the run marker must not persist and be misread as a native crash on
+    // the next launch (PDOOM-1448, part 3).
+    crash::clear_run_marker();
 
     if intentional {
         info!("Intentional shutdown — exiting with code 0 (no restart)");
