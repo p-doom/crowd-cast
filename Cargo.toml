@@ -141,6 +141,12 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
+    # EXCEPTION_POINTERS + SetUnhandledExceptionFilter (the native-crash fallback filter,
+    # PDOOM-1448) live behind this feature in windows 0.58.
+    "Win32_System_Kernel",
+    # GetModuleHandleExW/GetModuleFileNameW resolve the faulting module of a native crash,
+    # and GetModuleHandleW gives the session-end watcher window its HINSTANCE (PDOOM-1448).
+    "Win32_System_LibraryLoader",
     "Win32_System_Power",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",

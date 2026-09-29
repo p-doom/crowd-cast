@@ -120,6 +120,11 @@ fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
 fn restart_process() -> ! {
     info!("Restarting process for fresh OBS context...");
 
+    // Intentional, logged restart; clear the "run in progress" marker so the relaunched
+    // process does not misread this handoff as an unclean exit (PDOOM-1448, part 3). Runs
+    // before the macOS branch below, which never returns. A no-op off Windows.
+    crate::crash::clear_run_marker();
+
     #[cfg(all(target_os = "macos", not(no_tray)))]
     {
         restart_macos_process();

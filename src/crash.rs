@@ -23,6 +23,16 @@ static CRASH_LOG_FD: OnceLock<std::os::unix::io::RawFd> = OnceLock::new();
 
 const CRASH_LOG_FILENAME: &str = "crash.log";
 
+/// Filename of the "run in progress" sentinel (PDOOM-1448, part 3). Its presence at
+/// startup means the previous run never reached an intentional exit path.
+#[cfg(target_os = "windows")]
+const RUN_MARKER_FILENAME: &str = "running.marker";
+
+/// Path to the run marker, remembered so `clear_run_marker` can delete it from any
+/// exit path without re-deriving the log dir.
+#[cfg(target_os = "windows")]
+static RUN_MARKER_PATH: OnceLock<PathBuf> = OnceLock::new();
+
 /// Initialize crash handling. Call this early in main().
 ///
 /// Sets up:
@@ -324,4 +334,103 @@ pub fn log_critical_operation(operation: &str) {
 /// Get the crash log path
 pub fn get_crash_log_path() -> Option<&'static PathBuf> {
     CRASH_LOG_PATH.get()
+}
+
+/// Append `text` to the crash log synchronously (create if needed, flush, fsync).
+///
+/// The Windows native-crash handlers (PDOOM-1448) use this to persist OBS's crash
+/// report and native-exception details to the same `crash.log` the log shipper
+/// uploads. Returns `false` before `init_crash_handler` has set the path.
+pub fn append_to_crash_log(text: &str) -> bool {
+    let Some(path) = CRASH_LOG_PATH.get() else {
+        return false;
+    };
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut file) => {
+            let _ = file.write_all(text.as_bytes());
+            let _ = file.flush();
+            let _ = file.sync_all();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Create the "previous run exited cleanly" sentinel (PDOOM-1448, part 3).
+///
+/// Writes `running.marker` (containing this run's start timestamp) next to the crash
+/// log. If it already exists, the previous run did NOT reach an intentional exit path
+/// (a native crash, a kill, or a logoff/shutdown), so we emit one WARN carrying what
+/// we can recover of it. Call once at startup, after the log directory exists.
+///
+/// Windows-only: the target platform funnels every intentional exit (tray Quit,
+/// Ctrl+C, WinSparkle update, process restart, bootstrap handoff) through paths that
+/// clear the marker, and the WM_ENDSESSION watcher covers logoff/shutdown, so the
+/// sentinel fires only on a genuine silent death. macOS (ObjC applicationShould-
+/// Terminate / Sparkle `_exit`) and Linux (uncaught SIGTERM on logout) exit through
+/// paths that bypass this Rust cleanup, so enabling it there would fire on ordinary
+/// logouts; that is left to those platforms' owners.
+pub fn begin_run_marker(log_dir: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    {
+        let marker_path = log_dir.join(RUN_MARKER_FILENAME);
+
+        if marker_path.exists() {
+            let prev_started = std::fs::read_to_string(&marker_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            let marker_modified = std::fs::metadata(&marker_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            tracing::warn!(
+                "Previous run did not exit cleanly (no intentional exit path was reached: \
+                 native crash, kill, or logoff/shutdown). Previous run started: {}; marker \
+                 last modified: {}. See crash.log for a native crash report if one was captured.",
+                prev_started,
+                marker_modified
+            );
+        }
+
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&marker_path)
+        {
+            Ok(mut file) => {
+                let _ = file.write_all(now.as_bytes());
+                let _ = file.flush();
+            }
+            Err(e) => tracing::warn!("Failed to write run marker {:?}: {}", marker_path, e),
+        }
+
+        let _ = RUN_MARKER_PATH.set(marker_path);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = log_dir;
+    }
+}
+
+/// Remove the run marker to record that this run reached an intentional exit path
+/// (PDOOM-1448, part 3). Call from every clean/known exit: normal shutdown, process
+/// restart, the OBS bootstrap handoff, and logoff/shutdown. Best-effort, idempotent,
+/// and a no-op before `begin_run_marker` ran or off Windows.
+pub fn clear_run_marker() {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(path) = RUN_MARKER_PATH.get() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }

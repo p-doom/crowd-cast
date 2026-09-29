@@ -193,6 +193,10 @@ impl CaptureContext {
                         info!(
                             "OBS binaries installed; exiting so the bootstrap updater can relaunch with OBS available"
                         );
+                        // Intentional handoff to the bootstrap updater; clear the run
+                        // marker so the relaunch is not misread as an unclean exit
+                        // (PDOOM-1448, part 3). A no-op if the marker isn't set yet.
+                        crate::crash::clear_run_marker();
                         std::process::exit(0);
                     }
 
@@ -458,6 +462,13 @@ impl CaptureContext {
         log_critical_operation("initialize: calling ObsContext::new()");
         let context = ObsContext::new(startup_info).context("Failed to create OBS context")?;
         log_critical_operation("initialize: ObsContext::new() completed");
+
+        // Own OBS's native crash report and install the fallback exception filter
+        // (PDOOM-1448, parts 1 & 2). Runs once even across display-change reinits. Must be
+        // right after ObsContext::new(): libobs-wrapper installs OBS's Win32 exception
+        // filter during context creation and routes it through the global handler we swap.
+        #[cfg(target_os = "windows")]
+        crate::crash_win::install_native_crash_handlers();
 
         info!("libobs context initialized successfully");
         self.context = Some(context);
