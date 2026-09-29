@@ -109,6 +109,22 @@ pub struct CaptureConfig {
     pub restore_tokens: HashMap<String, String>,
 }
 
+impl CaptureConfig {
+    /// Apps that drive per-app capture. Empty when capture_all is set: the
+    /// whole-screen choice wins, and a stale list must never drive video
+    /// switching (see the follow_focus guard at engine.rs:4167).
+    // Unused on macOS: the macOS arm stays on raw target_apps (bit-identical) pending the macOS
+    // sibling to PDOOM-1418, so this accessor is Windows/Linux-only on that platform.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn effective_target_apps(&self) -> &[String] {
+        if self.capture_all {
+            &[]
+        } else {
+            &self.target_apps
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputConfig {
     /// Whether to capture keyboard events

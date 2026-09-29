@@ -1265,15 +1265,33 @@ impl SyncEngine {
         };
         let pause_uploads_on_idle = config.capture.pause_uploads_on_idle;
         #[cfg(target_os = "linux")]
-        let single_active_app_capture =
-            crate::capture::is_single_active_capable() && !config.capture.target_apps.is_empty();
-        #[cfg(not(target_os = "linux"))]
+        let single_active_app_capture = crate::capture::is_single_active_capable()
+            && !config.capture.effective_target_apps().is_empty();
+        #[cfg(target_os = "windows")]
+        let single_active_app_capture = config.capture.single_active_app_capture
+            && crate::capture::is_single_active_capable()
+            && !config.capture.effective_target_apps().is_empty();
+        // macOS is left bit-identical (raw target_apps) from this Windows box; the macOS half is
+        // tracked as a sibling to PDOOM-1418 for the macOS owner to route through
+        // effective_target_apps() if the macOS settings UI can produce the contradictory config.
+        #[cfg(target_os = "macos")]
         let single_active_app_capture = config.capture.single_active_app_capture
             && crate::capture::is_single_active_capable()
             && !config.capture.target_apps.is_empty();
         let blank_video_on_untracked_app = config.capture.blank_video_on_untracked_app;
         let capture_watchdog_timeout =
             Duration::from_millis(config.capture.capture_watchdog_timeout_ms);
+        // Windows/Linux: capture_all wins and the saved list is ignored for per-app switching.
+        #[cfg(not(target_os = "macos"))]
+        if config.capture.capture_all && !config.capture.target_apps.is_empty() {
+            info!(
+                "capture.capture_all=true; ignoring the saved target_apps list for per-app video \
+switching. The whole-screen choice wins, so recording stays full-screen; the list is kept in config \
+and returns to effect when capture_all is unticked."
+            );
+        }
+        // macOS keeps its prior warning verbatim (bit-identical) pending the sibling ticket.
+        #[cfg(target_os = "macos")]
         if config.capture.capture_all && single_active_app_capture {
             warn!(
                 "capture.capture_all=true with non-empty target_apps and single_active_app_capture enabled \
