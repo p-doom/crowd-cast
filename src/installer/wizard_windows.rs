@@ -142,6 +142,25 @@ fn load_logo_icon() -> Option<nwg::Icon> {
     Some(icon)
 }
 
+/// The directory the running agent was installed into (parent of its own exe),
+/// so `list_windowed_apps` can exclude any window whose exe lives there too --
+/// a second, path-based safety net alongside the name check below for our own
+/// process family (e.g. a future updater/helper binary with a different stem).
+/// Compared case-insensitively as a string prefix since Windows paths are
+/// case-insensitive but `Path` comparison is not.
+fn is_under_own_install_dir(full_exe: &str) -> bool {
+    static INSTALL_DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let dir = INSTALL_DIR.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_string_lossy().to_ascii_lowercase()))
+    });
+    match dir {
+        Some(d) if !d.is_empty() => full_exe.to_ascii_lowercase().starts_with(d.as_str()),
+        _ => false,
+    }
+}
+
 fn list_windowed_apps() -> Vec<(String, String)> {
     use libobs_simple::sources::windows::{WindowCaptureSourceBuilder, WindowSearchMode};
     use std::collections::BTreeMap;
@@ -165,8 +184,13 @@ fn list_windowed_apps() -> Vec<(String, String)> {
                 continue;
             }
             let exe_l = exe.to_ascii_lowercase();
+            // Exclude our own process family: the agent itself, the installer
+            // whose transient window can still be open when the wizard runs
+            // (PDOOM-1449), and (as a path-based fallback) anything else running
+            // out of our own install directory.
             if SYSTEM_EXES.contains(&exe_l.as_str())
-                || exe_l.as_str() == crate::config::agent_self_identifier()
+                || crate::config::is_agent_self(&exe_l)
+                || is_under_own_install_dir(&w.0.full_exe)
             {
                 continue;
             }
@@ -181,9 +205,7 @@ fn list_windowed_apps() -> Vec<(String, String)> {
         // Fallback: running processes (noisier, but better than an empty list).
         for app in crate::capture::list_capturable_apps() {
             let exe_l = app.bundle_id.to_ascii_lowercase();
-            if SYSTEM_EXES.contains(&exe_l.as_str())
-                || exe_l.as_str() == crate::config::agent_self_identifier()
-            {
+            if SYSTEM_EXES.contains(&exe_l.as_str()) || crate::config::is_agent_self(&exe_l) {
                 continue;
             }
             by_exe.entry(exe_l).or_insert(app.name);
