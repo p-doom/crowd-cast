@@ -3967,13 +3967,14 @@ unintended app video."
 
         info!("Saved {} events to {:?}", events.len(), input_path);
 
-        // Stop the current recording
-        let _session = obs_call_with_watchdog(
-            || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
-            "rotate_segment: stop_recording",
-        )?;
-
-        // Create completed segment for upload
+        // On Windows/Linux, register the completed segment for upload BEFORE stopping OBS. The
+        // libobs output-stop below can hang (encoder flush / MP4 finalization wedges on Windows,
+        // ~8.7% of rotations); when it does, the watchdog restarts the whole process. Persisting
+        // the pending-upload manifest entry first lets the restart's recovery pass re-queue the
+        // segment (video and input are already on disk) instead of orphaning it. Previously this
+        // ran only AFTER stop returned, so a hung stop dropped the segment and lost it (PDOOM-1413).
+        // macOS keeps the original order (register after stop) to stay bit-identical; tracked as the
+        // macOS sibling to PDOOM-1413.
         let chunk = CompletedChunk {
             chunk_id: segment_id.clone(),
             session_id: main_session_id.clone(),
@@ -3982,9 +3983,22 @@ unintended app video."
             start_time_us,
             end_time_us,
         };
-
-        // Buffer for delayed upload (10-minute hold for panic button)
         let segment = CompletedSegment { chunk, input_path };
+
+        // Buffer for delayed upload (10-minute hold for panic button). Windows/Linux: before stop.
+        #[cfg(not(target_os = "macos"))]
+        self.buffer_segment_for_upload(segment, segment_id);
+
+        // Stop the current recording. If this hangs, the watchdog restarts the process and the
+        // segment registered above (Windows/Linux) is recovered on the next launch rather than
+        // destroyed.
+        let _session = obs_call_with_watchdog(
+            || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
+            "rotate_segment: stop_recording",
+        )?;
+
+        // macOS: original order, register the segment after stop.
+        #[cfg(target_os = "macos")]
         self.buffer_segment_for_upload(segment, segment_id);
 
         // Clear recording state before starting new segment
@@ -4363,32 +4377,70 @@ unintended app video."
 
             info!("Saved {} events to {:?}", events.len(), input_path);
 
-            // Stop libobs recording — watchdog restarts the process if OBS hangs.
-            let session = obs_call_with_watchdog(
-                || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
-                "stop_recording: with_upload",
-            )?;
-            if let Some(session) = session {
-                info!(
-                    "Recording stopped: session={}, output={:?}",
-                    session.session_id, session.output_path
-                );
+            // Windows/Linux: register the final segment for upload BEFORE stopping OBS. As in
+            // rotate_segment, a hung output-stop triggers a watchdog process restart; persisting the
+            // manifest entry first lets recovery re-queue the segment on the next launch instead of
+            // losing it (PDOOM-1413). macOS keeps the original order (stop, then register) to stay
+            // bit-identical; tracked as the macOS sibling to PDOOM-1413.
+            #[cfg(not(target_os = "macos"))]
+            {
+                if self.uploader.is_configured() {
+                    let main_session_id = self.main_session_id.clone().unwrap_or_default();
+                    let chunk = CompletedChunk {
+                        chunk_id: segment_id.clone(),
+                        session_id: main_session_id,
+                        events,
+                        video_path,
+                        start_time_us,
+                        end_time_us,
+                    };
+
+                    let segment = CompletedSegment { chunk, input_path };
+                    self.buffer_segment_for_upload(segment, segment_id);
+                }
+
+                // Stop libobs recording. The watchdog restarts the process if OBS hangs; the segment
+                // registered above is then recovered on the next launch rather than destroyed.
+                let session = obs_call_with_watchdog(
+                    || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
+                    "stop_recording: with_upload",
+                )?;
+                if let Some(session) = session {
+                    info!(
+                        "Recording stopped: session={}, output={:?}",
+                        session.session_id, session.output_path
+                    );
+                }
             }
 
-            // Queue final segment for upload
-            if self.uploader.is_configured() {
-                let main_session_id = self.main_session_id.clone().unwrap_or_default();
-                let chunk = CompletedChunk {
-                    chunk_id: segment_id.clone(),
-                    session_id: main_session_id,
-                    events,
-                    video_path,
-                    start_time_us,
-                    end_time_us,
-                };
+            // macOS: original order, stop first, then queue the segment for upload.
+            #[cfg(target_os = "macos")]
+            {
+                let session = obs_call_with_watchdog(
+                    || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
+                    "stop_recording: with_upload",
+                )?;
+                if let Some(session) = session {
+                    info!(
+                        "Recording stopped: session={}, output={:?}",
+                        session.session_id, session.output_path
+                    );
+                }
 
-                let segment = CompletedSegment { chunk, input_path };
-                self.buffer_segment_for_upload(segment, segment_id);
+                if self.uploader.is_configured() {
+                    let main_session_id = self.main_session_id.clone().unwrap_or_default();
+                    let chunk = CompletedChunk {
+                        chunk_id: segment_id.clone(),
+                        session_id: main_session_id,
+                        events,
+                        video_path,
+                        start_time_us,
+                        end_time_us,
+                    };
+
+                    let segment = CompletedSegment { chunk, input_path };
+                    self.buffer_segment_for_upload(segment, segment_id);
+                }
             }
         } else {
             // Just stop recording without upload
