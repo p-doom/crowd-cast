@@ -1002,6 +1002,18 @@ struct PendingInputTransition {
 }
 
 const CAPTURING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// In-memory ceiling for the not-ready transition input buffer. On Windows/Linux this is a SPILL
+/// threshold, not a drop cap (PDOOM-1406): when the buffer reaches it, the burst is spilled into the
+/// recording buffer rather than discarded, so a capture source that stays not-ready for a long time
+/// (a wedged WGC/remote-desktop source can sit black for hours) never silently loses input. Kept
+/// large enough that an ordinary brief transition still clusters at video-ready in one flush, and
+/// small enough that the held burst is trivial memory (~4096 * a few dozen bytes ~= a few hundred
+/// KB) before it spills.
+#[cfg(not(target_os = "macos"))]
+const MAX_TRANSITION_INPUT_EVENTS: usize = 4096;
+/// macOS keeps the original fixed drop cap (bit-identical): events past this are dropped until video
+/// is ready. The spill-instead-of-drop behavior is tracked as the macOS sibling to PDOOM-1406.
+#[cfg(target_os = "macos")]
 const MAX_TRANSITION_INPUT_EVENTS: usize = 512;
 
 /// How long a finished segment is held before upload, so the panic button
@@ -1122,6 +1134,13 @@ pub struct SyncEngine {
     segment_timer: Option<tokio::time::Interval>,
     /// Input events buffered while waiting for a tracked app's video to become ready
     pending_input_transition: Option<PendingInputTransition>,
+    /// Running count of transition input events spilled into the recording buffer this process
+    /// because the transition buffer filled while capture stayed not-ready (PDOOM-1406). Spilling
+    /// retains the events instead of dropping them; this total makes the volume visible in logs
+    /// (a wedged NX box shed ~697k events to the old silent-drop path). Windows/Linux only; macOS
+    /// keeps the original drop path and never spills, so this looks unused there.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    transition_spill_total: u64,
     /// Last application context emitted into the raw event stream
     last_emitted_context: Option<String>,
     /// Number of buffered non-context input events for O(1) status updates
@@ -1341,6 +1360,7 @@ unintended app video."
             last_canvas_convergence_check: None,
             segment_timer: None,
             pending_input_transition: None,
+            transition_spill_total: 0,
             last_emitted_context: None,
             buffered_non_context_event_count: 0,
             any_source_ever_ready: false,
@@ -1572,18 +1592,73 @@ unintended app video."
             self.reset_pending_input_transition(target_app);
         }
 
-        if let Some(pending) = self.pending_input_transition.as_mut() {
-            if pending.events.len() >= MAX_TRANSITION_INPUT_EVENTS {
-                if pending.events.len() == MAX_TRANSITION_INPUT_EVENTS {
+        // macOS keeps the original bit-identical behavior: warn once at the cap, then drop events
+        // until video is ready. The spill-instead-of-drop path below is Windows/Linux only
+        // (PDOOM-1406); the macOS half is tracked as its sibling.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(pending) = self.pending_input_transition.as_mut() {
+                if pending.events.len() >= MAX_TRANSITION_INPUT_EVENTS {
+                    if pending.events.len() == MAX_TRANSITION_INPUT_EVENTS {
+                        warn!(
+                            "Transition input buffer for '{}' reached {} events; dropping additional events until video is ready",
+                            pending.target_app, MAX_TRANSITION_INPUT_EVENTS
+                        );
+                    }
+                    return;
+                }
+                pending.events.push(event);
+            }
+        }
+
+        // Windows/Linux: the transition buffer holds input while a tracked app's video is not yet
+        // ready, then replays it once video comes up (or drains it at segment rotation). On a
+        // machine where capture stays not-ready for a long stretch (a wedged WGC/remote-desktop
+        // source can sit black for hours) heavy input dwarfs any fixed in-memory cap. The old code
+        // SILENTLY DROPPED everything past MAX_TRANSITION_INPUT_EVENTS, corrupting the paired
+        // input/video dataset (one NX box shed ~697k events this way). Instead of dropping, spill
+        // the buffered burst into the recording buffer using the same timestamp remap the
+        // segment-rotation drain uses, then keep buffering. This bounds the transition buffer to
+        // MAX_TRANSITION_INPUT_EVENTS while retaining every event; the spilled events ride the
+        // normal segment-finalization path and are re-sorted by timestamp there. Worst-case memory
+        // stays bounded because the recording buffer is itself drained on every segment rotation
+        // (the wall-clock segment timer keeps firing through a wedge while recording is unpaused).
+        #[cfg(not(target_os = "macos"))]
+        {
+            let at_capacity = self
+                .pending_input_transition
+                .as_ref()
+                .map(|pending| pending.events.len() >= MAX_TRANSITION_INPUT_EVENTS)
+                .unwrap_or(false);
+            if at_capacity {
+                let spilled = self.drain_pending_transition_events_for_persistence();
+                let spilled_count = spilled.len();
+                for spilled_event in spilled {
+                    self.buffer_input_event(spilled_event);
+                }
+                // spilled_count is 0 only when the drain could not map timestamps (recording time
+                // unavailable); that path logs its own drop reason, so avoid a misleading spill line.
+                if spilled_count > 0 {
+                    self.transition_spill_total = self
+                        .transition_spill_total
+                        .saturating_add(spilled_count as u64);
                     warn!(
-                        "Transition input buffer for '{}' reached {} events; dropping additional events until video is ready",
-                        pending.target_app, MAX_TRANSITION_INPUT_EVENTS
+                        "Transition input buffer for '{}' filled at {} events while video was not ready; \
+spilled {} event(s) into the recording buffer to avoid data loss ({} spilled this session)",
+                        target_app,
+                        MAX_TRANSITION_INPUT_EVENTS,
+                        spilled_count,
+                        self.transition_spill_total
                     );
                 }
-                return;
+                // The drain above took the buffer; re-establish it for this target so the incoming
+                // event and any further burst keep accumulating.
+                self.reset_pending_input_transition(target_app);
             }
 
-            pending.events.push(event);
+            if let Some(pending) = self.pending_input_transition.as_mut() {
+                pending.events.push(event);
+            }
         }
     }
 
