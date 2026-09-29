@@ -489,6 +489,12 @@ fn main() -> Result<()> {
     // multi-monitor per-app envelope vs the display-capture canvas (setup_capture re-sets these).
     capture_ctx.set_single_active_app_capture(config.capture.single_active_app_capture);
     capture_ctx.set_mac_multi_monitor_capture(config.capture.mac_multi_monitor_capture);
+    // Feed the effective list on Windows/Linux: capture_all wins, so a stale target_apps list must
+    // not drive per-app source building (mirrors the effective_target_apps() gate in the engine).
+    // macOS is left bit-identical (raw list) from this Windows box; see the macOS sibling to PDOOM-1418.
+    #[cfg(not(target_os = "macos"))]
+    let target_apps = config.capture.effective_target_apps().to_vec();
+    #[cfg(target_os = "macos")]
     let target_apps = config.capture.target_apps.clone();
     capture_ctx.set_target_apps(&target_apps);
 
