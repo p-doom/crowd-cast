@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn heal_drops_self_entries_saved_in_an_existing_config() {
         // A config saved before the installer was excluded from the picker
-        // (Akshansh's ["msedge", "crowd-cast-setup"], PDOOM-1449) cleans itself
+        // (a participant's ["msedge", "crowd-cast-setup"], PDOOM-1449) cleans itself
         // up on the next `Config::load()`.
         let me = agent_self_identifier();
         let mut cfg = Config::default();
