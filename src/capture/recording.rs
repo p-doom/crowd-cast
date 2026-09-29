@@ -361,6 +361,25 @@ impl RecordingOutput {
     pub fn is_paused(&self) -> bool {
         self.state == RecordingState::Paused
     }
+
+    /// Read the output's real paused state directly from libobs.
+    ///
+    /// `self.state` (`RecordingState`) tracks the pause we *intended*; this reads the
+    /// actual OBS flag via `obs_output_paused`, which can disagree. `obs_output_pause`
+    /// returns false without pausing when the output is not active, lacks
+    /// `OBS_OUTPUT_CAN_PAUSE`, or a video encoder's `pause_can_start()` is false because
+    /// no frame has been encoded since the last resume. Callers use this to confirm a
+    /// pause really took before treating the recording as paused (PDOOM-1450).
+    ///
+    /// `obs_output_paused` is a thread-safe atomic load guarded by an internal validity
+    /// (null / being-destroyed) check, so it is safe to call directly off the OBS thread;
+    /// the `ObsOutputRef` we hold keeps the output alive for the duration of the call.
+    /// Windows/Linux only for now (PDOOM-1450); macOS keeps the original pause path, so unused there.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn is_output_paused(&self) -> bool {
+        let ptr = self.output.as_ptr();
+        unsafe { libobs::obs_output_paused(ptr.0 as *const _) }
+    }
 }
 
 /// Builder for RecordingOutput with fluent API
