@@ -1542,6 +1542,16 @@ impl CaptureContext {
         self.recording.as_ref().map_or(false, |r| r.is_paused())
     }
 
+    /// Read the recording output's real paused state directly from libobs, or `None`
+    /// when there is no recording output. Unlike `is_paused` (which reflects our tracked
+    /// intent) this reflects what OBS actually did, so callers can tell a pause that took
+    /// from one that silently failed (PDOOM-1450). Windows/Linux only for now; macOS keeps the
+    /// original pause path (mark paused on intent), so this is unused there.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn is_output_paused(&self) -> Option<bool> {
+        self.recording.as_ref().map(|r| r.is_output_paused())
+    }
+
     /// Get the current recording session info
     pub fn current_session(&self) -> Option<&RecordingSession> {
         self.current_session.as_ref()

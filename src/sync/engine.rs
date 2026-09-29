@@ -2395,7 +2395,15 @@ unintended app video."
         // `pause_recording` and the resume paths read it to attribute the pause to the
         // dead-capture machinery (auto-resume eligibility; see `capture_dead_paused`).
         self.capture_dead_paused = true;
-        self.pause_recording();
+        if !self.pause_recording() {
+            // The pause did not take (PDOOM-1450). A dead/window-less source encodes no new
+            // frame, which is exactly the condition obs_output_pause() rejects, so this path is
+            // especially prone to it. We are still recording (black) but the keylog stays
+            // aligned; drop the dead-capture pause claim and let the watchdog retry on its next
+            // tick, by which point a frame has usually passed and the pause is accepted.
+            warn!("Dead-capture pause did not take; will retry on the next watchdog tick");
+            self.capture_dead_paused = false;
+        }
     }
 
     /// Forget that `app` has ever shown content, after a switch that may have restarted its
@@ -4443,14 +4451,23 @@ unintended app video."
     /// Pause recording (both video capture and keylog)
     ///
     /// Pauses the OBS video output and disables input event capture.
-    fn pause_recording(&mut self) {
+    ///
+    /// Returns `true` when the output is genuinely paused (confirmed by reading OBS's real
+    /// pause state back), `false` when OBS refused the pause and the output is still running.
+    /// On a `false` return the caller MUST NOT treat the recording as paused: the video file
+    /// keeps advancing, so the keylog is left running and no resume offset is applied, keeping
+    /// the two aligned. Pretending the pause took is exactly the PDOOM-1450 corruption.
+    fn pause_recording(&mut self) -> bool {
         if self.current_session.is_none() {
             warn!("Cannot pause - no recording in progress");
-            return;
+            return false;
         }
 
-        // Paused output writes no frames, so black output proves nothing and the probe's
-        // per-frame download is pure cost (idle pauses can last a whole night) — detach.
+        // macOS keeps the original behavior (bit-identical; the macOS half of PDOOM-1450 is tracked
+        // as a sibling): the black probe detaches here, before the pause attempt, and the pause
+        // intent sticks even if OBS reports an error. A paused output writes no frames, so black
+        // output proves nothing and the probe's per-frame download is pure cost (idle pauses can
+        // last a whole night).
         #[cfg(all(target_os = "macos", not(no_tray)))]
         self.capture_ctx.set_black_probe_active(false);
 
@@ -4461,11 +4478,60 @@ unintended app video."
             || tokio::task::block_in_place(|| self.capture_ctx.pause_recording()),
             "pause_recording",
         );
-        if let Err(e) = result {
+
+        // macOS: original behavior, mark paused even if OBS erred (the intent to pause sticks).
+        #[cfg(target_os = "macos")]
+        if let Err(e) = &result {
             error!("Failed to pause video recording: {}", e);
-            // Still mark as paused to prevent infinite retry loops —
-            // the intent to pause should stick even if OBS is degraded.
         }
+
+        // Windows/Linux (PDOOM-1450): obs_output_pause() returns false ("Output failed to pause")
+        // WITHOUT pausing when the output is not active, lacks OBS_OUTPUT_CAN_PAUSE, or a video
+        // encoder's pause_can_start() is false because no frame has been encoded since the last
+        // resume (a static window delivering no new WGC frame, or a stalled encoder). Read the
+        // output's REAL state back rather than trusting our intent: if OBS did not actually pause,
+        // the file keeps advancing, so stopping the keylog and shifting recording_start_ns on
+        // resume would misalign every later event by the length of this false pause. Logging both
+        // the call result and the read-back makes the fleet count meaningful.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let actually_paused = self.capture_ctx.is_output_paused().unwrap_or(false);
+            match (&result, actually_paused) {
+                (Ok(()), true) => {
+                    debug!("Video recording paused (obs_output_paused() confirmed)");
+                }
+                (Err(e), true) => {
+                    // The call reported an error but the output is genuinely paused (e.g. a benign
+                    // pause-signal hiccup). Safe to proceed as a real pause.
+                    warn!(
+                        "pause_recording returned an error but obs_output_paused() reads paused; treating as paused: {}",
+                        e
+                    );
+                }
+                (Ok(()), false) => {
+                    // No error surfaced, yet the output is not paused (e.g. there was no active
+                    // output to pause). Do not fabricate a pause.
+                    error!(
+                        "pause_recording reported success but obs_output_paused() reads NOT paused; leaving video and keylog running so they stay aligned (PDOOM-1450)"
+                    );
+                    return false;
+                }
+                (Err(e), false) => {
+                    // Genuinely failed: OBS refused the pause and the output is still running. Do
+                    // not pretend; keep video and keylog both running and aligned. The caller
+                    // retries on its next tick, by which point a frame has usually been encoded and
+                    // the pause is accepted.
+                    error!(
+                        "Failed to pause video recording and obs_output_paused() confirms it is NOT paused; leaving recording running so the keylog stays aligned (PDOOM-1450): {}",
+                        e
+                    );
+                    return false;
+                }
+            }
+        }
+
+        // The output is genuinely paused past this point (Windows/Linux confirmed by read-back;
+        // macOS by intent, matching prior behavior).
 
         // Capture the frame-time clock at pause. On resume we add the elapsed pause to
         // recording_start_ns, because OBS's clock advances while paused but the recording
@@ -4498,6 +4564,7 @@ unintended app video."
         }
 
         info!("Recording paused");
+        true
     }
 
     /// Resume recording (both video capture and keylog)
@@ -5062,10 +5129,23 @@ unintended app video."
         // pause_recording() skips its generic "Recording paused" toast while
         // `idle_paused` is set (see the !idle_paused gate there), so the
         // idle-specific toast below is the only one the user sees.
-        self.pause_recording();
-
-        if self.config.recording.notify_on_start_stop && notifications_authorized() {
-            show_idle_paused_notification();
+        if self.pause_recording() {
+            if self.config.recording.notify_on_start_stop && notifications_authorized() {
+                show_idle_paused_notification();
+            }
+        } else {
+            // OBS refused the pause and it did not take (PDOOM-1450): the output is still
+            // recording and the keylog is still aligned to it, so do NOT claim an idle pause
+            // (no toast, no `idle_paused` intent, no `is_paused`). Push the idle deadline out
+            // by treating now as the last recorded action, so the next attempt fires one idle
+            // interval from here instead of spinning against a deadline already in the past.
+            // The false pause clears once a frame is encoded, so a later retry succeeds.
+            warn!(
+                "Idle pause did not take; staying in recording state and retrying after the \
+                 next idle interval"
+            );
+            self.idle_paused = false;
+            self.last_recorded_action_time = Instant::now();
         }
     }
 
