@@ -88,6 +88,20 @@ unsafe extern "C" fn on_quit(_item: *mut TrayMenuItem) {
     }
 }
 
+/// Map a notification's action to the existing menu callback that performs it,
+/// so notification rows need no new engine plumbing.
+fn notification_callback(
+    action: &TrayAction,
+) -> Option<unsafe extern "C" fn(*mut TrayMenuItem)> {
+    match action {
+        TrayAction::ToggleUploads => Some(on_toggle_uploads),
+        TrayAction::Settings => Some(on_settings),
+        TrayAction::SignIn => Some(on_sign_in),
+        TrayAction::CheckForUpdates => Some(on_check_for_updates),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Icon CString wrappers
 // ---------------------------------------------------------------------------
@@ -122,19 +136,20 @@ impl TrayIconCStrings {
 
 const MENU_STATUS: usize = 0;
 const MENU_ACCOUNT: usize = 1;
-// 2 = separator
-const MENU_START: usize = 3;
-const MENU_STOP: usize = 4;
-// 5 = panic (text never changes)
-// 6 = separator
-const MENU_UPLOADS: usize = 7;
-const MENU_SIGN_ACTION: usize = 8;
-// 9 = settings (text never changes)
-const MENU_UPDATES: usize = 10;
-// 11 = report bug (text never changes)
-// 12 = separator
-// 13 = quit
-// 14 = NULL terminator
+const MENU_NOTIFICATIONS: usize = 2; // parent of the dynamic notifications submenu
+// 3 = separator
+const MENU_START: usize = 4;
+const MENU_STOP: usize = 5;
+// 6 = panic (text never changes)
+// 7 = separator
+const MENU_UPLOADS: usize = 8;
+const MENU_SIGN_ACTION: usize = 9;
+// 10 = settings (text never changes)
+const MENU_UPDATES: usize = 11;
+// 12 = report bug (text never changes)
+// 13 = separator
+// 14 = quit
+// 15 = NULL terminator
 
 // ---------------------------------------------------------------------------
 // MacOSTray
@@ -147,6 +162,14 @@ pub struct MacOSTray {
     _tooltip: CString,
     menu_items: Vec<TrayMenuItem>,
     menu_strings: Vec<CString>,
+    // Dynamic notifications submenu (children of MENU_NOTIFICATIONS). Rebuilt each
+    // update(); the C side copies the strings during tray_update, so replacing
+    // these vecs afterward is safe (same lifetime contract as menu_strings).
+    notif_items: Vec<TrayMenuItem>,
+    notif_strings: Vec<CString>,
+    // Holds the current badged-icon path CString alive for the FFI call when a
+    // badge is shown; `None` falls back to the plain per-state icon.
+    badged_icon: Option<CString>,
 }
 
 impl MacOSTray {
@@ -158,18 +181,19 @@ impl MacOSTray {
         let menu_strings = vec![
             CString::new("Status: Idle")?,           // 0: status
             CString::new("")?,                       // 1: account
-            CString::new("-")?,                      // 2: separator
-            CString::new("Start Recording")?,        // 3
-            CString::new("Stop Recording")?,         // 4
-            CString::new("Delete last 10 minutes")?, // 5: panic
-            CString::new("-")?,                      // 6: separator
-            CString::new("Pause Uploads")?,          // 7
-            CString::new("Sign in with Google")?,    // 8
-            CString::new("Settings")?,               // 9
-            CString::new("Check for Updates")?,      // 10
-            CString::new("Report Bug…")?,            // 11
-            CString::new("-")?,                      // 12: separator
-            CString::new("Quit")?,                   // 13
+            CString::new("No notifications")?,       // 2: notifications (submenu parent)
+            CString::new("-")?,                      // 3: separator
+            CString::new("Start Recording")?,        // 4
+            CString::new("Stop Recording")?,         // 5
+            CString::new("Delete last 10 minutes")?, // 6: panic
+            CString::new("-")?,                      // 7: separator
+            CString::new("Pause Uploads")?,          // 8
+            CString::new("Sign in with Google")?,    // 9
+            CString::new("Settings")?,               // 10
+            CString::new("Check for Updates")?,      // 11
+            CString::new("Report Bug…")?,            // 12
+            CString::new("-")?,                      // 13: separator
+            CString::new("Quit")?,                   // 14
         ];
 
         let mut menu_items = vec![
@@ -189,103 +213,111 @@ impl MacOSTray {
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
-            // 2: Separator
+            // 2: Notifications (submenu parent; text + submenu set in update())
             TrayMenuItem {
                 text: menu_strings[2].as_ptr(),
+                disabled: 1,
+                checked: 0,
+                cb: None,
+                submenu: std::ptr::null_mut(),
+            },
+            // 3: Separator
+            TrayMenuItem {
+                text: menu_strings[3].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
-            // 3: Start Recording
+            // 4: Start Recording
             TrayMenuItem {
-                text: menu_strings[3].as_ptr(),
+                text: menu_strings[4].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_start_capture),
                 submenu: std::ptr::null_mut(),
             },
-            // 4: Stop Recording
+            // 5: Stop Recording
             TrayMenuItem {
-                text: menu_strings[4].as_ptr(),
+                text: menu_strings[5].as_ptr(),
                 disabled: 1,
                 checked: 0,
                 cb: Some(on_stop_capture),
                 submenu: std::ptr::null_mut(),
             },
-            // 5: Panic
+            // 6: Panic
             TrayMenuItem {
-                text: menu_strings[5].as_ptr(),
+                text: menu_strings[6].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_panic),
                 submenu: std::ptr::null_mut(),
             },
-            // 6: Separator
+            // 7: Separator
             TrayMenuItem {
-                text: menu_strings[6].as_ptr(),
+                text: menu_strings[7].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
-            // 7: Pause/Resume Uploads
+            // 8: Pause/Resume Uploads
             TrayMenuItem {
-                text: menu_strings[7].as_ptr(),
+                text: menu_strings[8].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_toggle_uploads),
                 submenu: std::ptr::null_mut(),
             },
-            // 8: Sign in / Sign out
+            // 9: Sign in / Sign out
             TrayMenuItem {
-                text: menu_strings[8].as_ptr(),
+                text: menu_strings[9].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_sign_in),
                 submenu: std::ptr::null_mut(),
             },
-            // 9: Settings
+            // 10: Settings
             TrayMenuItem {
-                text: menu_strings[9].as_ptr(),
+                text: menu_strings[10].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_settings),
                 submenu: std::ptr::null_mut(),
             },
-            // 10: Check for Updates
+            // 11: Check for Updates
             TrayMenuItem {
-                text: menu_strings[10].as_ptr(),
+                text: menu_strings[11].as_ptr(),
                 disabled: 1,
                 checked: 0,
                 cb: Some(on_check_for_updates),
                 submenu: std::ptr::null_mut(),
             },
-            // 11: Report Bug
+            // 12: Report Bug
             TrayMenuItem {
-                text: menu_strings[11].as_ptr(),
+                text: menu_strings[12].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_report_bug),
                 submenu: std::ptr::null_mut(),
             },
-            // 12: Separator
+            // 13: Separator
             TrayMenuItem {
-                text: menu_strings[12].as_ptr(),
+                text: menu_strings[13].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: None,
                 submenu: std::ptr::null_mut(),
             },
-            // 13: Quit
+            // 14: Quit
             TrayMenuItem {
-                text: menu_strings[13].as_ptr(),
+                text: menu_strings[14].as_ptr(),
                 disabled: 0,
                 checked: 0,
                 cb: Some(on_quit),
                 submenu: std::ptr::null_mut(),
             },
-            // 14: NULL terminator
+            // 15: NULL terminator
             TrayMenuItem {
                 text: std::ptr::null(),
                 disabled: 0,
@@ -302,12 +334,24 @@ impl MacOSTray {
             menu: menu_items.as_mut_ptr(),
         };
 
+        // Submenu starts empty (just its NULL terminator); populated in update().
+        let notif_items = vec![TrayMenuItem {
+            text: std::ptr::null(),
+            disabled: 0,
+            checked: 0,
+            cb: None,
+            submenu: std::ptr::null_mut(),
+        }];
+
         Ok(Self {
             tray,
             icons,
             _tooltip: tooltip,
             menu_items,
             menu_strings,
+            notif_items,
+            notif_strings: Vec::new(),
+            badged_icon: None,
         })
     }
 }
@@ -436,8 +480,66 @@ impl PlatformTray for MacOSTray {
         // Check for Updates enabled state
         self.menu_items[MENU_UPDATES].disabled = if state.can_check_updates { 0 } else { 1 };
 
-        // Icon
-        self.tray.icon_filepath = self.icons.path_for(state.icon_state);
+        // Notifications submenu (dynamic). Rebuilt from the derived set each
+        // refresh; the C side copies these strings during tray_update, so
+        // replacing the vecs here is safe.
+        let count = state.notifications.len();
+        let parent_label = if count == 0 {
+            "No notifications".to_string()
+        } else {
+            format!("Notifications ({})", count)
+        };
+        if let Ok(text) = CString::new(parent_label.as_bytes()) {
+            self.menu_strings[MENU_NOTIFICATIONS] = text;
+            self.menu_items[MENU_NOTIFICATIONS].text =
+                self.menu_strings[MENU_NOTIFICATIONS].as_ptr();
+        }
+        self.menu_items[MENU_NOTIFICATIONS].disabled = if count == 0 { 1 } else { 0 };
+
+        // Child strings: one per notification.
+        let mut notif_strings: Vec<CString> = Vec::with_capacity(count);
+        for n in &state.notifications {
+            notif_strings
+                .push(CString::new(n.title.as_bytes()).unwrap_or_else(|_| CString::default()));
+        }
+        self.notif_strings = notif_strings;
+
+        // Child items reuse existing action callbacks; NULL-terminated.
+        let mut notif_items: Vec<TrayMenuItem> = Vec::with_capacity(count + 1);
+        for (i, n) in state.notifications.iter().enumerate() {
+            notif_items.push(TrayMenuItem {
+                text: self.notif_strings[i].as_ptr(),
+                disabled: 0,
+                checked: 0,
+                cb: notification_callback(&n.action),
+                submenu: std::ptr::null_mut(),
+            });
+        }
+        notif_items.push(TrayMenuItem {
+            text: std::ptr::null(),
+            disabled: 0,
+            checked: 0,
+            cb: None,
+            submenu: std::ptr::null_mut(),
+        });
+        self.notif_items = notif_items;
+        self.menu_items[MENU_NOTIFICATIONS].submenu = if count == 0 {
+            std::ptr::null_mut()
+        } else {
+            self.notif_items.as_mut_ptr()
+        };
+
+        // Icon — badge it with the notification count when there are any.
+        self.badged_icon = if count > 0 {
+            super::tray::render_badged_tray_icon(state.icon_state, count)
+                .and_then(|p| CString::new(p.to_string_lossy().as_bytes()).ok())
+        } else {
+            None
+        };
+        self.tray.icon_filepath = match &self.badged_icon {
+            Some(c) => c.as_ptr(),
+            None => self.icons.path_for(state.icon_state),
+        };
 
         // Apply
         self.tray.menu = self.menu_items.as_mut_ptr();
