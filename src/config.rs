@@ -352,10 +352,21 @@ pub fn agent_self_identifier() -> &'static str {
     })
 }
 
-/// Whether `bundle_id` refers to the crowd-cast agent itself.
+/// Executable stem of the Windows installer (see installer/windows/crowd-cast.iss
+/// OutputBaseFilename). The setup wizard runs from the freshly-launched agent
+/// while the installer's own finish-page window can still be open, so it shows
+/// up in the app picker like any other windowed app (PDOOM-1449) -- but it's a
+/// one-shot installer, not something a participant will ever want to capture.
+/// Checked by name (not path) so this applies the same way on every platform.
+const INSTALLER_SELF_IDENTIFIER: &str = "crowd-cast-setup";
+
+/// Whether `bundle_id` refers to one of our own processes: the running agent
+/// itself, or the installer that launched it (PDOOM-1449). Never a useful
+/// capture target or whitelist entry.
 pub fn is_agent_self(bundle_id: &str) -> bool {
     let me = agent_self_identifier();
-    !me.is_empty() && bundle_id.eq_ignore_ascii_case(me)
+    (!me.is_empty() && bundle_id.eq_ignore_ascii_case(me))
+        || bundle_id.eq_ignore_ascii_case(INSTALLER_SELF_IDENTIFIER)
 }
 
 impl Config {
@@ -369,6 +380,7 @@ impl Config {
 
             let mut config: Config = toml::from_str(&contents)
                 .with_context(|| format!("Failed to parse config file: {:?}", config_path))?;
+            config.heal_self_target_apps();
 
             config.config_path = Some(config_path);
             Ok(config)
@@ -486,6 +498,15 @@ impl Config {
     pub fn clear_target_apps(&mut self) {
         self.capture.target_apps.clear();
     }
+
+    /// Drop any of our own processes that ended up saved in the target-app list
+    /// (e.g. the installer's transient window, ticked in the picker before it
+    /// was excluded -- PDOOM-1449). Called on load so an already-saved config
+    /// self-heals, the same way `should_capture_app` already excludes them at
+    /// runtime.
+    fn heal_self_target_apps(&mut self) {
+        self.capture.target_apps.retain(|app| !is_agent_self(app));
+    }
 }
 
 #[cfg(test)]
@@ -515,5 +536,33 @@ mod tests {
 
         // Self-exclusion is case-insensitive.
         assert!(!cfg.should_capture_app(&me.to_ascii_uppercase()));
+    }
+
+    #[test]
+    fn installer_is_treated_as_agent_self() {
+        // The Windows installer's own (transient) window can end up ticked in
+        // the picker (PDOOM-1449); it must never be captured or kept in the
+        // saved target-app list, same as the agent itself.
+        assert!(is_agent_self("crowd-cast-setup"));
+        assert!(is_agent_self("CROWD-CAST-SETUP"));
+        assert!(!is_agent_self("firefox"));
+    }
+
+    #[test]
+    fn heal_drops_self_entries_saved_in_an_existing_config() {
+        // A config saved before the installer was excluded from the picker
+        // (a participant's ["msedge", "crowd-cast-setup"], PDOOM-1449) cleans itself
+        // up on the next `Config::load()`.
+        let me = agent_self_identifier();
+        let mut cfg = Config::default();
+        cfg.capture.target_apps = vec![
+            "msedge".to_string(),
+            "crowd-cast-setup".to_string(),
+            me.to_string(),
+        ];
+
+        cfg.heal_self_target_apps();
+
+        assert_eq!(cfg.capture.target_apps, vec!["msedge".to_string()]);
     }
 }
