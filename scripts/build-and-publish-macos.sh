@@ -161,7 +161,7 @@ fi
 WIN_MKT=""
 while IFS= read -r tag; do
     if [[ "$tag" =~ ^win-v([0-9.]+)[+] ]]; then WIN_MKT="${BASH_REMATCH[1]}"; break; fi
-done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,publishedAt --jq 'sort_by(.publishedAt) | reverse | .[].tagName')
 if [[ -n "$WIN_MKT" && "$WIN_MKT" != "$APP_VERSION" ]]; then
     if [[ "$ALLOW_MISMATCH" -eq 1 ]]; then
         echo "Warning: releasing macOS $APP_VERSION while the latest Windows release is $WIN_MKT (proceeding, --allow-version-mismatch)." >&2
@@ -212,7 +212,7 @@ while IFS= read -r tag; do
     [[ -z "$tag" ]] && continue
     names="$(gh release view "$tag" --repo "$GITHUB_REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)"
     if grep -qx 'crowd-cast-setup.exe' <<<"$names"; then WIN_TAG="$tag"; break; fi
-done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,publishedAt --jq 'sort_by(.publishedAt) | reverse | .[].tagName')
 
 # Assets always include the Sparkle zip + dmg; append the carried exe if found.
 ASSETS=("$SPARKLE_ARCHIVE_DIR/$SPARKLE_ZIP" "$DMG_PATH")
@@ -245,7 +245,7 @@ while IFS= read -r tag; do
     [[ -z "$tag" ]] && continue
     names="$(gh release view "$tag" --repo "$GITHUB_REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)"
     if grep -qx 'crowd-cast-agent-x86_64' <<<"$names"; then LINUX_TAG="$tag"; LINUX_TAG_NAMES="$names"; break; fi
-done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+done < <(gh release list --repo "$GITHUB_REPO" --limit 40 --json tagName,publishedAt --jq 'sort_by(.publishedAt) | reverse | .[].tagName')
 
 if [[ -n "$LINUX_TAG" ]]; then
     for asset in "${LINUX_CARRY_ASSETS[@]}"; do
