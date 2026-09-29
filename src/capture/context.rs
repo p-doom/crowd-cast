@@ -79,6 +79,20 @@ pub struct CaptureContext {
     app_scenes: HashMap<String, (ObsSceneRef, ScreenCaptureSource)>,
     /// Empty scene activated when no tracked app is frontmost
     blank_scene: Option<ObsSceneRef>,
+    /// Per-app scenes whose window-source creation FAILED during `setup_app_scenes`, kept alive
+    /// here instead of being dropped inline. Destroying a scene in the same setup pass that
+    /// created it races the graphics thread ticking the just-created scene and takes libobs down
+    /// with a native access violation on Windows (PDOOM-1324: c0000005 in obs.dll, silent exit 0,
+    /// no Rust panic hook, KeepAlive reads it as intentional so the agent stays down). These
+    /// scenes carry no source and are never activated, so they are inert; they are released
+    /// together at the next capture rebuild, when a full teardown is already in flight rather than
+    /// a fresh create. Keeping them OUT of `app_scenes` preserves `needs_scene_for_app`, so a
+    /// window-less app still gets its scene-creating restart once a window appears.
+    /// macOS never pushes here (it keeps the original inline drop in setup_app_scenes); the field is
+    /// only cleared there, so allow it to look unused on macOS. Tracked as the macOS sibling to
+    /// PDOOM-1324.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    retained_empty_scenes: Vec<ObsSceneRef>,
     /// GNOME Wayland: owns the Mutter ScreenCast sessions that back the per-app PipeWire
     /// nodes (picker-free capture). Must outlive `app_scenes` — dropping it closes the
     /// sessions and kills the nodes. `None` off GNOME Wayland (display / XComposite paths).
@@ -253,6 +267,7 @@ impl CaptureContext {
             capture_sources: Vec::new(),
             app_scenes: HashMap::new(),
             blank_scene: None,
+            retained_empty_scenes: Vec::new(),
             #[cfg(target_os = "linux")]
             gnome_screencast: None,
             #[cfg(target_os = "linux")]
@@ -761,6 +776,10 @@ impl CaptureContext {
         // leaks when switching between single-active and display/multi modes.
         self.clear_app_scenes();
         self.blank_scene = None;
+        // Release empty scenes retained from a prior generation's failed source creations
+        // (PDOOM-1324). A full teardown is already in flight here, so this is an orderly drop, not
+        // the create-then-immediately-destroy race the retention exists to avoid.
+        self.retained_empty_scenes.clear();
         // The per-app monitor-fit transform is de-duped via `last_monitor_fit` (keyed on app +
         // scale + pos). Clearing app_scenes destroys the scene items the transform was applied
         // to, so that cache is now stale. Reset it here — every rebuild path (setup_capture,
@@ -929,6 +948,16 @@ impl CaptureContext {
                         "Failed to create capture source for '{}': {}. Skipping.",
                         bundle_id, e
                     );
+                    // Windows/Linux: do NOT drop `scene` here. It was just created in this same setup
+                    // pass, and destroying it inline races the graphics thread ticking it, crashing
+                    // libobs natively on Windows (PDOOM-1324). Retain it (inert, no source, never
+                    // activated) to be released at the next rebuild's teardown instead. It stays out
+                    // of `app_scenes`, so `needs_scene_for_app` still reports this app as needing a
+                    // scene and the engine's restart-when-a-window-appears path is intact. macOS keeps
+                    // the original inline drop (`scene` falls out of scope here; no such native crash
+                    // there, bit-identical), tracked as the macOS sibling to PDOOM-1324.
+                    #[cfg(not(target_os = "macos"))]
+                    self.retained_empty_scenes.push(scene);
                 }
             }
         }
@@ -989,6 +1018,8 @@ impl CaptureContext {
         self.scene = None;
         self.clear_app_scenes();
         self.blank_scene = None;
+        // Release any empty scenes retained by a prior per-app setup (PDOOM-1324).
+        self.retained_empty_scenes.clear();
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             self.last_monitor_fit = None;
@@ -1204,6 +1235,8 @@ impl CaptureContext {
         self.scene = None;
         self.clear_app_scenes();
         self.blank_scene = None;
+        // Release any retained empty scenes before reset_video (PDOOM-1324).
+        self.retained_empty_scenes.clear();
 
         // Build new video info
         let video_info = ObsVideoInfoBuilder::new()
@@ -1262,6 +1295,8 @@ impl CaptureContext {
         self.capture_sources.clear();
         self.clear_app_scenes();
         self.blank_scene = None;
+        // Release any retained empty scenes before the OBS context is dropped (PDOOM-1324).
+        self.retained_empty_scenes.clear();
         log_critical_operation("reinitialize_for_display_change: dropping scene");
         self.scene = None;
         log_critical_operation("reinitialize_for_display_change: dropping recording");
