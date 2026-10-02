@@ -247,7 +247,7 @@ impl Uploader {
                 .put(&presign.upload_url)
                 .header("Content-Type", content_type)
                 .header("Content-Length", file_size)
-                .timeout(std::time::Duration::from_secs(600))
+                .timeout(video_upload_timeout(file_size))
                 .body(body)
                 .send()
                 .await
@@ -402,5 +402,44 @@ mod tests {
         assert!(json.contains("recordings/test.mp4"));
         assert!(json.contains("0.0.1"));
         assert!(json.contains("test-user"));
+    }
+}
+
+/// Whole-request timeout for a video PUT.
+///
+/// Windows scales it with the file size (PDOOM-1473): a fixed 600 s killed every upload that
+/// was still making progress on a slow uplink (a ~100 MB segment at ~30 KB/s needs ~1 h), and
+/// each retry restarted from zero, so nothing ever finished. The floor keeps the old 600 s for
+/// small files; the assumed minimum rate (8 KiB/s) means only a genuinely stalled transfer
+/// times out; the ceiling bounds how long a dead connection can hold an upload slot.
+/// Other platforms keep the fixed 600 s.
+fn video_upload_timeout(file_size: u64) -> std::time::Duration {
+    #[cfg(target_os = "windows")]
+    {
+        const FLOOR_SECS: u64 = 600;
+        const CEILING_SECS: u64 = 6 * 60 * 60;
+        const MIN_RATE_BYTES_PER_SEC: u64 = 8 * 1024;
+        let secs = (file_size / MIN_RATE_BYTES_PER_SEC).clamp(FLOOR_SECS, CEILING_SECS);
+        std::time::Duration::from_secs(secs)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = file_size;
+        std::time::Duration::from_secs(600)
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod upload_timeout_tests {
+    use super::video_upload_timeout;
+
+    #[test]
+    fn video_upload_timeout_scales_with_size_within_bounds() {
+        // Small files keep the old 600 s floor.
+        assert_eq!(video_upload_timeout(1024).as_secs(), 600);
+        // A ~100 MB segment gets enough time at 8 KiB/s (~3.5 h).
+        assert_eq!(video_upload_timeout(100 * 1024 * 1024).as_secs(), 12_800);
+        // Huge files are capped at 6 h.
+        assert_eq!(video_upload_timeout(u64::MAX).as_secs(), 6 * 60 * 60);
     }
 }

@@ -1081,9 +1081,10 @@ const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
 /// Whether a segment that fails to upload is held — in the retry queue and the on-disk
 /// manifest — until it succeeds, instead of being dropped after a two-hour retry window, and
 /// whether finished segment files with no manifest entry are adopted on startup. Live on macOS
-/// only until the same behaviour has been exercised on Windows and Linux hardware; the code
-/// compiles and is checked on every platform.
-const HOLD_SEGMENTS_UNTIL_UPLOADED: bool = cfg!(target_os = "macos");
+/// and Windows; Linux keeps the two-hour give-up until it has been exercised on Linux hardware.
+/// On Windows the give-up silently lost ~1,000 segments across 26 users in two weeks, mostly on
+/// slow or interrupted uplinks (PDOOM-1473). The code compiles and is checked on every platform.
+const HOLD_SEGMENTS_UNTIL_UPLOADED: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -3448,8 +3449,38 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                         }
                         while retry_queue.peek().map(|entry| entry.next_attempt_at <= now).unwrap_or(false) {
                             let entry = retry_queue.pop().expect("retry queue peeked");
-                            let item = entry.item;
+                            let mut item = entry.item;
                             let chunk_id = item.segment.chunk.chunk_id.clone();
+
+                            // Held segments retry for as long as their files exist, so a file
+                            // that vanished underneath us (Windows Storage Sense clearing Temp,
+                            // a user cleanup) must not turn into a retry every 15 minutes
+                            // forever (PDOOM-1473). No events file: nothing left to upload
+                            // under, drop it. Video gone but events present: upload the keylog
+                            // alone rather than failing on the missing video every attempt.
+                            if HOLD_SEGMENTS_UNTIL_UPLOADED {
+                                if !item.segment.input_path.exists() {
+                                    warn!(
+                                        "Dropping held segment {}: its events file {:?} is gone",
+                                        chunk_id, item.segment.input_path
+                                    );
+                                    remove_pending_upload(&chunk_id);
+                                    continue;
+                                }
+                                if item
+                                    .segment
+                                    .chunk
+                                    .video_path
+                                    .as_ref()
+                                    .is_some_and(|p| !p.exists())
+                                {
+                                    warn!(
+                                        "Video file for held segment {} is gone; uploading its events only",
+                                        chunk_id
+                                    );
+                                    item.segment.chunk.video_path = None;
+                                }
+                            }
 
                             // Off macOS the previous behaviour stands: two hours after the
                             // first failure the segment is dropped from the manifest.
@@ -6074,8 +6105,11 @@ mod tests {
     }
 
     #[test]
-    fn segments_are_held_until_uploaded_on_macos_only() {
-        assert_eq!(HOLD_SEGMENTS_UNTIL_UPLOADED, cfg!(target_os = "macos"));
+    fn segments_are_held_until_uploaded_on_macos_and_windows() {
+        assert_eq!(
+            HOLD_SEGMENTS_UNTIL_UPLOADED,
+            cfg!(any(target_os = "macos", target_os = "windows"))
+        );
     }
 
     #[test]
