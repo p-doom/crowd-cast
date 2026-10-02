@@ -900,6 +900,80 @@ fn retain_unpurged_pending_uploads(
     entries.len() != before
 }
 
+/// Move everything in the legacy Temp recordings folder into `new_dir` and repoint the upload
+/// manifest at the moved files (PDOOM-1473). Both folders live under the user profile on the
+/// same drive, so each move is a rename, not a copy. A file that cannot be moved stays where it
+/// is and keeps its manifest path, so nothing is lost; the next launch tries again.
+#[cfg(target_os = "windows")]
+pub(crate) fn migrate_legacy_recordings_dir(legacy_dir: &Path, new_dir: &Path) {
+    if legacy_dir == new_dir || !legacy_dir.is_dir() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(new_dir) {
+        warn!("Cannot create recordings dir {:?}: {}; leaving recordings in {:?}", new_dir, e, legacy_dir);
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(legacy_dir) else {
+        return;
+    };
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut failed = 0usize;
+    for entry in entries.flatten() {
+        let from = entry.path();
+        if !from.is_file() {
+            continue;
+        }
+        let to = new_dir.join(entry.file_name());
+        if to.exists() {
+            continue;
+        }
+        match std::fs::rename(&from, &to) {
+            Ok(()) => moved.push((from, to)),
+            Err(e) => {
+                failed += 1;
+                warn!("Could not move {:?} to {:?}: {}", from, to, e);
+            }
+        }
+    }
+    if moved.is_empty() && failed == 0 {
+        let _ = std::fs::remove_dir(legacy_dir);
+        return;
+    }
+    let mut pending = read_pending_uploads();
+    let mut repointed = 0usize;
+    let remap = |p: &mut PathBuf, moved: &[(PathBuf, PathBuf)]| -> bool {
+        if let Some((_, to)) = moved.iter().find(|(from, _)| from == p) {
+            *p = to.clone();
+            true
+        } else {
+            false
+        }
+    };
+    for e in pending.iter_mut() {
+        let mut hit = remap(&mut e.input_path, &moved);
+        if let Some(v) = e.video_path.as_mut() {
+            hit |= remap(v, &moved);
+        }
+        if hit {
+            repointed += 1;
+        }
+    }
+    if repointed > 0 {
+        write_pending_uploads(&pending);
+    }
+    info!(
+        "Moved {} recording file(s) from {:?} to {:?} ({} queued upload(s) repointed, {} file(s) left behind)",
+        moved.len(),
+        legacy_dir,
+        new_dir,
+        repointed,
+        failed
+    );
+    if failed == 0 {
+        let _ = std::fs::remove_dir(legacy_dir);
+    }
+}
+
 /// Finished segments on disk that no manifest entry points at. A finished segment is written
 /// as `input_<session>_seg<NNNN>.msgpack` (plus, normally, `recording_<same>.mp4`) and put in
 /// the manifest in the same breath, so such a pair without an entry means an earlier build
@@ -1081,9 +1155,10 @@ const UPLOAD_BUFFER_DELAY: Duration = Duration::from_secs(600);
 /// Whether a segment that fails to upload is held — in the retry queue and the on-disk
 /// manifest — until it succeeds, instead of being dropped after a two-hour retry window, and
 /// whether finished segment files with no manifest entry are adopted on startup. Live on macOS
-/// only until the same behaviour has been exercised on Windows and Linux hardware; the code
-/// compiles and is checked on every platform.
-const HOLD_SEGMENTS_UNTIL_UPLOADED: bool = cfg!(target_os = "macos");
+/// and Windows; Linux keeps the two-hour give-up until it has been exercised on Linux hardware.
+/// On Windows the give-up silently lost ~1,000 segments across 26 users in two weeks, mostly on
+/// slow or interrupted uplinks (PDOOM-1473). The code compiles and is checked on every platform.
+const HOLD_SEGMENTS_UNTIL_UPLOADED: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// The synchronization engine coordinates recording and input capture
 pub struct SyncEngine {
@@ -1329,11 +1404,7 @@ impl SyncEngine {
         notification_rx: mpsc::UnboundedReceiver<NotificationAction>,
         auth: Option<Arc<tokio::sync::Mutex<crate::auth::AuthManager>>>,
     ) -> Result<Self> {
-        let output_dir = config
-            .recording
-            .output_directory
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"));
+        let output_dir = config.recording_output_directory();
 
         let (upload_tx, upload_rx) = mpsc::unbounded_channel();
         let uploader = Uploader::new(&config, auth);
@@ -3448,8 +3519,38 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                         }
                         while retry_queue.peek().map(|entry| entry.next_attempt_at <= now).unwrap_or(false) {
                             let entry = retry_queue.pop().expect("retry queue peeked");
-                            let item = entry.item;
+                            let mut item = entry.item;
                             let chunk_id = item.segment.chunk.chunk_id.clone();
+
+                            // Held segments retry for as long as their files exist, so a file
+                            // that vanished underneath us (Windows Storage Sense clearing Temp,
+                            // a user cleanup) must not turn into a retry every 15 minutes
+                            // forever (PDOOM-1473). No events file: nothing left to upload
+                            // under, drop it. Video gone but events present: upload the keylog
+                            // alone rather than failing on the missing video every attempt.
+                            if HOLD_SEGMENTS_UNTIL_UPLOADED {
+                                if !item.segment.input_path.exists() {
+                                    warn!(
+                                        "Dropping held segment {}: its events file {:?} is gone",
+                                        chunk_id, item.segment.input_path
+                                    );
+                                    remove_pending_upload(&chunk_id);
+                                    continue;
+                                }
+                                if item
+                                    .segment
+                                    .chunk
+                                    .video_path
+                                    .as_ref()
+                                    .is_some_and(|p| !p.exists())
+                                {
+                                    warn!(
+                                        "Video file for held segment {} is gone; uploading its events only",
+                                        chunk_id
+                                    );
+                                    item.segment.chunk.video_path = None;
+                                }
+                            }
 
                             // Off macOS the previous behaviour stands: two hours after the
                             // first failure the segment is dropped from the manifest.
@@ -6074,8 +6175,11 @@ mod tests {
     }
 
     #[test]
-    fn segments_are_held_until_uploaded_on_macos_only() {
-        assert_eq!(HOLD_SEGMENTS_UNTIL_UPLOADED, cfg!(target_os = "macos"));
+    fn segments_are_held_until_uploaded_on_macos_and_windows() {
+        assert_eq!(
+            HOLD_SEGMENTS_UNTIL_UPLOADED,
+            cfg!(any(target_os = "macos", target_os = "windows"))
+        );
     }
 
     #[test]

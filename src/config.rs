@@ -226,6 +226,38 @@ fn default_recording_output_directory() -> PathBuf {
     std::env::temp_dir().join("crowd-cast-recordings")
 }
 
+/// Where recordings went before PDOOM-1473: the system Temp folder. On Windows, Storage Sense and
+/// Disk Cleanup delete files from Temp, which loses segments that are still waiting to upload.
+pub fn legacy_temp_recording_directory() -> PathBuf {
+    default_recording_output_directory()
+}
+
+/// Windows: recordings live next to the logs, in the app's own data dir, not in Temp.
+#[cfg(target_os = "windows")]
+fn app_data_recording_directory() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "crowd-cast", "agent")
+        .map(|p| p.data_local_dir().join("recordings"))
+}
+
+/// Case-insensitive path equality for Windows paths (config files store whatever casing
+/// `temp_dir()` reported when the default was first written).
+#[cfg(target_os = "windows")]
+fn same_windows_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .replace('/', "\\")
+            .to_lowercase()
+    };
+    if norm(a) == norm(b) {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 fn default_recording_output_directory_option() -> Option<PathBuf> {
     Some(default_recording_output_directory())
 }
@@ -370,6 +402,29 @@ pub fn is_agent_self(bundle_id: &str) -> bool {
 }
 
 impl Config {
+    /// The directory recordings are written to and uploaded from.
+    ///
+    /// On Windows an unset path, or the old Temp default that every config written before
+    /// PDOOM-1473 carries, resolves to the app's data dir instead, so queued segments are no
+    /// longer exposed to Temp cleanup. A path the user chose themselves is kept as-is. Other
+    /// platforms are unchanged.
+    pub fn recording_output_directory(&self) -> PathBuf {
+        let configured = self.recording.output_directory.clone();
+        #[cfg(target_os = "windows")]
+        {
+            let is_default = match &configured {
+                None => true,
+                Some(p) => same_windows_path(p, &legacy_temp_recording_directory()),
+            };
+            if is_default {
+                if let Some(dir) = app_data_recording_directory() {
+                    return dir;
+                }
+            }
+        }
+        configured.unwrap_or_else(default_recording_output_directory)
+    }
+
     /// Load configuration from default location or create default
     pub fn load() -> Result<Self> {
         let config_path = Self::default_config_path()?;
@@ -564,5 +619,32 @@ mod tests {
         cfg.heal_self_target_apps();
 
         assert_eq!(cfg.capture.target_apps, vec!["msedge".to_string()]);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod recording_dir_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_temp_default_resolves_to_app_data_dir() {
+        let mut cfg = Config::default();
+        let app = app_data_recording_directory().expect("project dirs");
+
+        cfg.recording.output_directory = None;
+        assert_eq!(cfg.recording_output_directory(), app);
+
+        // The Temp default written into every pre-PDOOM-1473 config, in any casing.
+        let legacy = legacy_temp_recording_directory();
+        cfg.recording.output_directory = Some(legacy.clone());
+        assert_eq!(cfg.recording_output_directory(), app);
+        cfg.recording.output_directory =
+            Some(PathBuf::from(legacy.to_string_lossy().to_uppercase()));
+        assert_eq!(cfg.recording_output_directory(), app);
+
+        // A path the user picked is kept.
+        let custom = PathBuf::from(r"D:\my-recordings");
+        cfg.recording.output_directory = Some(custom.clone());
+        assert_eq!(cfg.recording_output_directory(), custom);
     }
 }
