@@ -477,6 +477,15 @@ fn main() -> Result<()> {
     // crash, a kill, or a logoff/shutdown.
     crash::begin_run_marker(&log_dir);
 
+    // Move recordings (and any queued uploads) out of the old Temp location before anything
+    // reads or writes them, so a backlog waiting on a slow uplink is not lost to Temp cleanup
+    // (PDOOM-1473). Windows-only; a no-op when there is nothing to move.
+    #[cfg(target_os = "windows")]
+    sync::migrate_legacy_recordings_dir(
+        &config::legacy_temp_recording_directory(),
+        &get_output_directory(&config),
+    );
+
     // Bootstrap OBS binaries if needed
     info!("Bootstrapping OBS binaries...");
     let mut capture_ctx =
@@ -804,11 +813,7 @@ fn main() -> Result<()> {
 }
 
 fn get_output_directory(config: &Config) -> std::path::PathBuf {
-    config
-        .recording
-        .output_directory
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"))
+    config.recording_output_directory()
 }
 
 fn reconcile_start_on_login(config: &mut Config) {

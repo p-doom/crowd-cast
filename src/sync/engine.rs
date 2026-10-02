@@ -900,6 +900,80 @@ fn retain_unpurged_pending_uploads(
     entries.len() != before
 }
 
+/// Move everything in the legacy Temp recordings folder into `new_dir` and repoint the upload
+/// manifest at the moved files (PDOOM-1473). Both folders live under the user profile on the
+/// same drive, so each move is a rename, not a copy. A file that cannot be moved stays where it
+/// is and keeps its manifest path, so nothing is lost; the next launch tries again.
+#[cfg(target_os = "windows")]
+pub(crate) fn migrate_legacy_recordings_dir(legacy_dir: &Path, new_dir: &Path) {
+    if legacy_dir == new_dir || !legacy_dir.is_dir() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(new_dir) {
+        warn!("Cannot create recordings dir {:?}: {}; leaving recordings in {:?}", new_dir, e, legacy_dir);
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(legacy_dir) else {
+        return;
+    };
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut failed = 0usize;
+    for entry in entries.flatten() {
+        let from = entry.path();
+        if !from.is_file() {
+            continue;
+        }
+        let to = new_dir.join(entry.file_name());
+        if to.exists() {
+            continue;
+        }
+        match std::fs::rename(&from, &to) {
+            Ok(()) => moved.push((from, to)),
+            Err(e) => {
+                failed += 1;
+                warn!("Could not move {:?} to {:?}: {}", from, to, e);
+            }
+        }
+    }
+    if moved.is_empty() && failed == 0 {
+        let _ = std::fs::remove_dir(legacy_dir);
+        return;
+    }
+    let mut pending = read_pending_uploads();
+    let mut repointed = 0usize;
+    let remap = |p: &mut PathBuf, moved: &[(PathBuf, PathBuf)]| -> bool {
+        if let Some((_, to)) = moved.iter().find(|(from, _)| from == p) {
+            *p = to.clone();
+            true
+        } else {
+            false
+        }
+    };
+    for e in pending.iter_mut() {
+        let mut hit = remap(&mut e.input_path, &moved);
+        if let Some(v) = e.video_path.as_mut() {
+            hit |= remap(v, &moved);
+        }
+        if hit {
+            repointed += 1;
+        }
+    }
+    if repointed > 0 {
+        write_pending_uploads(&pending);
+    }
+    info!(
+        "Moved {} recording file(s) from {:?} to {:?} ({} queued upload(s) repointed, {} file(s) left behind)",
+        moved.len(),
+        legacy_dir,
+        new_dir,
+        repointed,
+        failed
+    );
+    if failed == 0 {
+        let _ = std::fs::remove_dir(legacy_dir);
+    }
+}
+
 /// Finished segments on disk that no manifest entry points at. A finished segment is written
 /// as `input_<session>_seg<NNNN>.msgpack` (plus, normally, `recording_<same>.mp4`) and put in
 /// the manifest in the same breath, so such a pair without an entry means an earlier build
@@ -1330,11 +1404,7 @@ impl SyncEngine {
         notification_rx: mpsc::UnboundedReceiver<NotificationAction>,
         auth: Option<Arc<tokio::sync::Mutex<crate::auth::AuthManager>>>,
     ) -> Result<Self> {
-        let output_dir = config
-            .recording
-            .output_directory
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join("crowd-cast-recordings"));
+        let output_dir = config.recording_output_directory();
 
         let (upload_tx, upload_rx) = mpsc::unbounded_channel();
         let uploader = Uploader::new(&config, auth);

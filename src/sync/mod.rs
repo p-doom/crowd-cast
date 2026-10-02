@@ -3,6 +3,8 @@
 mod engine;
 
 pub use engine::{create_engine_channels, SyncEngine};
+#[cfg(target_os = "windows")]
+pub(crate) use engine::migrate_legacy_recordings_dir;
 
 /// Commands that can be sent to the sync engine
 #[derive(Debug, Clone)]
