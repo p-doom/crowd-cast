@@ -8,12 +8,16 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: "dev = test build: prerelease, NO appcast publish (does not auto-update users); prod = real release"
+        description: "dev = test build: hidden DRAFT release, NO appcast publish (does not auto-update users); prod = real release"
         type: choice
         options: [prod, dev]
         default: prod
       version_base:
         description: "Marketing version (blank = Cargo.toml version)"
+        required: false
+        default: ""
+      release_notes:
+        description: "prod: user-facing bullets for the release page, e.g. '* **Fix X**: what changed for participants (#123)'. Required for prod; ignored for dev."
         required: false
         default: ""
       allow_version_mismatch:
@@ -34,6 +38,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+
+      # A prod release with an empty "What's changed" is what the release page must never show.
+      - name: Require release notes for prod
+        if: ${{ github.event.inputs.channel != 'dev' }}
+        shell: pwsh
+        env:
+          NOTES: ${{ github.event.inputs.release_notes }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NOTES)) {
+            Write-Error "release_notes is required for a prod release (user-facing bullets with PR numbers)."
+            exit 1
+          }
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -193,17 +209,19 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: ${{ github.event.inputs.channel == 'dev' && format('v{0} (cross-platform test)', steps.ver.outputs.marketing) || format('v{0}', steps.ver.outputs.marketing) }}
-          # dev = prerelease: excluded from /releases/latest, so the docs download
-          # buttons keep pointing at the current prod release.
-          prerelease: ${{ github.event.inputs.channel == 'dev' }}
+          name: ${{ github.event.inputs.channel == 'dev' && format('v{0} (Windows test build)', steps.ver.outputs.marketing) || format('v{0} (Windows)', steps.ver.outputs.marketing) }}
+          # dev = DRAFT: invisible on the public releases page and never /releases/latest, so
+          # test builds do not clutter the page and the docs download buttons keep pointing at
+          # the current prod release. Download a draft's installer with
+          # `gh release download <tag>` (works for repo members). Delete it after testing.
+          draft: ${{ github.event.inputs.channel == 'dev' }}
           body: |
             ## Installation
 
             Please refer to the [quickstart guide](https://pdoom.org/crowd-cast-quickstart.html) for installation instructions.
 
-            ## What's changed
-            <!-- Add the user-facing changes for this release. -->
+            ## What's Changed
+            ${{ github.event.inputs.release_notes }}
           # Everything but the .exe is carried forward (above) and may be absent on a
           # very first release, so do not fail if one is missing.
           fail_on_unmatched_files: false
