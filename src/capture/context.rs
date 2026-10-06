@@ -474,6 +474,12 @@ impl CaptureContext {
         if let Some(paths) = obs_startup_paths_from_env() {
             startup_info = startup_info.set_startup_paths(paths);
         }
+        // Windows: libobs warnings/errors (and encoder start output) into our log (#175).
+        #[cfg(target_os = "windows")]
+        {
+            startup_info =
+                startup_info.set_logger(Box::new(super::obs_log::TracingObsLogger::new()));
+        }
         log_critical_operation("initialize: calling ObsContext::new()");
         let context = ObsContext::new(startup_info).context("Failed to create OBS context")?;
         log_critical_operation("initialize: ObsContext::new() completed");
@@ -1473,11 +1479,21 @@ impl CaptureContext {
         );
 
         // Create and start recording
+        #[cfg(not(target_os = "windows"))]
         let mut recording =
             RecordingOutput::new(context.clone(), output_path.clone(), &self.recording_config)
                 .context("Failed to create recording output")?;
 
+        #[cfg(not(target_os = "windows"))]
         recording.start().context("Failed to start recording")?;
+
+        // Windows: same, but falls back to another video encoder on start failure (#175).
+        #[cfg(target_os = "windows")]
+        let recording = super::encoder_fallback::start_recording_output(
+            &context,
+            &output_path,
+            &self.recording_config,
+        )?;
 
         // Get the start timestamp from OBS
         let start_time_ns = context

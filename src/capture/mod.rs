@@ -16,9 +16,13 @@ mod apps;
 #[cfg_attr(not(all(target_os = "macos", not(no_tray))), allow(dead_code))]
 pub(crate) mod black_probe;
 mod context;
+#[cfg(target_os = "windows")]
+mod encoder_fallback;
 #[cfg(target_os = "linux")]
 pub(crate) mod focus;
 mod frontmost;
+#[cfg(target_os = "windows")]
+mod obs_log;
 #[cfg(target_os = "macos")]
 mod mac_geometry;
 #[cfg(target_os = "linux")]
@@ -71,6 +75,8 @@ pub fn is_single_active_capable() -> bool {
 
 pub use apps::{list_capturable_apps, list_running_apps};
 pub use context::{CaptureContext, RecordingSession};
+#[cfg(target_os = "windows")]
+pub use encoder_fallback::set_video_encoder_override;
 pub use frontmost::{get_frontmost_app, AppInfo};
 pub use recording::{
     calculate_output_dimensions, RecordingConfig, RecordingOutput, RecordingOutputBuilder,
