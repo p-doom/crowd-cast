@@ -312,6 +312,162 @@ fn cached_window_probe_verdict(
     }
 }
 
+/// Windows (#137): what the dead-source ladder knows about the WINDOW the dead source is bound
+/// to. `dead_source_action` only sees the app; these facts separate "this one window never
+/// delivers WGC frames" (an owned dialog, while the same app's main window captures fine) from
+/// a wedged capture stack, so the ladder stops telling participants to restart their computer
+/// over a single dialog.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DeadWindowFacts {
+    /// We already restarted for this window identity (persisted, 24h, cleared once it is
+    /// ever ready): it was dead before the restart too.
+    restarted_before: bool,
+    /// An earlier post-restart Alert for this identity was downgraded (persisted, 24h,
+    /// cleared once it is ever ready).
+    known_uncapturable: bool,
+    /// The bound window is owned (a dialog/palette of a main window).
+    owned: bool,
+    /// Some source has been ready in this process: the capture stack works here.
+    ready_this_process: bool,
+    /// This window AND a different window identity each stayed bound and dead for the
+    /// escalation threshold with no source ready in between: the stack-wide signature.
+    other_window_dead: bool,
+    /// This window itself has stayed bound and dead for the escalation threshold. False right
+    /// after a re-point: the app's dead clock may then belong to the PREVIOUS window.
+    window_stayed_dead: bool,
+    /// The in-process alert de-dupe for this app (`capture_alerted_apps`).
+    already_alerted: bool,
+}
+
+/// Windows-only refinement of a `dead_source_action` decision, applied when the bound window's
+/// identity is known (otherwise the ladder's decision stands unchanged). Pure; it only ever
+/// maps to an existing variant. Decision table:
+///
+/// - Wait / PauseOnly / Hold: unchanged.
+/// - Restart for a window never restarted for (and not known uncapturable): unchanged. This
+///   is the restart that cures a real WGC/D3D wedge (the 21h idle-resume incident).
+/// - Restart for a window we already restarted for, or know to be uncapturable, within 24h
+///   (the per-app marker ages out after 1h, or the app's main window recovered in between):
+///   treated as already restarted, i.e. Hold if this app already alerted, otherwise the Alert
+///   rules below. This stops the hourly re-restart of the same dead window.
+/// - Alert:
+///   - another window identity also stayed dead with no source ready in between: Alert
+///     (stack-wide evidence beats everything);
+///   - a source was ready in this process, or the window is known uncapturable, or it is an
+///     owned dialog that was already dead before the restart: PauseOnly (the stack is
+///     healthy; it is this window);
+///   - this window was only just bound (it has not itself stayed dead for the threshold; the
+///     app's dead clock belongs to the previous window): Wait, give it its own threshold;
+///   - otherwise (no evidence either way, e.g. an unowned main window dead before and after
+///     the restart with nothing ready since): Alert, exactly as today.
+#[cfg(target_os = "windows")]
+fn refine_dead_action_for_window(
+    action: &DeadSourceAction,
+    facts: DeadWindowFacts,
+) -> DeadSourceAction {
+    let alert_rules = || {
+        if facts.other_window_dead {
+            DeadSourceAction::Alert
+        } else if facts.ready_this_process
+            || facts.known_uncapturable
+            || (facts.restarted_before && facts.owned)
+        {
+            DeadSourceAction::PauseOnly
+        } else if !facts.window_stayed_dead {
+            DeadSourceAction::Wait
+        } else {
+            DeadSourceAction::Alert
+        }
+    };
+    match action {
+        DeadSourceAction::Wait => DeadSourceAction::Wait,
+        DeadSourceAction::PauseOnly => DeadSourceAction::PauseOnly,
+        DeadSourceAction::Hold => DeadSourceAction::Hold,
+        DeadSourceAction::Restart => {
+            if !(facts.restarted_before || facts.known_uncapturable) {
+                DeadSourceAction::Restart
+            } else if facts.already_alerted {
+                DeadSourceAction::Hold
+            } else {
+                alert_rules()
+            }
+        }
+        DeadSourceAction::Alert => alert_rules(),
+    }
+}
+
+/// Windows (#137): minimum gap between two dead-window diagnostic log lines.
+#[cfg(target_os = "windows")]
+const DEAD_WINDOW_DIAG_MIN_GAP: Duration = Duration::from_secs(60);
+
+/// Windows (#137): the small in-process evidence the window refinement needs. All of it is
+/// about WINDOWS (identities = bound obs_id), never apps.
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct DeadWindowEvidence {
+    /// The persisted 24h per-window records, loaded on first use.
+    records: Option<crate::capture::dead_windows::WindowRecords>,
+    /// Some source has been ready since this process started.
+    ready_this_process: bool,
+    /// The identity bound at the last dead tick and since when it has been continuously
+    /// bound and dead (identity changes and readiness reset it).
+    bound_track: Option<(String, Instant)>,
+    /// Identities that stayed bound and dead for the escalation threshold with no source
+    /// ready since. Cleared whenever any source is ready.
+    dead_since_ready: std::collections::HashSet<String>,
+    /// Identities already described by the diagnostic line this episode.
+    diag_logged: std::collections::HashSet<String>,
+    last_diag_at: Option<Instant>,
+    /// Identities whose downgrade was already logged this episode.
+    downgrade_logged: std::collections::HashSet<String>,
+}
+
+#[cfg(target_os = "windows")]
+impl DeadWindowEvidence {
+    fn records(&mut self) -> &mut crate::capture::dead_windows::WindowRecords {
+        self.records
+            .get_or_insert_with(crate::capture::dead_windows::load)
+    }
+
+    fn store_records(&mut self) {
+        if let Some(records) = self.records.as_ref() {
+            crate::capture::dead_windows::store(records);
+        }
+    }
+
+    /// A source is ready (bound to `identity`, when known): the stack works in this process,
+    /// any dead-window episode is over, and this identity is not uncapturable after all.
+    fn on_ready(&mut self, identity: Option<&str>) {
+        self.ready_this_process = true;
+        self.bound_track = None;
+        self.dead_since_ready.clear();
+        self.diag_logged.clear();
+        self.downgrade_logged.clear();
+        if let Some(id) = identity {
+            if self.records().tracks(id) && self.records().clear_ready(id) {
+                self.store_records();
+            }
+        }
+    }
+
+    /// A dead tick with `identity` bound. Once one identity has stayed bound and dead for
+    /// `stay_dead_after` it counts toward the stack-wide signature. Brief follow-focus flips
+    /// never qualify: the identity changes, so its continuity restarts.
+    fn note_dead_tick(&mut self, identity: &str, now: Instant, stay_dead_after: Duration) {
+        let since = match &self.bound_track {
+            Some((id, since)) if id == identity => *since,
+            _ => {
+                self.bound_track = Some((identity.to_string(), now));
+                now
+            }
+        };
+        if now.saturating_duration_since(since) >= stay_dead_after {
+            self.dead_since_ready.insert(identity.to_string());
+        }
+    }
+}
+
 /// Fraction of the composited output that must read as capture-black before we treat the
 /// recording as blind. Deliberately near-total, with the 3% of headroom sized for what a
 /// black app-capture frame still shows: the menu-bar strip and the cursor (~1-2% of pixels).
@@ -1303,6 +1459,9 @@ pub struct SyncEngine {
     /// memory lives in the marker file; this is only the in-process alert de-dupe.
     #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
     capture_alerted_apps: std::collections::HashSet<String>,
+    /// Windows (#137): per-WINDOW evidence for `refine_dead_action_for_window`.
+    #[cfg(target_os = "windows")]
+    dead_window_evidence: DeadWindowEvidence,
     /// PER-KEY blind clocks for the black-output ladder (PDOOM-1298). A source that comes up
     /// black-but-valid-sized passes every readiness check the dead-source watchdog makes, so
     /// this runs as a PARALLEL ladder driven by the output blackness probe instead of by
@@ -1522,6 +1681,8 @@ unintended app video."
             capture_dead_since: std::collections::HashMap::new(),
             #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
             capture_alerted_apps: std::collections::HashSet::new(),
+            #[cfg(target_os = "windows")]
+            dead_window_evidence: DeadWindowEvidence::default(),
             #[cfg(all(target_os = "macos", not(no_tray)))]
             blind_since: std::collections::HashMap::new(),
             #[cfg(all(target_os = "macos", not(no_tray)))]
@@ -2533,6 +2694,18 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
             already_restarted,
             already_alerted,
         );
+        // Windows (#137): refine the per-app decision with what is known about the bound
+        // WINDOW, so one never-delivering dialog no longer reaches the reboot prompt (see
+        // refine_dead_action_for_window). macOS: no refinement, decision unchanged.
+        #[cfg(target_os = "windows")]
+        let (action, dead_window) = self.refine_dead_action_windows(
+            &app,
+            action,
+            surface_failure && !window_less,
+            now,
+            ESCALATE_AFTER,
+            already_alerted,
+        );
 
         match action {
             DeadSourceAction::Wait => false,
@@ -2583,6 +2756,20 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                         dead_for.as_secs()
                     );
                     note_capture_dead_restart(&app);
+                    // Windows (#137): also remember WHICH window we restarted for (24h), so
+                    // the fresh process can tell it was already dead before the restart.
+                    #[cfg(target_os = "windows")]
+                    if let Some(identity) = dead_window.as_deref() {
+                        let now_secs = crate::capture::dead_windows::unix_now_secs();
+                        let evidence = &mut self.dead_window_evidence;
+                        if evidence.records().insert(
+                            crate::capture::dead_windows::RecordKind::Restarted,
+                            identity,
+                            now_secs,
+                        ) {
+                            evidence.store_records();
+                        }
+                    }
                     self.input_backend.stop();
                     self.stop_recording().await.ok();
                     restart_process(); // replaces the process — never returns
@@ -2595,6 +2782,122 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                 true
             }
         }
+    }
+
+    /// Windows (#137): gather the bound window's facts, apply `refine_dead_action_for_window`,
+    /// and do the refinement's own bookkeeping. Returns the refined action plus the bound
+    /// window's identity (the Restart arm records it). `track` is "preconditions met and the
+    /// app has a window": only then does a dead tick count as a window staying dead.
+    ///
+    /// Side effects, all window-scoped: one rate-limited diagnostic line per dead-with-window
+    /// episode; on a downgraded Alert, the identity is remembered as uncapturable (24h) and the
+    /// "can't record this window" notification is shown at most once per identity per day.
+    /// A downgraded Alert deliberately does NOT enter `capture_alerted_apps`, so a later real
+    /// stack-wide wedge of the same app can still alert.
+    #[cfg(target_os = "windows")]
+    fn refine_dead_action_windows(
+        &mut self,
+        app: &str,
+        action: DeadSourceAction,
+        track: bool,
+        now: Instant,
+        stay_dead_after: Duration,
+        already_alerted: bool,
+    ) -> (DeadSourceAction, Option<String>) {
+        use crate::capture::dead_windows::{identity_of, unix_now_secs, RecordKind};
+
+        let Some((hwnd, obs_id)) = self.capture_ctx.active_bound_window() else {
+            self.dead_window_evidence.bound_track = None;
+            return (action, None);
+        };
+        let identity = identity_of(&obs_id);
+        let evidence = &mut self.dead_window_evidence;
+        if !track {
+            evidence.bound_track = None;
+            return (action, Some(identity));
+        }
+        evidence.note_dead_tick(&identity, now, stay_dead_after);
+
+        if !matches!(
+            action,
+            DeadSourceAction::Restart | DeadSourceAction::Alert | DeadSourceAction::Hold
+        ) {
+            return (action, Some(identity));
+        }
+
+        // One diagnostic line per dead-with-window episode (per identity, reset when any
+        // source is ready), at most one per minute, so the remaining WGC-level reason a titled
+        // visible window never delivers frames can be found from shipped logs.
+        let diag_due = !evidence.diag_logged.contains(&identity)
+            && evidence
+                .last_diag_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= DEAD_WINDOW_DIAG_MIN_GAP);
+        if diag_due {
+            evidence.diag_logged.insert(identity.clone());
+            evidence.last_diag_at = Some(now);
+            warn!(
+                "Dead-window diagnostic for '{}': {} identity={:?}",
+                app,
+                crate::capture::win_enum::describe_bound_window(hwnd),
+                identity
+            );
+        }
+
+        if action == DeadSourceAction::Hold {
+            return (action, Some(identity));
+        }
+
+        let now_secs = unix_now_secs();
+        // Stack-wide signature: THIS window and a different one have each stayed bound and
+        // dead for the threshold with no source ready in between. Requiring this window too
+        // keeps a single not-ready tick right after a re-point (follow-focus moving from the
+        // dead dialog back to the healthy main window) from reading as a second dead window.
+        let window_stayed_dead = evidence.dead_since_ready.contains(&identity);
+        let other_window_dead =
+            window_stayed_dead && evidence.dead_since_ready.iter().any(|id| *id != identity);
+        let ready_this_process = evidence.ready_this_process;
+        let records = evidence.records();
+        let facts = DeadWindowFacts {
+            restarted_before: records.has(RecordKind::Restarted, &identity, now_secs),
+            known_uncapturable: records.has(RecordKind::Uncapturable, &identity, now_secs),
+            owned: crate::capture::win_enum::window_owner(hwnd) != 0,
+            ready_this_process,
+            other_window_dead,
+            window_stayed_dead,
+            already_alerted,
+        };
+        let refined = refine_dead_action_for_window(&action, facts);
+
+        if refined == DeadSourceAction::Wait {
+            // Only just bound: the app's dead clock belongs to the previous window.
+            debug!(
+                "Capture source for '{}' not ready on just-bound window {:?}; giving it its own \
+                 threshold before escalating (#137)",
+                app, identity
+            );
+        } else if refined != action {
+            if !evidence.downgrade_logged.contains(&identity) {
+                evidence.downgrade_logged.insert(identity.clone());
+                warn!(
+                    "Capture source for '{}' is dead on window {:?}, but this looks like that \
+                     one window, not the capture stack ({:?}); {:?} instead of {:?} (#137)",
+                    app, identity, facts, refined, action
+                );
+            }
+            if refined == DeadSourceAction::PauseOnly {
+                let records = evidence.records();
+                let newly_uncapturable =
+                    records.insert(RecordKind::Uncapturable, &identity, now_secs);
+                let notify = records.insert(RecordKind::Notified, &identity, now_secs);
+                if newly_uncapturable || notify {
+                    evidence.store_records();
+                }
+                if notify {
+                    crate::ui::show_window_uncapturable_notification();
+                }
+            }
+        }
+        (refined, Some(identity))
     }
 
     /// Pause recording (video + keylog, the idle-pause machinery) because the active capture
@@ -3007,6 +3310,16 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                     self.capture_alerted_apps
                         .remove(watchdog.expected_app.as_str());
                     clear_capture_dead_restart(&watchdog.expected_app);
+                }
+                // Windows (#137): the stack works in this process, and whichever window is
+                // bound is not uncapturable after all (forget its 24h records).
+                #[cfg(target_os = "windows")]
+                {
+                    let identity = self
+                        .capture_ctx
+                        .active_bound_window()
+                        .map(|(_, obs_id)| crate::capture::dead_windows::identity_of(&obs_id));
+                    self.dead_window_evidence.on_ready(identity.as_deref());
                 }
                 // Auto-resume a dead-capture pause: the source is ready again, so recording is
                 // no longer black. Success is read back from `is_paused` (`resume_recording`
@@ -5836,6 +6149,423 @@ mod tests {
                 dead_source_action(dead(60), false, AFTER, true, false, false),
                 DeadSourceAction::Wait
             );
+        }
+    }
+
+    // Windows (#137): the per-window refinement of the dead-source ladder. Pure table tests
+    // plus replays of the field sequences through a small model of the engine glue (per-app
+    // marker, in-process alert de-dupe, persisted per-window records, process restarts).
+    #[cfg(target_os = "windows")]
+    mod window_refinement {
+        use super::*;
+        use crate::capture::dead_windows::{RecordKind, WindowRecords};
+
+        const AFTER: Duration = Duration::from_secs(12);
+
+        /// No evidence, with the bound window having stayed dead for the threshold (the
+        /// normal situation at an escalation tick).
+        fn facts() -> DeadWindowFacts {
+            DeadWindowFacts {
+                window_stayed_dead: true,
+                ..DeadWindowFacts::default()
+            }
+        }
+
+        #[test]
+        fn wait_pause_and_hold_pass_through() {
+            let all = DeadWindowFacts {
+                restarted_before: true,
+                known_uncapturable: true,
+                owned: true,
+                ready_this_process: true,
+                other_window_dead: true,
+                window_stayed_dead: true,
+                already_alerted: true,
+            };
+            for a in [
+                DeadSourceAction::Wait,
+                DeadSourceAction::PauseOnly,
+                DeadSourceAction::Hold,
+            ] {
+                for f in [facts(), all] {
+                    let expected = match a {
+                        DeadSourceAction::Wait => DeadSourceAction::Wait,
+                        DeadSourceAction::PauseOnly => DeadSourceAction::PauseOnly,
+                        _ => DeadSourceAction::Hold,
+                    };
+                    assert_eq!(refine_dead_action_for_window(&a, f), expected);
+                }
+            }
+        }
+
+        #[test]
+        fn first_restart_for_a_window_is_always_kept() {
+            // The real-wedge cure: even with every "healthy" signal, a window never restarted
+            // for still gets its one restart.
+            for f in [
+                facts(),
+                DeadWindowFacts {
+                    owned: true,
+                    ready_this_process: true,
+                    ..facts()
+                },
+                DeadWindowFacts {
+                    other_window_dead: true,
+                    already_alerted: true,
+                    ..facts()
+                },
+            ] {
+                assert_eq!(
+                    refine_dead_action_for_window(&DeadSourceAction::Restart, f),
+                    DeadSourceAction::Restart
+                );
+            }
+        }
+
+        #[test]
+        fn repeat_restart_for_the_same_window_is_treated_as_already_restarted() {
+            let healthy = DeadWindowFacts {
+                restarted_before: true,
+                ready_this_process: true,
+                ..facts()
+            };
+            assert_eq!(
+                refine_dead_action_for_window(&DeadSourceAction::Restart, healthy),
+                DeadSourceAction::PauseOnly
+            );
+            let uncapturable = DeadWindowFacts {
+                known_uncapturable: true,
+                ..facts()
+            };
+            assert_eq!(
+                refine_dead_action_for_window(&DeadSourceAction::Restart, uncapturable),
+                DeadSourceAction::PauseOnly
+            );
+            // Already alerted in this process (a kept Alert): sit tight, no hourly re-restart.
+            let alerted = DeadWindowFacts {
+                restarted_before: true,
+                already_alerted: true,
+                ..facts()
+            };
+            assert_eq!(
+                refine_dead_action_for_window(&DeadSourceAction::Restart, alerted),
+                DeadSourceAction::Hold
+            );
+            // No evidence: the Alert a second restart would have led to anyway.
+            let none = DeadWindowFacts {
+                restarted_before: true,
+                ..facts()
+            };
+            assert_eq!(
+                refine_dead_action_for_window(&DeadSourceAction::Restart, none),
+                DeadSourceAction::Alert
+            );
+        }
+
+        #[test]
+        fn alert_table() {
+            let alert = |f| refine_dead_action_for_window(&DeadSourceAction::Alert, f);
+            // Healthy-stack evidence → pause instead of the reboot prompt.
+            assert_eq!(
+                alert(DeadWindowFacts {
+                    ready_this_process: true,
+                    ..facts()
+                }),
+                DeadSourceAction::PauseOnly
+            );
+            assert_eq!(
+                alert(DeadWindowFacts {
+                    known_uncapturable: true,
+                    ..facts()
+                }),
+                DeadSourceAction::PauseOnly
+            );
+            assert_eq!(
+                alert(DeadWindowFacts {
+                    restarted_before: true,
+                    owned: true,
+                    ..facts()
+                }),
+                DeadSourceAction::PauseOnly
+            );
+            // Stack-wide evidence beats every healthy signal.
+            assert_eq!(
+                alert(DeadWindowFacts {
+                    restarted_before: true,
+                    owned: true,
+                    known_uncapturable: true,
+                    ready_this_process: true,
+                    other_window_dead: true,
+                    ..facts()
+                }),
+                DeadSourceAction::Alert
+            );
+            // No evidence either way → today's Alert: an unowned main window dead before and
+            // after the restart with nothing ready since, or an owned window whose restart was
+            // for a different window, or no facts at all.
+            for f in [
+                DeadWindowFacts {
+                    restarted_before: true,
+                    ..facts()
+                },
+                DeadWindowFacts {
+                    owned: true,
+                    ..facts()
+                },
+                facts(),
+            ] {
+                assert_eq!(alert(f), DeadSourceAction::Alert);
+            }
+            // A window only just bound (the app's dead clock belongs to the previous window):
+            // wait for its own threshold instead of alerting on borrowed time.
+            assert_eq!(
+                alert(DeadWindowFacts {
+                    window_stayed_dead: false,
+                    ..facts()
+                }),
+                DeadSourceAction::Wait
+            );
+            // ...but healthy evidence still pauses it and stack-wide evidence cannot apply.
+            assert_eq!(
+                alert(DeadWindowFacts {
+                    window_stayed_dead: false,
+                    ready_this_process: true,
+                    ..facts()
+                }),
+                DeadSourceAction::PauseOnly
+            );
+        }
+
+        /// A small model of the engine glue around the two pure decisions, mirroring
+        /// `maybe_escalate_dead_source`, `refine_dead_action_windows` and the Ok(true) arm.
+        /// Restarts are modelled by `restart()`, which keeps only what survives a process
+        /// restart (the per-app marker and the per-window records).
+        struct Sim {
+            app_marker: bool,
+            alerted: bool,
+            records: WindowRecords,
+            ready_this_process: bool,
+            dead_since_ready: std::collections::HashSet<String>,
+            now: u64,
+            restarts: u32,
+            reboot_alerts: u32,
+            gentle_notices: u32,
+        }
+
+        impl Sim {
+            fn new() -> Self {
+                Self {
+                    app_marker: false,
+                    alerted: false,
+                    records: WindowRecords::default(),
+                    ready_this_process: false,
+                    dead_since_ready: Default::default(),
+                    now: 1_800_000_000,
+                    restarts: 0,
+                    reboot_alerts: 0,
+                    gentle_notices: 0,
+                }
+            }
+
+            fn restart(&mut self) {
+                self.alerted = false;
+                self.ready_this_process = false;
+                self.dead_since_ready.clear();
+            }
+
+            /// The app's source became ready while bound to `window`.
+            fn ready(&mut self, window: &str) {
+                self.app_marker = false;
+                self.alerted = false;
+                self.ready_this_process = true;
+                self.dead_since_ready.clear();
+                self.records.clear_ready(window);
+            }
+
+            /// One escalation tick with `window` bound and dead past the threshold (it has
+            /// stayed bound that long). Returns the action the engine takes.
+            fn dead_tick(&mut self, window: &str, owned: bool) -> DeadSourceAction {
+                self.tick(window, owned, true)
+            }
+
+            /// A not-ready tick on a window that was only JUST bound (a re-point), so it has
+            /// not stayed dead for the threshold itself.
+            fn blip_tick(&mut self, window: &str, owned: bool) -> DeadSourceAction {
+                self.tick(window, owned, false)
+            }
+
+            fn tick(&mut self, window: &str, owned: bool, stayed: bool) -> DeadSourceAction {
+                if stayed {
+                    self.dead_since_ready.insert(window.to_string());
+                }
+                let action =
+                    dead_source_action(AFTER, true, AFTER, false, self.app_marker, self.alerted);
+                let f = DeadWindowFacts {
+                    restarted_before: self.records.has(RecordKind::Restarted, window, self.now),
+                    known_uncapturable: self.records.has(
+                        RecordKind::Uncapturable,
+                        window,
+                        self.now,
+                    ),
+                    owned,
+                    ready_this_process: self.ready_this_process,
+                    other_window_dead: self.dead_since_ready.contains(window)
+                        && self.dead_since_ready.iter().any(|w| w != window),
+                    window_stayed_dead: self.dead_since_ready.contains(window),
+                    already_alerted: self.alerted,
+                };
+                let refined = refine_dead_action_for_window(&action, f);
+                match refined {
+                    DeadSourceAction::Restart => {
+                        self.app_marker = true;
+                        self.records.insert(RecordKind::Restarted, window, self.now);
+                        self.restarts += 1;
+                        self.restart();
+                    }
+                    DeadSourceAction::Alert => {
+                        self.alerted = true;
+                        self.reboot_alerts += 1;
+                    }
+                    DeadSourceAction::PauseOnly if refined != action => {
+                        self.records.insert(RecordKind::Uncapturable, window, self.now);
+                        if self.records.insert(RecordKind::Notified, window, self.now) {
+                            self.gentle_notices += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                refined
+            }
+        }
+
+        const MAIN: &str = "Project - Mechanical:ATL#3A0000000007643AF0:AnsysWBU.exe";
+        const SOLUTION: &str = "Ansys Workbench Solution Status:#2232770:AnsysWBU.exe";
+        const MESH: &str = "Ansys Workbench Mesh Status:#2232770:AnsysWBU.exe";
+        const NX_MAIN: &str = "Designcenter Modeling:Afx#3A0000000180000000:ugraf.exe";
+        const EDGE_BLEND: &str = "Edge Blend:NX_SURFACE_WND_DIALOG:ugraf.exe";
+        const ASSEMBLY: &str = "Assembly Minimally Load - Lightweight:#2232770:ugraf.exe";
+
+        /// The 5 Ansys and 2 NX field sequences: an owned dialog that never delivers frames,
+        /// restart, the fresh process re-binds it. None may reach the reboot prompt.
+        #[test]
+        fn field_sequences_never_prompt_for_a_reboot() {
+            for (main, dialog) in [
+                (MAIN, SOLUTION),
+                (MAIN, MESH),
+                (MAIN, MESH),
+                (MAIN, SOLUTION),
+                (MAIN, MESH),
+                (NX_MAIN, ASSEMBLY),
+                (NX_MAIN, EDGE_BLEND),
+            ] {
+                let mut s = Sim::new();
+                s.ready(main); // the app recorded fine before the dialog
+                assert_eq!(s.dead_tick(dialog, true), DeadSourceAction::Restart);
+                // Fresh process: the dialog is re-bound (it has focus) and stays dead.
+                assert_eq!(s.dead_tick(dialog, true), DeadSourceAction::PauseOnly);
+                // Every later tick keeps pausing; no reboot prompt, one gentle notice.
+                for _ in 0..10 {
+                    assert_eq!(s.dead_tick(dialog, true), DeadSourceAction::PauseOnly);
+                }
+                assert_eq!((s.restarts, s.reboot_alerts, s.gentle_notices), (1, 0, 1));
+                // Follow-focus re-points to the main window; a tick can land before its first
+                // frame. That is not a second dead window (and the app's dead clock belongs to
+                // the dialog): it waits for the main window's own threshold, no reboot prompt.
+                assert_eq!(s.blip_tick(main, false), DeadSourceAction::Wait);
+                assert_eq!(s.reboot_alerts, 0);
+                // Back on the main window: ready, resume. The dialog stays remembered.
+                s.ready(main);
+                assert!(s.records.has(RecordKind::Uncapturable, dialog, s.now));
+                // The dialog again later (a new instance, same identity): no restart at all.
+                assert_eq!(s.dead_tick(dialog, true), DeadSourceAction::PauseOnly);
+                assert_eq!((s.restarts, s.reboot_alerts, s.gentle_notices), (1, 0, 1));
+            }
+        }
+
+        /// The NX flip pattern: after a kept Alert-free pause the main window recovers (which
+        /// clears the per-app marker), then the same dialog dies again. Previously a second
+        /// restart (and in the next process the reboot prompt); now it pauses.
+        #[test]
+        fn same_dialog_after_main_window_recovery_does_not_restart_again() {
+            let mut s = Sim::new();
+            assert_eq!(s.dead_tick(EDGE_BLEND, true), DeadSourceAction::Restart);
+            s.ready(NX_MAIN);
+            assert_eq!(s.dead_tick(EDGE_BLEND, true), DeadSourceAction::PauseOnly);
+            assert_eq!((s.restarts, s.reboot_alerts), (1, 0));
+        }
+
+        /// The 1h prune of the per-app marker: a window dead for over an hour used to restart
+        /// (and re-alert) every hour. The per-window record (24h) stops that.
+        #[test]
+        fn hourly_marker_expiry_does_not_restart_the_same_window_again() {
+            let mut s = Sim::new();
+            s.ready(MAIN);
+            assert_eq!(s.dead_tick(MESH, true), DeadSourceAction::Restart);
+            assert_eq!(s.dead_tick(MESH, true), DeadSourceAction::PauseOnly);
+            s.app_marker = false; // the marker aged out an hour later
+            assert_eq!(s.dead_tick(MESH, true), DeadSourceAction::PauseOnly);
+            assert_eq!((s.restarts, s.reboot_alerts), (1, 0));
+            // Same for a KEPT alert (unowned window, stack wedge): Hold, not a re-restart.
+            let mut w = Sim::new();
+            assert_eq!(w.dead_tick(MAIN, false), DeadSourceAction::Restart);
+            assert_eq!(w.dead_tick(MAIN, false), DeadSourceAction::Alert);
+            w.app_marker = false;
+            assert_eq!(w.dead_tick(MAIN, false), DeadSourceAction::Hold);
+            assert_eq!((w.restarts, w.reboot_alerts), (1, 1));
+        }
+
+        /// A real stack-wide wedge (the 21h incident class) where the restart does NOT cure
+        /// it and everything stays dead: Restart, then the reboot Alert, exactly as before.
+        #[test]
+        fn stack_wide_wedge_restarts_then_alerts() {
+            // Unowned main window, nothing ready after the restart.
+            let mut s = Sim::new();
+            s.ready(MAIN); // healthy before the wedge
+            assert_eq!(s.dead_tick(MAIN, false), DeadSourceAction::Restart);
+            assert_eq!(s.dead_tick(MAIN, false), DeadSourceAction::Alert);
+            assert_eq!(s.dead_tick(MAIN, false), DeadSourceAction::Hold);
+            assert_eq!((s.restarts, s.reboot_alerts), (1, 1));
+
+            // A dialog was bound when the wedge hit: it pauses first, but as soon as a second
+            // window also stays dead with nothing ready in between, the Alert fires.
+            let mut d = Sim::new();
+            assert_eq!(d.dead_tick(SOLUTION, true), DeadSourceAction::Restart);
+            assert_eq!(d.dead_tick(SOLUTION, true), DeadSourceAction::PauseOnly);
+            assert_eq!(d.dead_tick(MAIN, false), DeadSourceAction::Alert);
+            assert_eq!((d.restarts, d.reboot_alerts), (1, 1));
+        }
+
+        /// A restart that cures the wedge: the window is ready in the fresh process, its
+        /// records are forgotten, and a later wedge of the same window restarts again.
+        #[test]
+        fn cured_restart_is_unchanged() {
+            let mut s = Sim::new();
+            assert_eq!(s.dead_tick(MAIN, false), DeadSourceAction::Restart);
+            s.ready(MAIN);
+            assert!(!s.records.tracks(MAIN));
+            assert_eq!(s.dead_tick(MAIN, false), DeadSourceAction::Restart);
+            assert_eq!((s.restarts, s.reboot_alerts), (2, 0));
+        }
+
+        #[test]
+        fn dead_tick_tracking_ignores_brief_flips() {
+            let mut e = DeadWindowEvidence::default();
+            let t0 = Instant::now();
+            // Dialog and main window alternate faster than the threshold: neither qualifies.
+            for i in 0..20u64 {
+                let w = if i % 2 == 0 { EDGE_BLEND } else { NX_MAIN };
+                e.note_dead_tick(w, t0 + Duration::from_millis(1500 * i), AFTER);
+            }
+            assert!(e.dead_since_ready.is_empty());
+            // One identity continuously bound and dead for the threshold qualifies.
+            let t1 = t0 + Duration::from_secs(100);
+            e.note_dead_tick(EDGE_BLEND, t1, AFTER);
+            e.note_dead_tick(EDGE_BLEND, t1 + AFTER, AFTER);
+            assert!(e.dead_since_ready.contains(EDGE_BLEND));
+            // Any ready source ends the episode.
+            e.records = Some(WindowRecords::default());
+            e.on_ready(Some(NX_MAIN));
+            assert!(e.dead_since_ready.is_empty() && e.ready_this_process);
         }
     }
 

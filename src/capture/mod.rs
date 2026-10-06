@@ -16,6 +16,8 @@ mod apps;
 #[cfg_attr(not(all(target_os = "macos", not(no_tray))), allow(dead_code))]
 pub(crate) mod black_probe;
 mod context;
+#[cfg(target_os = "windows")]
+pub(crate) mod dead_windows;
 #[cfg(target_os = "linux")]
 pub(crate) mod focus;
 mod frontmost;
