@@ -2054,6 +2054,25 @@ impl CaptureContext {
         }
     }
 
+    /// Windows: the window the active source is bound to, as `(hwnd, obs_id it was bound
+    /// with)`, chosen exactly like `active_source_dimensions` picks the source. Read by the
+    /// dead-source ladder to key its per-window memory (#137). `None` for display capture or
+    /// when nothing is bound.
+    #[cfg(target_os = "windows")]
+    pub fn active_bound_window(&self) -> Option<(isize, String)> {
+        let source = if self.use_single_active_app_capture() {
+            self.active_capture_app
+                .as_ref()
+                .and_then(|app| self.app_scenes.get(app))
+                .map(|(_, source)| source)
+        } else {
+            self.capture_sources.first()
+        };
+        source
+            .and_then(|s| s.bound_window())
+            .map(|(hwnd, obs_id)| (hwnd, obs_id.to_string()))
+    }
+
     /// Follow-focus within the active app: when the foreground window becomes a DIFFERENT window
     /// of the SAME already-captured app (a dialog, a second window, a file picker), re-point the
     /// existing `window_capture` source to it in-place. On current main the Windows path only

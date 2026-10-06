@@ -85,6 +85,11 @@ pub struct ScreenCaptureSource {
     /// next genuine focus change self-corrects it.
     #[cfg(target_os = "windows")]
     bound_hwnd: Option<isize>,
+    /// Windows: the obs_id (`title:class:exe`) of the window `bound_hwnd` was bound with, set
+    /// at the same bind sites. NOT a dedup key (see above); it is the window IDENTITY the
+    /// dead-source ladder remembers dead windows by (#137, `capture::dead_windows`).
+    #[cfg(target_os = "windows")]
+    bound_obs_id: Option<String>,
     /// Windows monitor name currently selected by `monitor_capture`. OBS keys monitor sources by
     /// this stable device name; retaining it avoids restarting WGC on every focus poll.
     #[cfg(target_os = "windows")]
@@ -188,6 +193,7 @@ impl ScreenCaptureSource {
             app_id: None,
             // Monitor capture is display-bound, never window-bound; follow-focus never touches it.
             bound_hwnd: None,
+            bound_obs_id: None,
             display_id: primary.map(|monitor| monitor.0.name.clone()),
         })
     }
@@ -374,6 +380,7 @@ impl ScreenCaptureSource {
             // Seed the follow-focus dedup key with the window we just bound, so the first poll
             // after creation only re-points if the foreground window is genuinely different.
             bound_hwnd: Some(hwnd),
+            bound_obs_id: Some(obs_id),
             display_id: None,
         })
     }
@@ -655,6 +662,7 @@ impl ScreenCaptureSource {
         // next poll would either spuriously re-point (stale key) or fail to correct a genuine
         // change (see the `bound_hwnd` doc comment on why every bind site must set this).
         self.bound_hwnd = Some(hwnd);
+        self.bound_obs_id = Some(obs_id);
         info!(
             "Updated window capture source '{}' to application '{}' (hwnd: {:#x})",
             self.name, bundle_id, hwnd
@@ -686,6 +694,7 @@ impl ScreenCaptureSource {
             .context("Failed to re-point window capture target")?;
 
         self.bound_hwnd = Some(hwnd);
+        self.bound_obs_id = Some(obs_id.to_string());
         info!(
             "Re-pointed window capture source '{}' to window {:#x} ({})",
             self.name, hwnd, obs_id
@@ -700,6 +709,13 @@ impl ScreenCaptureSource {
     #[cfg(target_os = "windows")]
     pub(crate) fn bound_hwnd(&self) -> Option<isize> {
         self.bound_hwnd
+    }
+
+    /// Windows: the bound window as `(hwnd, obs_id)`, the obs_id being the one it was bound
+    /// with. Read by the dead-source ladder to key its per-window memory (#137).
+    #[cfg(target_os = "windows")]
+    pub(crate) fn bound_window(&self) -> Option<(isize, &str)> {
+        Some((self.bound_hwnd?, self.bound_obs_id.as_deref()?))
     }
 
     /// Re-resolve and re-point this source at the app's focused window, in-place.
@@ -1160,9 +1176,12 @@ pub(crate) fn permissive_window_for_app(
 }
 
 /// Find a capturable top-level window belonging to the given application (matched by executable
-/// file stem, case-insensitive), returning its numeric handle and OBS window id. Picks the first
-/// match in enumeration order, unchanged from before; only the return shape grew to also surface
-/// the HWND (so the two callers can seed `bound_hwnd`).
+/// file stem, case-insensitive), returning its numeric handle and OBS window id. Among the
+/// app's strict matches it prefers, in order (see `pick_creation_window`): a window not known
+/// to be uncapturable, the app's foreground window, an unowned main window over an owned
+/// dialog; ties keep enumeration order. An owned dialog enumerates before its owner, so the
+/// old first-match pick re-bound a never-delivering dialog in the fresh process after a
+/// dead-source restart (#137). Returns the HWND too (so the callers can seed `bound_hwnd`).
 #[cfg(target_os = "windows")]
 fn find_window_obs_id_for_app(bundle_id: &str) -> Result<(isize, String)> {
     // STRICT-ONLY, deliberately: creating a `window_capture` source with a permissively
@@ -1172,16 +1191,60 @@ fn find_window_obs_id_for_app(bundle_id: &str) -> Result<(isize, String)> {
     // captures the same window fine. So permissive binding is scoped to re-points on scenes
     // that already exist; an app that is tool-window-only at scene-creation time stays
     // NoCapturableWindow and rides #140's parked-pause until a strict window appears.
-    enumerate_capture_windows()?
-        .into_iter()
-        .find(|(_, _, stem)| stem.eq_ignore_ascii_case(bundle_id))
-        .map(|(hwnd, obs_id, _)| (hwnd, obs_id))
-        .ok_or_else(|| {
-            // Same typed signal as the refresh-time site in `update_application`.
-            anyhow::Error::new(NoCapturableWindow {
-                app: bundle_id.to_string(),
-            })
+    // The candidates are still exactly the strict enumeration (title gate and crash guard
+    // included); only the choice among them changed.
+    let candidates = enumerate_capture_windows()?;
+    let foreground = super::window_geometry::foreground_window_of_app(bundle_id);
+    let records = super::dead_windows::load();
+    let now = super::dead_windows::unix_now_secs();
+    pick_creation_window(
+        &candidates,
+        bundle_id,
+        foreground,
+        |hwnd| super::win_enum::window_owner(hwnd) != 0,
+        |obs_id| {
+            records.has(
+                super::dead_windows::RecordKind::Uncapturable,
+                &super::dead_windows::identity_of(obs_id),
+                now,
+            )
+        },
+    )
+    .ok_or_else(|| {
+        // Same typed signal as the refresh-time site in `update_application`.
+        anyhow::Error::new(NoCapturableWindow {
+            app: bundle_id.to_string(),
         })
+    })
+}
+
+/// Pure scene-creation window choice for `find_window_obs_id_for_app`, over a strict
+/// `enumerate_capture_windows()` snapshot. Only the app's own candidates are considered (the
+/// same exe-stem rule as everywhere else); the ranking key, lowest first, is
+/// `(known uncapturable, not the foreground window, owned)`, and ties keep enumeration order
+/// (`min_by_key` returns the first minimum). A known-uncapturable window is ranked LAST, never
+/// excluded: if it is the app's only window it is still bound, exactly as before, so an app
+/// never loses its scene (and the no-backoff needs-scene restart path never sees a
+/// strict-window app without one). `None` only when the app has no candidate at all.
+#[cfg(target_os = "windows")]
+pub(crate) fn pick_creation_window(
+    candidates: &[(isize, String, String)],
+    bundle_id: &str,
+    foreground: Option<isize>,
+    is_owned: impl Fn(isize) -> bool,
+    is_uncapturable: impl Fn(&str) -> bool,
+) -> Option<(isize, String)> {
+    candidates
+        .iter()
+        .filter(|(_, _, stem)| stem.eq_ignore_ascii_case(bundle_id))
+        .min_by_key(|(hwnd, obs_id, _)| {
+            (
+                is_uncapturable(obs_id),
+                Some(*hwnd) != foreground,
+                is_owned(*hwnd),
+            )
+        })
+        .map(|(hwnd, obs_id, _)| (*hwnd, obs_id.clone()))
 }
 
 /// Pure follow-focus dedup / trigger decision. `foreground` is the HWND the caller has already
@@ -1368,7 +1431,7 @@ pub fn get_main_display_resolution() -> Result<(u32, u32)> {
 #[cfg(all(test, target_os = "windows"))]
 mod follow_focus_tests {
     use super::{
-        plan_repoint, resolve_watchdog_target, select_window_by_handle,
+        pick_creation_window, plan_repoint, resolve_watchdog_target, select_window_by_handle,
         should_skip_unresolvable, UNRESOLVABLE_RETRY_TICKS,
     };
 
@@ -1523,5 +1586,81 @@ mod follow_focus_tests {
         let mut skip = None;
         assert!(!should_skip_unresolvable(&mut skip, 0x5000));
         assert_eq!(skip, None);
+    }
+
+    // --- pick_creation_window: main window first at scene creation (#137) ----
+
+    const DIALOG: isize = 0x241610;
+    const MAIN: isize = 0x80b06;
+    const DIALOG_ID: &str = "Ansys Workbench Solution Status:#2232770:AnsysWBU.exe";
+    const MAIN_ID: &str = "E #3A Two fin - Mechanical:ATL#3A0000000007643AF0:AnsysWBU.exe";
+
+    /// The observed #137 enumeration: the owned dialog lists before its owner.
+    fn ansys_windows() -> Vec<(isize, String, String)> {
+        vec![
+            app_candidate(0x1111, "Claude:Chrome_WidgetWin_1:claude.exe", "claude"),
+            app_candidate(DIALOG, DIALOG_ID, "AnsysWBU"),
+            app_candidate(MAIN, MAIN_ID, "AnsysWBU"),
+        ]
+    }
+
+    fn owned_dialog(h: isize) -> bool {
+        h == DIALOG
+    }
+
+    #[test]
+    fn creation_prefers_unowned_main_window_over_earlier_owned_dialog() {
+        let pick =
+            pick_creation_window(&ansys_windows(), "ansyswbu", None, owned_dialog, |_| false);
+        assert_eq!(pick, Some((MAIN, MAIN_ID.to_string())));
+    }
+
+    #[test]
+    fn creation_prefers_the_foreground_window_even_if_owned() {
+        // Follow-focus would re-point to the focused window right away anyway; binding it at
+        // creation saves that re-point.
+        let pick = pick_creation_window(
+            &ansys_windows(),
+            "ansyswbu",
+            Some(DIALOG),
+            owned_dialog,
+            |_| false,
+        );
+        assert_eq!(pick, Some((DIALOG, DIALOG_ID.to_string())));
+    }
+
+    #[test]
+    fn creation_ranks_known_uncapturable_last_even_when_focused() {
+        let pick = pick_creation_window(
+            &ansys_windows(),
+            "ansyswbu",
+            Some(DIALOG),
+            owned_dialog,
+            |id| id == DIALOG_ID,
+        );
+        assert_eq!(pick, Some((MAIN, MAIN_ID.to_string())));
+    }
+
+    #[test]
+    fn creation_still_binds_a_known_uncapturable_only_window() {
+        // Ranked last, never excluded: an app must not lose its scene over it.
+        let windows = vec![app_candidate(DIALOG, DIALOG_ID, "AnsysWBU")];
+        let pick = pick_creation_window(&windows, "ansyswbu", None, owned_dialog, |_| true);
+        assert_eq!(pick, Some((DIALOG, DIALOG_ID.to_string())));
+    }
+
+    #[test]
+    fn creation_ties_keep_enumeration_order_and_ignore_other_apps() {
+        let windows = vec![
+            app_candidate(0x1, "a:Cls:other.exe", "other"),
+            app_candidate(0x2, "first:Cls:app.exe", "App"),
+            app_candidate(0x3, "second:Cls:app.exe", "app"),
+        ];
+        let pick = pick_creation_window(&windows, "app", None, |_| false, |_| false);
+        assert_eq!(pick, Some((0x2, "first:Cls:app.exe".to_string())));
+        assert_eq!(
+            pick_creation_window(&windows, "missing", None, |_| false, |_| false),
+            None
+        );
     }
 }
