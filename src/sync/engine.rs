@@ -3974,7 +3974,14 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                         }
                         EngineCommand::Panic => {
                             warn!("PANIC: deleting recent recordings");
-                            if self.current_session.is_some() {
+                            // Remember whether recording was running before the delete. A
+                            // participant who pressed Stop earlier and then uses this button to
+                            // clean up must stay stopped: unconditionally restarting here (and
+                            // persisting Recording) turned "Delete last 10 minutes" into a start
+                            // button (GitHub issue 160, PDOOM-1482). An idle or dead-capture
+                            // pause counts as active: the fresh session re-pauses on its own.
+                            let was_active = self.current_session.is_some();
+                            if was_active {
                                 let session = obs_call_with_watchdog(
                                     || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
                                     "panic: stop_recording",
@@ -4000,9 +4007,13 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                                 self.clear_event_buffer();
                             }
                             self.purge_upload_buffer();
-                            write_recording_state(PersistedRecordingState::Recording);
-                            if let Err(e) = self.start_recording().await {
-                                error!("Failed to restart recording after panic: {}", e);
+                            if was_active {
+                                write_recording_state(PersistedRecordingState::Recording);
+                                if let Err(e) = self.start_recording().await {
+                                    error!("Failed to restart recording after panic: {}", e);
+                                }
+                            } else {
+                                info!("Panic delete finished; recording was stopped and stays stopped");
                             }
                         }
                         EngineCommand::SwitchToDisplay { display_id } => {
