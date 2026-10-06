@@ -676,7 +676,7 @@ dependencies = [
 [[package]]
 name = "cargo-obs-build"
 version = "2.0.4"
-source = "git+https://github.com/p-doom/libobs-rs?branch=linux-support#3b35595e7e0e09574a391477bbb69adbc82874ae"
+source = "git+https://github.com/p-doom/libobs-rs?branch=crowd-cast-encoder-fallback#e57f70ee0750e5cf18a5150c4f576df955d94d03"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -2732,7 +2732,7 @@ checksum = "7fc7aa29613bd6a620df431842069224d8bc9011086b1db4c0e0cd47fa03ec9a"
 [[package]]
 name = "libobs"
 version = "4.0.3+32.0.2"
-source = "git+https://github.com/p-doom/libobs-rs?branch=linux-support#3b35595e7e0e09574a391477bbb69adbc82874ae"
+source = "git+https://github.com/p-doom/libobs-rs?branch=crowd-cast-encoder-fallback#e57f70ee0750e5cf18a5150c4f576df955d94d03"
 dependencies = [
  "bindgen",
  "pkg-config",
@@ -2741,7 +2741,7 @@ dependencies = [
 [[package]]
 name = "libobs-bootstrapper"
 version = "0.2.6"
-source = "git+https://github.com/p-doom/libobs-rs?branch=linux-support#3b35595e7e0e09574a391477bbb69adbc82874ae"
+source = "git+https://github.com/p-doom/libobs-rs?branch=crowd-cast-encoder-fallback#e57f70ee0750e5cf18a5150c4f576df955d94d03"
 dependencies = [
  "async-stream",
  "futures-core",
@@ -2763,7 +2763,7 @@ dependencies = [
 [[package]]
 name = "libobs-simple"
 version = "6.0.1+32.0.2"
-source = "git+https://github.com/p-doom/libobs-rs?branch=linux-support#3b35595e7e0e09574a391477bbb69adbc82874ae"
+source = "git+https://github.com/p-doom/libobs-rs?branch=crowd-cast-encoder-fallback#e57f70ee0750e5cf18a5150c4f576df955d94d03"
 dependencies = [
  "display-info",
  "libobs",
@@ -2779,7 +2779,7 @@ dependencies = [
 [[package]]
 name = "libobs-simple-macro"
 version = "6.0.2"
-source = "git+https://github.com/p-doom/libobs-rs?branch=linux-support#3b35595e7e0e09574a391477bbb69adbc82874ae"
+source = "git+https://github.com/p-doom/libobs-rs?branch=crowd-cast-encoder-fallback#e57f70ee0750e5cf18a5150c4f576df955d94d03"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2789,7 +2789,7 @@ dependencies = [
 [[package]]
 name = "libobs-window-helper"
 version = "0.3.1"
-source = "git+https://github.com/p-doom/libobs-rs?branch=linux-support#3b35595e7e0e09574a391477bbb69adbc82874ae"
+source = "git+https://github.com/p-doom/libobs-rs?branch=crowd-cast-encoder-fallback#e57f70ee0750e5cf18a5150c4f576df955d94d03"
 dependencies = [
  "windows 0.62.2",
 ]
@@ -2797,7 +2797,7 @@ dependencies = [
 [[package]]
 name = "libobs-wrapper"
 version = "7.0.2+32.0.2"
-source = "git+https://github.com/p-doom/libobs-rs?branch=linux-support#3b35595e7e0e09574a391477bbb69adbc82874ae"
+source = "git+https://github.com/p-doom/libobs-rs?branch=crowd-cast-encoder-fallback#e57f70ee0750e5cf18a5150c4f576df955d94d03"
 dependencies = [
  "chrono",
  "colored 3.1.1",
