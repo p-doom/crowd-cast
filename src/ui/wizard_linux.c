@@ -63,6 +63,14 @@ static size_t g_req_count = 0;
 // the app picker and forces full-screen capture (set via FFI).
 static gboolean g_per_app_available = TRUE;
 
+// ---- the selection the user already saved (owned copy, set via FFI) ----
+// The wizard seeds its checklist from this so a re-run shows the user's actual state; without
+// it a re-run (a TCC reset, an unmet requirement, an autostart mismatch -- see main.rs) would
+// save an empty checklist over the whole whitelist.
+static char **g_seed_apps = NULL;
+static size_t g_seed_count = 0;
+static bool g_seed_capture_all = false;
+
 static void free_stored_apps(void) {
     if (g_app_ids && g_app_names) {
         for (size_t i = 0; i < g_app_count; i++) {
@@ -109,6 +117,29 @@ void wizard_set_apps(const WizardAppInfo *apps, size_t count) {
         g_app_names[i] = strdup(apps[i].name ? apps[i].name : "");
     }
     g_app_count = count;
+}
+
+static void free_stored_seed(void) {
+    if (g_seed_apps) {
+        for (size_t i = 0; i < g_seed_count; i++) {
+            free(g_seed_apps[i]);
+        }
+    }
+    free(g_seed_apps);
+    g_seed_apps = NULL;
+    g_seed_count = 0;
+}
+
+void wizard_set_selection(const char *const *apps, size_t count, bool capture_all) {
+    free_stored_seed();
+    g_seed_capture_all = capture_all;
+    if (!apps || count == 0) return;
+    g_seed_apps = (char **)calloc(count, sizeof(char *));
+    if (!g_seed_apps) return;
+    for (size_t i = 0; i < count; i++) {
+        g_seed_apps[i] = strdup(apps[i] ? apps[i] : "");
+    }
+    g_seed_count = count;
 }
 
 void wizard_set_requirements(const WizardRequirement *reqs, size_t count) {
@@ -279,6 +310,11 @@ static void build_addremove_section(GtkWidget *content, GtkWidget *dialog,
     gtk_container_add(GTK_CONTAINER(scroll), ctx->check_list);
     gtk_box_pack_start(GTK_BOX(ctx->apps_section), scroll, TRUE, TRUE, 0);
 
+    // Which preselected entries the candidate list covers; the rest get their own rows below.
+    bool *seed_listed = (preselected_count > 0)
+        ? (bool *)calloc(preselected_count, sizeof(bool))
+        : NULL;
+
     for (size_t i = 0; i < g_app_count; i++) {
         if (!g_app_ids[i] || !g_app_ids[i][0]) {
             continue;
@@ -290,12 +326,40 @@ static void build_addremove_section(GtkWidget *content, GtkWidget *dialog,
         for (size_t j = 0; j < preselected_count; j++) {
             if (preselected[j] && strcmp(preselected[j], g_app_ids[i]) == 0) {
                 gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(chk), TRUE);
+                if (seed_listed) seed_listed[j] = true;
                 break;
             }
         }
         g_signal_connect(chk, "toggled", G_CALLBACK(on_settings_check_toggled), ctx);
         gtk_box_pack_start(GTK_BOX(ctx->check_list), chk, FALSE, FALSE, 0);
     }
+
+    // A whitelisted app the host doesn't enumerate right now (not running, under X11) still
+    // belongs to the selection. Give it a pre-ticked row of its own -- the accept path only
+    // collects ticked rows, so without one it would be silently dropped on save, and the user
+    // could never see or deliberately remove it either.
+    for (size_t j = 0; j < preselected_count; j++) {
+        if (!preselected[j] || !preselected[j][0]) continue;
+        if (seed_listed && seed_listed[j]) continue;
+        // Guard against a duplicate id appearing twice in the saved list.
+        bool already_added = false;
+        for (size_t k = 0; k < j; k++) {
+            if (preselected[k] && strcmp(preselected[k], preselected[j]) == 0) {
+                already_added = true;
+                break;
+            }
+        }
+        if (already_added) continue;
+
+        char *label = g_strdup_printf("%s (not running)", preselected[j]);
+        GtkWidget *chk = gtk_check_button_new_with_label(label);
+        g_free(label);
+        g_object_set_data_full(G_OBJECT(chk), "app-id", g_strdup(preselected[j]), g_free);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(chk), TRUE);
+        g_signal_connect(chk, "toggled", G_CALLBACK(on_settings_check_toggled), ctx);
+        gtk_box_pack_start(GTK_BOX(ctx->check_list), chk, FALSE, FALSE, 0);
+    }
+    free(seed_listed);
 
     g_signal_connect(ctx->capture_all, "toggled", G_CALLBACK(on_settings_capture_all), ctx);
 
@@ -422,14 +486,17 @@ int wizard_run(WizardConfig *out) {
     }
 
     // ---- Capture options (shared add/remove UI with the tray "Settings" dialog) ----
-    // Start with NO capture mode selected: "capture all" defaults off and the app list
-    // is empty, so settings_update_save() keeps Finish disabled until the user makes an
-    // explicit choice (tick "capture all" or add an app). We must never silently default
-    // to recording the whole screen. (When per-app capture is unavailable on the host,
-    // build_addremove_section forces "capture all" on with a visible note -- that's an
-    // explicit, gated choice, not a silent default.)
+    // Seeded with whatever the user already saved (wizard_set_selection). On a true first run
+    // the seed is empty: "capture all" off and no app ticked, so settings_update_save() keeps
+    // Finish disabled until the user makes an explicit choice -- we must never silently
+    // default to recording the whole screen. On a re-run (a TCC/requirement/autostart
+    // condition in main.rs, not a first run) the seed is the user's own earlier explicit
+    // choice, so showing it back is not a silent default. (When per-app capture is
+    // unavailable on the host, build_addremove_section forces "capture all" on with a
+    // visible note -- also an explicit, gated choice.)
     SettingsCtx ctx;
-    build_addremove_section(content, dialog, FALSE, NULL, 0, required_unmet, &ctx);
+    build_addremove_section(content, dialog, g_seed_capture_all ? TRUE : FALSE,
+                            (const char **)g_seed_apps, g_seed_count, required_unmet, &ctx);
 
     GtkWidget *autostart = gtk_check_button_new_with_label("Start crowd-cast on login");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(autostart), autostart_initial);
