@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [Unreleased]
+### Fixed
+- Linux: the libobs bundle now includes the `obs-x264` plugin. Without it the `obs_x264` software encoder was missing and recording could not start on hosts without VAAPI (e.g. NVIDIA GPUs). The bundle build now fails if `obs_x264` is absent.
 
 ## [1.0.5] - 2026-06-17
 ### Added

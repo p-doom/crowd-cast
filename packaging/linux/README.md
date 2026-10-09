@@ -40,9 +40,10 @@ Output: `packaging/linux/out/obs-bundle-32.0.2-x86_64.tar.zst` + `.sha256`.
 
 ## Smoke test (the gate that would have caught the missing mp4_output)
 
-- **In-build (no GPU needed):** asserts `mp4_output` + `ffmpeg_muxer` are registered in
-  the built `obs-ffmpeg.so`, and that libobs loads + enumerates the output. Build fails
-  if `mp4_output` is absent.
+- **In-build (no GPU needed):** asserts `mp4_output` (obs-outputs), `ffmpeg_muxer`
+  (obs-ffmpeg) and `obs_x264` (obs-x264) are registered in the built plugins. Build fails
+  if any is absent. `obs_x264` is the encoder the agent uses whenever VAAPI is unavailable
+  (NVIDIA, or Intel/AMD without VA drivers), so a bundle without it cannot record there.
 - **On host (real VAAPI):** `packaging/linux/smoke-test-host.sh <bundle-dir>` extracts the
   bundle and runs crowd-cast against it, asserting a recording file actually grows.
   Run this on the laptop (real Intel GPU); CI has no GPU so it only runs the software gate.
