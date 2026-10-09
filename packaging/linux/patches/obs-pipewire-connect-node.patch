@@ -1,8 +1,37 @@
 diff --git a/plugins/linux-pipewire/pipewire.c b/plugins/linux-pipewire/pipewire.c
-index d312a18..83de907 100644
+index d312a18..008643a 100644
 --- a/plugins/linux-pipewire/pipewire.c
 +++ b/plugins/linux-pipewire/pipewire.c
-@@ -1131,8 +1131,14 @@ obs_pipewire *obs_pipewire_connect_fd(int pipewire_fd, const struct pw_registry_
+@@ -29,6 +29,7 @@
+ #include <glib/gstdio.h>
+ 
+ #include <fcntl.h>
++#include <stdlib.h>
+ #include <glad/glad.h>
+ #include <libdrm/drm_fourcc.h>
+ #include <pipewire/pipewire.h>
+@@ -392,6 +393,20 @@ static bool build_format_params(obs_pipewire_stream *obs_pw_stream, struct spa_p
+ 	if (!check_pw_version(&obs_pw->server_version, 0, 3, 33))
+ 		goto build_shm;
+ 
++	/* crowd-cast: on the NVIDIA proprietary driver, importing the compositor's DMA-BUF frames
++	 * into OBS's OpenGL context yields a black texture, so the whole recording is black while
++	 * OBS still draws and encodes frames. When the agent sets CROWD_CAST_PIPEWIRE_FORCE_SHM
++	 * (it does so only when it detects that driver), skip the DMA-BUF formats and offer only
++	 * shared-memory buffers, which the CPU-upload path renders correctly on every driver. */
++	{
++		const char *force_shm = getenv("CROWD_CAST_PIPEWIRE_FORCE_SHM");
++		if (force_shm && force_shm[0] && force_shm[0] != '0') {
++			blog(LOG_INFO,
++			     "[pipewire] crowd-cast: CROWD_CAST_PIPEWIRE_FORCE_SHM set - offering shared-memory buffers only (no DMA-BUF)");
++			goto build_shm;
++		}
++	}
++
+ 	for (size_t i = 0; i < obs_pw_stream->format_info.num; i++) {
+ 		if (obs_pw_stream->format_info.array[i].modifiers.num == 0) {
+ 			continue;
+@@ -1131,8 +1146,14 @@ obs_pipewire *obs_pipewire_connect_fd(int pipewire_fd, const struct pw_registry_
  
  	pw_thread_loop_lock(obs_pw->thread_loop);
  

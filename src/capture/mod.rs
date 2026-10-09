@@ -45,6 +45,44 @@ pub fn is_gnome_wayland() -> bool {
     sources::is_wayland_session() && crate::installer::gnome_focus::is_gnome()
 }
 
+/// Before OBS initializes, force the bundled obs-pipewire plugin onto shared-memory buffers when
+/// the NVIDIA proprietary driver is active (a DRM `card*` bound to the `nvidia` driver, not the
+/// open `nouveau`). OBS cannot import that driver's DMA-BUF screencast frames into its GL context:
+/// the texture is black, so recordings are black even though frames are drawn and encoded. The
+/// plugin reads `CROWD_CAST_PIPEWIRE_FORCE_SHM` (crowd-cast patch in
+/// `packaging/linux/patches/obs-pipewire-connect-node.patch`). No-op off Linux, off that driver,
+/// or when already set. Must run before [`CaptureContext::new`]; AMD/Intel keep zero-copy DMA-BUF.
+pub fn force_pipewire_shm_if_needed() {
+    #[cfg(target_os = "linux")]
+    {
+        const VAR: &str = "CROWD_CAST_PIPEWIRE_FORCE_SHM";
+        if std::env::var_os(VAR).is_some() {
+            return;
+        }
+        let nvidia = std::fs::read_dir("/sys/class/drm")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("card") && !n.contains('-')
+            })
+            .any(|e| {
+                std::fs::read_link(e.path().join("device/driver"))
+                    .ok()
+                    .and_then(|d| d.file_name().map(|n| n == "nvidia"))
+                    .unwrap_or(false)
+            });
+        if nvidia {
+            std::env::set_var(VAR, "1");
+            tracing::info!(
+                "NVIDIA proprietary driver detected: forcing PipeWire shared-memory capture (DMA-BUF import renders black on this driver)"
+            );
+        }
+    }
+}
+
 /// Whether this platform/session can drive the single-active-app capture model (capture
 /// only the frontmost tracked app, switching on focus). macOS always can (ScreenCaptureKit
 /// per-app). Windows always can (per-window capture + follow focus). Linux can only when the
