@@ -21,6 +21,11 @@ static atomic_bool trayRestartRequested = false;
 static CFAbsoluteTime statusItemDetachedSince = 0;
 static BOOL statusItemWasAttached = NO;
 
+// Decoded tray icon, cached by source path (see tray_update). Only touched on the main
+// thread, which is where tray_update dispatches its work.
+static NSImage *cachedIconImage = nil;
+static NSString *cachedIconPath = nil;
+
 // Last health-check verdict, exposed via tray_status_item_health_state() so the
 // Rust side can log transitions into the app log file (NSLog from this layer
 // only reaches the unified system log, which participants don't send us).
@@ -375,14 +380,26 @@ void tray_update(struct tray *tray) {
                 // Always ensure visible (macOS can hide items after display changes)
                 statusItem.visible = YES;
 
-                // Update icon
+                // Update icon. tray_update runs on every engine status message (~1/s while
+                // recording), but the icon only changes when the recording STATE changes --
+                // there are three of them. Decoding the PNG every time cost ~0.155ms plus a
+                // menu-bar redraw, ~86k times a day, to arrive at the same image. Cache the
+                // decoded NSImage per path, and skip the assignment when it is unchanged.
                 if (tray->icon_filepath != NULL) {
                     NSString *path = [NSString stringWithUTF8String:tray->icon_filepath];
-                    NSImage *image = [[NSImage alloc] initWithContentsOfFile:path];
-                    if (image != nil) {
-                        [image setSize:NSMakeSize(18, 18)];
-                        [image setTemplate:NO];
-                        statusItem.button.image = image;
+                    if (cachedIconPath == nil || ![path isEqualToString:cachedIconPath]) {
+                        NSImage *image = [[NSImage alloc] initWithContentsOfFile:path];
+                        if (image != nil) {
+                            [image setSize:NSMakeSize(18, 18)];
+                            [image setTemplate:NO];
+                            cachedIconImage = image;
+                            cachedIconPath = [path copy];
+                            statusItem.button.image = image;
+                        }
+                    } else if (cachedIconImage != nil && statusItem.button.image != cachedIconImage) {
+                        // The status item was rebuilt (health watchdog re-creates it), so the
+                        // image is gone -- re-apply the cached one instead of re-decoding.
+                        statusItem.button.image = cachedIconImage;
                     }
                 }
 

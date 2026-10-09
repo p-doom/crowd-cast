@@ -60,7 +60,11 @@ impl InputBackend for RdevBackend {
             info!("rdev input capture started");
 
             let callback = move |event: rdev::Event| {
-                if !capturing.load(Ordering::SeqCst) {
+                // Relaxed: this is a plain stop flag on the hottest path in the process (every
+                // keystroke and every mouse-move event from the system event tap). Nothing is
+                // published alongside it, so the full barrier SeqCst emits bought nothing; a
+                // late-observed stop just drops one more event into a channel nobody reads.
+                if !capturing.load(Ordering::Relaxed) {
                     return;
                 }
 
