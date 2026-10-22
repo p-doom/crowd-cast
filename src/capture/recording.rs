@@ -266,6 +266,94 @@ impl RecordingOutput {
         })
     }
 
+    /// Windows: build the output for one option of the encoder fallback chain (#175).
+    /// `Default` is exactly `new` (today's path); the others differ only in the video
+    /// encoder: a pinned encoder id, extra settings, or x264 `veryfast` CBR.
+    #[cfg(target_os = "windows")]
+    pub(super) fn new_for_encoder_option(
+        context: ObsContext,
+        output_path: PathBuf,
+        config: &RecordingConfig,
+        option: &super::encoder_fallback::EncoderOption,
+    ) -> Result<Self> {
+        use super::encoder_fallback::EncoderOption;
+        use libobs_simple::output::simple::X264Preset;
+        use std::str::FromStr;
+
+        let forced = |id: &str| {
+            libobs_wrapper::encoders::ObsVideoEncoderType::from_str(id)
+                .unwrap_or_else(|never| match never {})
+        };
+        let base = |context: ObsContext, obs_path: ObsPath| {
+            SimpleOutputBuilder::new(context, "recording", obs_path)
+                .video_bitrate(config.video_bitrate)
+                .audio_bitrate(config.audio_bitrate)
+                .format(config.format)
+        };
+
+        let output_path_str = output_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid output path (non-UTF8): {:?}", output_path))?;
+        let obs_path = ObsPath::new(output_path_str);
+
+        let builder = match option {
+            EncoderOption::Default { .. } => return Self::new(context, output_path, config),
+            EncoderOption::QsvLookaheadOff { id } => {
+                // Same preset/CRF handling as today's pick (QSV has no CRF, so CBR; the codec
+                // is unused once the id is pinned), plus lookahead and B-frames off.
+                // "ultra-low" sets QSV's lookahead depth to 0.
+                let mut b = base(context, obs_path)
+                    .hardware_encoder(HardwareCodec::HEVC, config.quality_preset)
+                    .force_video_encoder_id(forced(id))
+                    .video_encoder_setting_string("latency", "ultra-low")
+                    .video_encoder_setting_int("bframes", 0);
+                if let Some(crf) = config.crf {
+                    b = b.crf(crf);
+                }
+                b
+            }
+            EncoderOption::VendorH264 { id } => {
+                let mut b = base(context, obs_path)
+                    .hardware_encoder(HardwareCodec::H264, config.quality_preset)
+                    .force_video_encoder_id(forced(id));
+                if let Some(crf) = config.crf {
+                    b = b.crf(crf);
+                }
+                b
+            }
+            // No CRF: x264 uses CBR at video_bitrate, not the medium/crf path.
+            EncoderOption::X264VeryFast => base(context, obs_path).x264_encoder(X264Preset::VeryFast),
+        };
+
+        info!(
+            "Creating recording output: {:?} (fallback encoder option: {:?}, bitrate: {} Kbps)",
+            output_path, option, config.video_bitrate
+        );
+        let output = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to create recording output: {}", e))?;
+
+        Ok(Self {
+            output,
+            state: RecordingState::Stopped,
+            output_path,
+        })
+    }
+
+    /// Windows: release an output that never started, so a failed fallback attempt does not
+    /// stay in the OBS context for the rest of the process.
+    #[cfg(target_os = "windows")]
+    pub(super) fn release_unstarted(self, context: &ObsContext) {
+        if self.state != RecordingState::Stopped {
+            return;
+        }
+        let mut ctx = context.clone();
+        if let Err(e) = ctx.remove_output(&self.output) {
+            debug!("Could not release unstarted recording output: {}", e);
+        }
+        drop(self);
+    }
+
     /// Create a new recording output with default configuration (HEVC preferred)
     pub fn new_default(context: ObsContext, output_path: PathBuf) -> Result<Self> {
         Self::new(context, output_path, &RecordingConfig::default())

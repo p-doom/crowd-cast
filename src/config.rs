@@ -179,6 +179,13 @@ pub struct RecordingConfig {
     /// Recordings will be split into segments of this duration for progressive upload
     #[serde(default = "default_segment_duration_secs")]
     pub segment_duration_secs: u64,
+
+    /// Windows escape hatch for the video encoder (#175): "auto" (default), "x264" or
+    /// "qsv_h264". The named option is tried first, then the usual fallback chain. Missing
+    /// or unknown values behave like "auto". Not written to the config unless set.
+    #[cfg(target_os = "windows")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_encoder: Option<String>,
 }
 
 fn default_segment_duration_secs() -> u64 {
@@ -315,6 +322,8 @@ impl Default for RecordingConfig {
             session_id: None,
             notify_on_start_stop: true,
             segment_duration_secs: default_segment_duration_secs(),
+            #[cfg(target_os = "windows")]
+            video_encoder: None,
         }
     }
 }

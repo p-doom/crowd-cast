@@ -486,6 +486,10 @@ fn main() -> Result<()> {
         &get_output_directory(&config),
     );
 
+    // Optional video encoder override from config.toml (#175). Windows-only.
+    #[cfg(target_os = "windows")]
+    capture::set_video_encoder_override(config.recording.video_encoder.as_deref());
+
     // Bootstrap OBS binaries if needed
     info!("Bootstrapping OBS binaries...");
     let mut capture_ctx =
