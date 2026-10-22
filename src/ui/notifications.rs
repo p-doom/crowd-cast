@@ -292,6 +292,19 @@ pub fn show_capture_stuck_notification() {
     );
 }
 
+/// Notify that one specific window cannot be recorded (Windows, #137): its capture stayed dead
+/// after an automatic restart while the capture stack was demonstrably healthy, so recording
+/// is paused instead of telling the participant to restart their computer. Shown at most once
+/// per window identity per day (the caller's persisted de-dupe).
+#[cfg(target_os = "windows")]
+pub fn show_window_uncapturable_notification() {
+    emit(
+        "crowd-cast can't record this window. Recording is paused and resumes when you switch \
+         to another window.",
+        "",
+    );
+}
+
 /// Show notification when recording is paused
 #[cfg(target_os = "macos")]
 pub fn show_recording_paused_notification() {

@@ -224,6 +224,70 @@ pub(crate) fn build_obs_id(title: &str, class: &str, exe_name: &str) -> String {
     format!("{}:{}:{}", enc(title), enc(class), enc(exe_name))
 }
 
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmGetWindowAttribute(hwnd: *mut c_void, attr: u32, value: *mut c_void, size: u32) -> i32;
+}
+
+const DWMWA_CLOAKED: u32 = 14;
+
+/// The owner of `hwnd` (`GetWindow(GW_OWNER)`), 0 for an unowned top-level window. An owned
+/// window is a dialog/palette of a main window (#137: the dead-dialog evidence, and the
+/// main-window-first order at scene creation).
+pub(crate) fn window_owner(hwnd: isize) -> isize {
+    unsafe { GetWindow(hwnd as *mut c_void, GW_OWNER) as isize }
+}
+
+/// One-line description of a single (bound) window for the dead-with-window diagnostic
+/// (#137): class, title, size, owner, cloaked, minimized, visible, foreground. Enough to find
+/// the WGC-level reason a titled, visible window never delivers frames from shipped logs.
+pub(crate) fn describe_bound_window(hwnd: isize) -> String {
+    unsafe {
+        let h = hwnd as *mut c_void;
+        let mut title_buf = [0u16; 512];
+        let tlen = GetWindowTextW(h, title_buf.as_mut_ptr(), title_buf.len() as i32);
+        let mut class_buf = [0u16; 256];
+        let clen = GetClassNameW(h, class_buf.as_mut_ptr(), class_buf.len() as i32);
+        let mut rect = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        GetWindowRect(h, &mut rect);
+        let mut cloaked: u32 = 0;
+        let cloaked_hr = DwmGetWindowAttribute(
+            h,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let cloaked = if cloaked_hr == 0 {
+            format!("{cloaked:#x}")
+        } else {
+            "unknown".to_string()
+        };
+        let owner = GetWindow(h, GW_OWNER) as isize;
+        format!(
+            "hwnd={:#x} class={:?} title={:?} size={}x{} owned={} owner={:#x} cloaked={} \
+             minimized={} visible={} foreground={} style={:#x} ex_style={:#x}",
+            hwnd,
+            String::from_utf16_lossy(&class_buf[..clen.max(0) as usize]),
+            String::from_utf16_lossy(&title_buf[..tlen.max(0) as usize]),
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            owner != 0,
+            owner,
+            cloaked,
+            IsIconic(h) != 0,
+            IsWindowVisible(h) != 0,
+            super::window_geometry::foreground_hwnd() == hwnd,
+            GetWindowLongPtrW(h, GWL_STYLE),
+            GetWindowLongPtrW(h, GWL_EXSTYLE),
+        )
+    }
+}
+
 /// One-line description of a window for the window-less telemetry: enough to classify the
 /// NX shape from a participant's shipped logs without a diagnostic session (PDOOM-1274).
 pub(crate) fn describe_window(w: &RawWindow) -> String {

@@ -18,6 +18,8 @@ pub(crate) mod black_probe;
 mod context;
 #[cfg(target_os = "windows")]
 mod encoder_fallback;
+#[cfg(target_os = "windows")]
+pub(crate) mod dead_windows;
 #[cfg(target_os = "linux")]
 pub(crate) mod focus;
 mod frontmost;
