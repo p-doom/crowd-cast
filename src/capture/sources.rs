@@ -1593,7 +1593,7 @@ mod follow_focus_tests {
     const DIALOG: isize = 0x241610;
     const MAIN: isize = 0x80b06;
     const DIALOG_ID: &str = "Ansys Workbench Solution Status:#2232770:AnsysWBU.exe";
-    const MAIN_ID: &str = "E #3A Two fin - Mechanical:ATL#3A0000000007643AF0:AnsysWBU.exe";
+    const MAIN_ID: &str = "Project - Mechanical:ATL#3A0000000007643AF0:AnsysWBU.exe";
 
     /// The observed #137 enumeration: the owned dialog lists before its owner.
     fn ansys_windows() -> Vec<(isize, String, String)> {
