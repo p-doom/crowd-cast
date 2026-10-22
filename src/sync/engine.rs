@@ -3974,14 +3974,29 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                         }
                         EngineCommand::Panic => {
                             warn!("PANIC: deleting recent recordings");
-                            // Remember whether recording was running before the delete. A
-                            // participant who pressed Stop earlier and then uses this button to
-                            // clean up must stay stopped: unconditionally restarting here (and
-                            // persisting Recording) turned "Delete last 10 minutes" into a start
-                            // button (GitHub issue 160, PDOOM-1482). An idle or dead-capture
-                            // pause counts as active: the fresh session re-pauses on its own.
-                            let was_active = self.current_session.is_some();
-                            if was_active {
+                            // Purge the held segments FIRST. This touches only finished files and
+                            // the manifest, while the OBS stop below can hang (the watchdog then
+                            // restarts the process after 5 s). Purging after the stop would leave
+                            // the last 10 minutes in the manifest for the relaunch to upload —
+                            // exactly what the participant asked to delete.
+                            self.purge_upload_buffer();
+                            // Remember whether recording was meant to be running before the
+                            // delete. A participant who pressed Stop earlier and then uses this
+                            // button to clean up must stay stopped: unconditionally restarting
+                            // here (and persisting Recording) turned "Delete last 10 minutes" into
+                            // a start button (GitHub issue 160, PDOOM-1482). "Meant to be running"
+                            // is the persisted state the Start/Stop handlers write, OR a live
+                            // session: the session can be gone while the state still says
+                            // recording (a failed start or rotation restart, the pre-update stop),
+                            // and there the restart below is the only recovery the participant can
+                            // reach. An idle or dead-capture pause keeps its session, so it counts
+                            // as active and the fresh session re-pauses on its own.
+                            let was_active = self.current_session.is_some()
+                                || matches!(
+                                    read_recording_state(),
+                                    Some(PersistedRecordingState::Recording)
+                                );
+                            if self.current_session.is_some() {
                                 let session = obs_call_with_watchdog(
                                     || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
                                     "panic: stop_recording",
@@ -4006,7 +4021,6 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                                 self.segment_timer = None;
                                 self.clear_event_buffer();
                             }
-                            self.purge_upload_buffer();
                             if was_active {
                                 write_recording_state(PersistedRecordingState::Recording);
                                 if let Err(e) = self.start_recording().await {
