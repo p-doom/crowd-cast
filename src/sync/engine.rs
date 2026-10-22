@@ -733,18 +733,73 @@ fn obs_call_with_watchdog<F, T>(f: F, description: &str) -> T
 where
     F: FnOnce() -> T,
 {
-    const OBS_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+    obs_call_with_watchdog_timeout(f, description, OBS_CALL_TIMEOUT, None)
+}
 
+/// Default watchdog timeout for blocking OBS calls (every call and every platform, except the
+/// Windows output-stop sites, see [`obs_stop_watchdog`]).
+const OBS_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Watchdog `(timeout, warn_after)` for the output-stop call sites (segment rotation and
+/// `stop_recording`). Windows: 15s with a warning at 5s. A Windows stop finishes only once the
+/// encoder has drained every frame queued before it, and a healthy stop's tail is close to the
+/// old 5s limit (fleet: p99 2.8s, max 5.28s), so 5s restarted the process on stops that were
+/// still making progress (#146). Every other platform keeps exactly the 5s default.
+fn obs_stop_watchdog() -> (Duration, Option<Duration>) {
+    #[cfg(target_os = "windows")]
+    {
+        (Duration::from_secs(15), Some(OBS_CALL_TIMEOUT))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        (OBS_CALL_TIMEOUT, None)
+    }
+}
+
+/// The watchdog thread's two sleeps: `(Some(warn_after), timeout - warn_after)` when a warning
+/// is requested strictly before `timeout`, else `(None, timeout)` (the plain watchdog).
+fn watchdog_sleeps(timeout: Duration, warn_after: Option<Duration>) -> (Option<Duration>, Duration) {
+    match warn_after {
+        Some(w) if w < timeout => (Some(w), timeout - w),
+        _ => (None, timeout),
+    }
+}
+
+/// [`obs_call_with_watchdog`] with an explicit `timeout`, and an optional `warn_after` at which a
+/// still-running call logs a warning (no restart). `warn_after: None` (or one that is not below
+/// `timeout`) behaves exactly like the plain watchdog: one sleep of `timeout`, then restart.
+fn obs_call_with_watchdog_timeout<F, T>(
+    f: F,
+    description: &str,
+    timeout: Duration,
+    warn_after: Option<Duration>,
+) -> T
+where
+    F: FnOnce() -> T,
+{
     let completed = Arc::new(AtomicBool::new(false));
     let completed_clone = completed.clone();
     let desc = description.to_string();
 
+    let (warn_sleep, restart_sleep) = watchdog_sleeps(timeout, warn_after);
+
     std::thread::spawn(move || {
-        std::thread::sleep(OBS_CALL_TIMEOUT);
+        if let Some(warn_sleep) = warn_sleep {
+            std::thread::sleep(warn_sleep);
+            if completed_clone.load(AtomicOrdering::SeqCst) {
+                return;
+            }
+            warn!(
+                "OBS call '{}' still running after {:?} (output still flushing); \
+                 restarting only if it exceeds {:?}",
+                desc, warn_sleep, timeout
+            );
+        }
+        std::thread::sleep(restart_sleep);
         if !completed_clone.load(AtomicOrdering::SeqCst) {
             error!(
                 "OBS call '{}' hung for {:?} — restarting process",
-                desc, OBS_CALL_TIMEOUT
+                desc, timeout
             );
             restart_process();
         }
@@ -4289,9 +4344,12 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
         // Stop the current recording. If this hangs, the watchdog restarts the process and the
         // segment registered above (Windows/Linux) is recovered on the next launch rather than
         // destroyed.
-        let _session = obs_call_with_watchdog(
+        let (stop_timeout, stop_warn_after) = obs_stop_watchdog();
+        let _session = obs_call_with_watchdog_timeout(
             || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
             "rotate_segment: stop_recording",
+            stop_timeout,
+            stop_warn_after,
         )?;
 
         // macOS: original order, register the segment after stop.
@@ -4462,6 +4520,30 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
         }
         self.last_resume_restart_at = Some(Instant::now());
         warn!("{reason}; starting a fresh recording to keep keylog↔video aligned");
+
+        // Windows (#146): never gracefully stop an output that spanned a suspend. QPC keeps
+        // advancing through sleep, so on wake libobs queues one duplicate frame per missed
+        // interval (~108,000 after an hour) and the MP4 muxer completes a stop only once all of
+        // them are encoded; the stop then outlives the watchdog and the process restarts anyway,
+        // as an ERROR. Instead persist the segment exactly as `stop_recording` does before its
+        // OBS stop (events file + upload manifest entry), keep the persisted state `Recording`
+        // so the fresh process resumes recording, and restart deliberately. The abandoned MP4 is
+        // left in the same state a hung stop leaves it (hybrid MP4, fragments already on disk),
+        // which recovery uploads. If the restart backoff refuses, fall through to the graceful
+        // path below, unchanged.
+        #[cfg(target_os = "windows")]
+        if restart_allowed_with_backoff() {
+            info!(
+                "Resume after suspend: skipping OBS stop (frame backlog), restarting for a fresh context"
+            );
+            self.input_backend.stop();
+            if let Err(e) = self.persist_segment_without_stopping_output().await {
+                error!("Resume restart: failed to persist the current segment: {}", e);
+            }
+            write_recording_state(PersistedRecordingState::Recording);
+            restart_process(); // spawns a replacement and exits; never returns
+        }
+
         if let Err(e) = self.stop_recording().await {
             error!("Resume restart: stop_recording failed: {}", e);
         }
@@ -4476,6 +4558,52 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
                 )));
             }
         }
+    }
+
+    /// Windows: the pre-OBS-stop half of [`Self::stop_recording`], for a recording whose output is
+    /// about to be abandoned by a deliberate process restart (see `restart_recording_after_resume`).
+    /// Writes the segment's events file and registers the segment in the upload manifest exactly
+    /// as `stop_recording` does before it stops OBS (PDOOM-1413 order), so the fresh process's
+    /// recovery pass re-queues it. Leaves the OBS output and all in-memory recording state
+    /// untouched: the caller restarts the process next.
+    #[cfg(target_os = "windows")]
+    async fn persist_segment_without_stopping_output(&mut self) -> Result<()> {
+        if self.current_session.is_none() {
+            return Ok(());
+        }
+
+        let video_path = self.current_session.as_ref().map(|s| s.output_path.clone());
+        let segment_id = self.current_segment_id();
+        let events = self.collect_segment_events(&segment_id).await?;
+
+        if !events.is_empty() || video_path.is_some() {
+            let start_time_us = events.first().map(|e| e.timestamp_us).unwrap_or(0);
+            let end_time_us = events.last().map(|e| e.timestamp_us).unwrap_or(0);
+
+            let input_path = self
+                .output_dir
+                .join(format!("input_{}.msgpack", segment_id));
+            let bytes = rmp_serde::to_vec(&events)?;
+            tokio::fs::write(&input_path, bytes).await?;
+
+            info!("Saved {} events to {:?}", events.len(), input_path);
+
+            if self.uploader.is_configured() {
+                let main_session_id = self.main_session_id.clone().unwrap_or_default();
+                let chunk = CompletedChunk {
+                    chunk_id: segment_id.clone(),
+                    session_id: main_session_id,
+                    events,
+                    video_path,
+                    start_time_us,
+                    end_time_us,
+                };
+
+                let segment = CompletedSegment { chunk, input_path };
+                self.buffer_segment_for_upload(segment, segment_id);
+            }
+        }
+        Ok(())
     }
 
     /// Start recording
@@ -4698,9 +4826,12 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
 
                 // Stop libobs recording. The watchdog restarts the process if OBS hangs; the segment
                 // registered above is then recovered on the next launch rather than destroyed.
-                let session = obs_call_with_watchdog(
+                let (stop_timeout, stop_warn_after) = obs_stop_watchdog();
+                let session = obs_call_with_watchdog_timeout(
                     || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
                     "stop_recording: with_upload",
+                    stop_timeout,
+                    stop_warn_after,
                 )?;
                 if let Some(session) = session {
                     info!(
@@ -4741,9 +4872,12 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
             }
         } else {
             // Just stop recording without upload
-            let session = obs_call_with_watchdog(
+            let (stop_timeout, stop_warn_after) = obs_stop_watchdog();
+            let session = obs_call_with_watchdog_timeout(
                 || tokio::task::block_in_place(|| self.capture_ctx.stop_recording()),
                 "stop_recording: without_upload",
+                stop_timeout,
+                stop_warn_after,
             )?;
             if let Some(session) = session {
                 info!(
@@ -6260,6 +6394,73 @@ mod tests {
         assert_eq!(buffer.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #146: the output-stop watchdog. Windows waits 15s and warns at 5s; every other platform
+    // keeps the plain 5s watchdog with no warning.
+    mod stop_watchdog {
+        use super::*;
+
+        #[test]
+        fn default_watchdog_is_five_seconds() {
+            assert_eq!(OBS_CALL_TIMEOUT, Duration::from_secs(5));
+        }
+
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn windows_stop_waits_15s_and_warns_at_5s() {
+            assert_eq!(
+                obs_stop_watchdog(),
+                (Duration::from_secs(15), Some(Duration::from_secs(5)))
+            );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        #[test]
+        fn other_platforms_keep_the_plain_5s_stop_watchdog() {
+            assert_eq!(obs_stop_watchdog(), (Duration::from_secs(5), None));
+        }
+
+        #[test]
+        fn no_warning_sleeps_the_whole_timeout_once() {
+            let t = Duration::from_secs(5);
+            assert_eq!(watchdog_sleeps(t, None), (None, t));
+        }
+
+        #[test]
+        fn warning_splits_the_timeout() {
+            assert_eq!(
+                watchdog_sleeps(Duration::from_secs(15), Some(Duration::from_secs(5))),
+                (Some(Duration::from_secs(5)), Duration::from_secs(10))
+            );
+        }
+
+        #[test]
+        fn warning_not_before_timeout_is_ignored() {
+            let t = Duration::from_secs(5);
+            assert_eq!(watchdog_sleeps(t, Some(t)), (None, t));
+            assert_eq!(watchdog_sleeps(t, Some(Duration::from_secs(9))), (None, t));
+        }
+
+        #[test]
+        fn the_stop_schedule_always_totals_its_timeout() {
+            let (timeout, warn_after) = obs_stop_watchdog();
+            let (warn_sleep, restart_sleep) = watchdog_sleeps(timeout, warn_after);
+            assert_eq!(warn_sleep.unwrap_or(Duration::ZERO) + restart_sleep, timeout);
+            assert_eq!(warn_sleep, warn_after);
+        }
+
+        #[test]
+        fn a_fast_call_returns_its_value_without_restarting() {
+            // Long timeout so the watchdog thread can never fire during the test run.
+            let v = obs_call_with_watchdog_timeout(
+                || 42,
+                "test: fast call",
+                Duration::from_secs(600),
+                Some(Duration::from_secs(300)),
+            );
+            assert_eq!(v, 42);
+        }
     }
 }
 
