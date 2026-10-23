@@ -181,7 +181,7 @@ struct WinSparkle {
     set_did_find_update_callback: Option<FnSetUpdateStatusCb>,
     set_did_not_find_update_callback: Option<FnSetUpdateStatusCb>,
     set_update_error_callback: Option<FnSetUpdateStatusCb>,
-    check_update_without_ui: FnVoid,
+    check_update_and_install: FnVoid,
 }
 
 // Raw fn pointers + Library are Send/Sync; WinSparkle is only driven from the
@@ -258,7 +258,12 @@ unsafe fn load() -> Result<WinSparkle, String> {
     );
     let set_update_error_callback =
         opt_sym!(FnSetUpdateStatusCb, b"win_sparkle_set_error_callback\0");
-    let check_update_without_ui = sym!(FnVoid, b"win_sparkle_check_update_without_ui\0");
+    // Not win_sparkle_check_update_without_ui: despite its name, when it finds an
+    // update it opens WinSparkle's "install update?" dialog and waits for a click.
+    // That dialog never surfaces for our windowless app, so updates were found but
+    // never installed. This call downloads and installs without asking.
+    let check_update_and_install =
+        sym!(FnVoid, b"win_sparkle_check_update_with_ui_and_install\0");
 
     Ok(WinSparkle {
         _lib: lib,
@@ -274,7 +279,7 @@ unsafe fn load() -> Result<WinSparkle, String> {
         set_did_find_update_callback,
         set_did_not_find_update_callback,
         set_update_error_callback,
-        check_update_without_ui,
+        check_update_and_install,
     })
 }
 
@@ -322,11 +327,11 @@ pub fn init(appcast_url: &str, eddsa_pubkey: &str, version: &str) -> Result<(), 
         if let Some(f) = ws.set_update_error_callback {
             f(update_error_cb);
         }
-        (ws.set_automatic_check_for_updates)(1);
-        // Check hourly (WinSparkle's enforced minimum) rather than daily, so a
-        // freshly published release reaches users within ~an hour instead of up
-        // to a day. The background check respects this interval, so a long-running
-        // agent would otherwise sit on a stale version until the daily mark.
+        // WinSparkle's own scheduled check is off: like check_update_without_ui, it
+        // opens the "install update?" dialog that never surfaces for us, and that
+        // hidden dialog would sit in front of our installs. The tray loop drives
+        // check_without_ui() every 10 minutes instead.
+        (ws.set_automatic_check_for_updates)(0);
         (ws.set_update_check_interval)(60 * 60);
         (ws.init)();
     }
@@ -339,8 +344,8 @@ pub fn init(appcast_url: &str, eddsa_pubkey: &str, version: &str) -> Result<(), 
 ///
 /// WinSparkle's interactive (with-UI) check does not render a dialog for our
 /// windowless tray app (the click reaches it, but no window appears). So drive
-/// the same silent check the background loop uses, which reliably finds,
-/// downloads, and installs updates, and report progress/result via toasts from
+/// the same check the background loop uses, which finds, downloads, and
+/// installs updates without a click, and report progress/result via toasts from
 /// the did-find / did-not-find / error callbacks (gated on MANUAL_CHECK so the
 /// every-10-minute background checks stay silent).
 pub fn check_with_ui() {
@@ -348,7 +353,7 @@ pub fn check_with_ui() {
         info!("Manual update check requested (tray Check for Updates)");
         MANUAL_CHECK.store(true, Ordering::SeqCst);
         crate::ui::notifications::show_update_check_notification("Checking for updates…");
-        unsafe { (ws.check_update_without_ui)() };
+        unsafe { (ws.check_update_and_install)() };
     } else {
         error!("Manual update check requested but WinSparkle is not initialized");
     }
@@ -357,7 +362,7 @@ pub fn check_with_ui() {
 /// Trigger a silent background update check.
 pub fn check_without_ui() {
     if let Some(ws) = WINSPARKLE.get() {
-        unsafe { (ws.check_update_without_ui)() };
+        unsafe { (ws.check_update_and_install)() };
     }
 }
 
