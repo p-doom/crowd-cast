@@ -18,5 +18,5 @@ echo "recordings -> $REC ; running crowd-cast for ~12s..."
 sleep 12
 kill "$(cat "$WORK/pid")" 2>/dev/null || true
 echo "--- mp4_output / output errors in log ---"
-grep -iE "mp4_output|Failed to (create|start)|Output ID|recording" /tmp/cc-smoke.log | head
+grep -iE "mp4_output|obs_x264|Encoder ID|Failed to (create|start)|Output ID|recording" /tmp/cc-smoke.log | head
 echo "NOTE: assert a recording file was created and non-zero (see configured output dir)."
