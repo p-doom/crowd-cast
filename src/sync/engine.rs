@@ -230,7 +230,9 @@ enum DeadSourceAction {
     Wait,
     /// First failure for this app — restart the process for a fresh capture context.
     Restart,
-    /// Already restarted for this app and still dead — surface the restart-your-machine alert.
+    /// Already restarted for this app and still dead — surface the restart-your-machine alert
+    /// (macOS: first restart replayd and the process, at most once an hour; see
+    /// [`reset_replayd`]).
     Alert,
     /// Already restarted AND alerted for this app — sit tight (no restart, no re-alert).
     Hold,
@@ -877,6 +879,68 @@ fn restart_macos_process() -> ! {
     }
 }
 
+/// Whether a capture failure that an automatic restart did not fix first restarts macOS's
+/// screen capture service (replayd), once, before the participant is told to restart their Mac.
+/// macOS only: replayd is macOS's.
+#[cfg_attr(
+    not(any(all(target_os = "macos", not(no_tray)), target_os = "windows")),
+    allow(dead_code)
+)]
+const REPLAYD_RESET_ENABLED: bool = cfg!(all(target_os = "macos", not(no_tray)));
+
+/// Persisted marker (in the capture-dead map, 1h expiry): replayd was restarted within the hour.
+/// One marker for every caller, never cleared on recovery, so replayd is restarted at most once
+/// an hour whatever asks for it.
+#[cfg_attr(
+    not(any(all(target_os = "macos", not(no_tray)), target_os = "windows")),
+    allow(dead_code)
+)]
+const REPLAYD_RESET_MARKER: &str = "service:replayd-reset";
+
+/// Whether to restart replayd before telling the participant to restart their Mac: enabled, the
+/// app holds Screen Recording permission (without it, capture fails for that reason and
+/// restarting replayd would only interrupt other apps' capture), and not done within the hour.
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
+fn replayd_reset_due() -> bool {
+    REPLAYD_RESET_ENABLED
+        && crate::installer::wizard_ffi::check_screen_recording()
+        && capture_dead_restart_age(REPLAYD_RESET_MARKER).is_none()
+}
+
+/// Restart replayd by killing it; launchd starts it again the next time any app asks for screen
+/// capture. The same as `pkill -9 -x replayd` in Terminal: replayd runs as the logged-in user, so
+/// no admin rights are needed, and `-U` limits it to this user's. It also ends any other app's
+/// screen capture in progress (a screen share, a QuickTime recording), which is why it only runs
+/// after a restart did not help, and at most once an hour. Call it right before
+/// [`restart_process`], so the fresh process sets up capture against a fresh replayd.
+#[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
+fn reset_replayd() {
+    // Marked before the kill, so a kill that fails still counts against the hourly limit.
+    note_capture_dead_restart(REPLAYD_RESET_MARKER);
+    #[cfg(target_os = "macos")]
+    {
+        let uid = unsafe { libc::getuid() }.to_string();
+        match std::process::Command::new("/usr/bin/pkill")
+            .args(["-9", "-x", "-U", &uid, "replayd"])
+            .status()
+        {
+            Ok(status) if status.success() => {
+                warn!("Killed replayd (macOS screen capture service); it restarts on demand");
+            }
+            // pkill exits 1 when nothing matched.
+            Ok(status) if status.code() == Some(1) => {
+                info!("replayd was not running; nothing to kill");
+            }
+            Ok(status) => {
+                warn!("pkill replayd failed with status {}", status);
+            }
+            Err(e) => {
+                warn!("Could not run pkill to restart replayd: {}", e);
+            }
+        }
+    }
+}
+
 /// Run a blocking OBS call with a watchdog timeout.
 ///
 /// Spawns a background thread that waits `timeout` seconds. If the call
@@ -1010,7 +1074,8 @@ const STARTUP_SETUP_ALERTED_MARKER: &str = "alerted:startup:capture-setup-stalle
 /// signals reset the count: a display reported asleep or absent, and a tick that spanned a system
 /// sleep (much more wall-clock time than its length). On a stall: restart (under
 /// the shared restart backoff). If the previous process also restarted for a stalled startup
-/// within the hour, also notify once that capture cannot start.
+/// within the hour, restart replayd along with it (see [`reset_replayd`]); if replayd was already
+/// restarted within the hour, notify instead (once an hour) that capture cannot start.
 ///
 /// Arm once per attempt and drop it when the attempt returns, so retry sleeps between attempts
 /// never count as a stall. Inert unless [`STARTUP_CAPTURE_WATCHDOG_ENABLED`].
@@ -1067,14 +1132,46 @@ fn startup_stall_after_tick(
     }
 }
 
-/// Whether a stalled startup should notify the participant: only when the previous process also
-/// restarted for a stalled startup (the restart did not fix it), and not if already notified.
+/// What a stalled startup does besides restarting the process, which it always does.
 #[cfg_attr(
     not(any(all(target_os = "macos", not(no_tray)), target_os = "windows")),
     allow(dead_code)
 )]
-fn startup_stall_should_notify(previous_start_stalled: bool, already_notified: bool) -> bool {
-    previous_start_stalled && !already_notified
+#[derive(Debug, PartialEq, Eq)]
+enum StartupStallStep {
+    /// Nothing else. The first stalled startup: most are a request lost to a Mac going to sleep,
+    /// which a plain restart fixes, so replayd is left alone. Also a repeated stall once the
+    /// participant was already notified within the hour.
+    Restart,
+    /// The previous start stalled too, so a plain restart did not fix it: restart replayd first.
+    ResetReplaydThenRestart,
+    /// The previous start stalled too and replayd cannot be restarted again (already restarted
+    /// within the hour, or no Screen Recording permission): tell the participant to restart their
+    /// Mac.
+    NotifyThenRestart,
+}
+
+/// The step for a stalled startup, given whether the previous process also restarted for a
+/// stalled startup within the hour, whether [`replayd_reset_due`], and whether the participant
+/// was already notified within the hour.
+#[cfg_attr(
+    not(any(all(target_os = "macos", not(no_tray)), target_os = "windows")),
+    allow(dead_code)
+)]
+fn startup_stall_step(
+    previous_start_stalled: bool,
+    replayd_reset_due: bool,
+    already_notified: bool,
+) -> StartupStallStep {
+    if !previous_start_stalled {
+        StartupStallStep::Restart
+    } else if replayd_reset_due {
+        StartupStallStep::ResetReplaydThenRestart
+    } else if already_notified {
+        StartupStallStep::Restart
+    } else {
+        StartupStallStep::NotifyThenRestart
+    }
 }
 
 /// Whether a display is awake right now. Asleep or absent (lid closed, dark wake) means a stall
@@ -1124,24 +1221,43 @@ fn watch_startup_capture(done: Arc<AtomicBool>) {
     );
     #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
     {
-        let previous_start_stalled =
-            capture_dead_restart_age(STARTUP_SETUP_STALLED_MARKER).is_some();
-        let already_notified = capture_dead_restart_age(STARTUP_SETUP_ALERTED_MARKER).is_some();
-        if startup_stall_should_notify(previous_start_stalled, already_notified) {
-            error!("Startup capture setup also stalled in the previous process; notifying");
-            note_capture_dead_restart(STARTUP_SETUP_ALERTED_MARKER);
-            crate::ui::show_capture_stuck_notification();
+        let step = startup_stall_step(
+            capture_dead_restart_age(STARTUP_SETUP_STALLED_MARKER).is_some(),
+            replayd_reset_due(),
+            capture_dead_restart_age(STARTUP_SETUP_ALERTED_MARKER).is_some(),
+        );
+        match step {
+            StartupStallStep::Restart => {}
+            StartupStallStep::ResetReplaydThenRestart => {
+                error!(
+                    "Startup capture setup also stalled in the previous process; restarting \
+                     replayd (macOS screen capture service) along with this process"
+                );
+            }
+            StartupStallStep::NotifyThenRestart => {
+                error!(
+                    "Startup capture setup also stalled in the previous process, and replayd \
+                     cannot be restarted again (already restarted within the hour, or no Screen \
+                     Recording permission); notifying"
+                );
+                note_capture_dead_restart(STARTUP_SETUP_ALERTED_MARKER);
+                crate::ui::show_capture_stuck_notification();
+            }
         }
         note_capture_dead_restart(STARTUP_SETUP_STALLED_MARKER);
         // The backoff only ever defers a restart. While deferred, keep waiting in this process
         // (exiting instead would make launchd relaunch it within seconds, a loop), and stand down
         // if the setup finishes after all. 15s between checks: each deferred check logs a line.
+        // replayd is killed only together with an actual restart, never while deferred.
         loop {
             if done.load(AtomicOrdering::SeqCst) {
                 info!("Startup capture setup finished after all; not restarting");
                 return;
             }
             if restart_allowed_with_backoff() {
+                if step == StartupStallStep::ResetReplaydThenRestart {
+                    reset_replayd();
+                }
                 restart_process();
             }
             std::thread::sleep(Duration::from_secs(15));
@@ -2867,7 +2983,8 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
     /// app's Ok(true) used to wipe the global "already tried" state). One restart per app: the
     /// per-app marker survives the restart, so if the fresh process is still dead for the same
     /// app we treat it as an OS-level wedge, alert once, and hold — no more restarts for that
-    /// app until ITS source recovers.
+    /// app until ITS source recovers. macOS adds one step before the alert: restart replayd and
+    /// the process once more, at most once an hour (see [`reset_replayd`]).
     ///
     /// Returns true if it handled the tick (restart deferred / alert / hold). On an actual
     /// restart the process is replaced (exec on macOS, spawn+exit on Windows) and this never
@@ -2962,6 +3079,31 @@ spilled {} event(s) into the recording buffer to avoid data loss ({} spilled thi
             // which keeps the readiness probe alive — expected.
             DeadSourceAction::Hold => {
                 self.pause_for_dead_capture(&app);
+                true
+            }
+            // macOS, before the restart-your-Mac alert: restart replayd (macOS screen capture
+            // service) and this process, at most once an hour. The app's marker is renewed, so a
+            // fresh process still dead for this app comes back to Alert and, with replayd already
+            // restarted, alerts. Not marked alerted here, so a deferred restart is retried.
+            DeadSourceAction::Alert if replayd_reset_due() => {
+                if restart_allowed_with_backoff() {
+                    error!(
+                        "Capture source for '{}' still dead after an automatic restart; \
+                         restarting replayd (macOS screen capture service) and this process \
+                         before prompting for a machine restart",
+                        app
+                    );
+                    note_capture_dead_restart(&app);
+                    self.input_backend.stop();
+                    self.stop_recording().await.ok();
+                    reset_replayd();
+                    restart_process(); // replaces the process — never returns
+                }
+                warn!(
+                    "Capture source for '{}' still dead after an automatic restart; replayd \
+                     restart deferred by backoff, will retry",
+                    app
+                );
                 true
             }
             DeadSourceAction::Alert => {
@@ -6485,22 +6627,52 @@ mod tests {
         }
 
         #[test]
-        fn notifies_only_on_a_repeated_stall_once() {
-            // First stalled startup: restart silently.
-            assert!(!startup_stall_should_notify(false, false));
-            // The restarted process stalled too: notify.
-            assert!(startup_stall_should_notify(true, false));
-            // Already notified within the hour: do not notify again.
-            assert!(!startup_stall_should_notify(true, true));
-            assert!(!startup_stall_should_notify(false, true));
+        fn first_stall_only_restarts() {
+            // Most first stalls are a request lost to a Mac going to sleep: replayd is fine.
+            for replayd_due in [false, true] {
+                for notified in [false, true] {
+                    assert_eq!(
+                        startup_stall_step(false, replayd_due, notified),
+                        StartupStallStep::Restart
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn repeated_stall_restarts_replayd_before_notifying() {
+            // The restarted process stalled too: restart replayd first.
+            assert_eq!(
+                startup_stall_step(true, true, false),
+                StartupStallStep::ResetReplaydThenRestart
+            );
+            // replayd already restarted within the hour: notify.
+            assert_eq!(
+                startup_stall_step(true, false, false),
+                StartupStallStep::NotifyThenRestart
+            );
+            // ...once.
+            assert_eq!(
+                startup_stall_step(true, false, true),
+                StartupStallStep::Restart
+            );
         }
 
         #[test]
         fn markers_are_distinct_and_not_app_ids() {
-            // Both share the per-app capture-dead map with bundle ids and process names, which
+            // All share the per-app capture-dead map with bundle ids and process names, which
             // never contain ':'.
-            assert!(STARTUP_SETUP_STALLED_MARKER.contains(':'));
-            assert_ne!(STARTUP_SETUP_STALLED_MARKER, STARTUP_SETUP_ALERTED_MARKER);
+            let markers = [
+                STARTUP_SETUP_STALLED_MARKER,
+                STARTUP_SETUP_ALERTED_MARKER,
+                REPLAYD_RESET_MARKER,
+            ];
+            for (i, a) in markers.iter().enumerate() {
+                assert!(a.contains(':'));
+                for b in &markers[i + 1..] {
+                    assert_ne!(a, b);
+                }
+            }
         }
     }
 

@@ -558,7 +558,7 @@ void notifications_show_capture_stuck(void) {
     @autoreleasepool {
         UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
         content.title = @"crowd-cast cannot capture the screen";
-        content.body = @"An automatic restart did not fix it. Please restart your Mac.";
+        content.body = @"crowd-cast could not fix this automatically. Please restart your Mac.";
 
         NSString *identifier = [[NSUUID UUID] UUIDString];
         UNNotificationRequest *request = [UNNotificationRequest
