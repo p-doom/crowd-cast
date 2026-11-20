@@ -538,6 +538,9 @@ fn main() -> Result<()> {
 
     let mut startup_attempt = 0usize;
     loop {
+        // Restarts the process if this attempt stalls inside ScreenCaptureKit (PDOOM-1782).
+        // Dropped when the attempt returns, so the retry sleep below is never counted.
+        let attempt_watchdog = sync::StartupCaptureWatchdog::arm();
         let step_err = match capture_ctx.initialize() {
             Err(e) => Some(("initialize libobs", e)),
             Ok(()) => {
@@ -547,6 +550,7 @@ fn main() -> Result<()> {
                 }
             }
         };
+        drop(attempt_watchdog);
         match step_err {
             None => break,
             Some((step, e)) => {
@@ -572,6 +576,7 @@ fn main() -> Result<()> {
         }
     }
     info!("libobs context initialized");
+    sync::startup_capture_setup_completed();
     if target_apps.is_empty() {
         info!("Capture sources configured (display capture since no apps selected)");
     } else {

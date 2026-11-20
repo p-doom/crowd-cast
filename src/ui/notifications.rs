@@ -54,6 +54,7 @@ mod ffi {
             build: *const c_char,
         );
         pub fn notifications_show_upload_queue_warning(count: usize);
+        pub fn notifications_show_capture_stuck();
         pub fn notifications_is_authorized() -> i32;
     }
 }
@@ -278,6 +279,17 @@ pub fn show_recording_stopped_notification() {
 #[cfg(not(target_os = "macos"))]
 pub fn show_recording_stopped_notification() {
     emit("Recording stopped", "");
+}
+
+/// Notify that screen capture could not start and an automatic agent restart did not fix it
+/// (startup capture setup stalled twice in a row, PDOOM-1782). A notification, not the "restart
+/// your Mac" alert: it is posted while the main thread is still stuck in capture setup, and an
+/// alert needs the main run loop. Safe to call from any thread.
+#[cfg(target_os = "macos")]
+pub fn show_capture_stuck_notification() {
+    unsafe {
+        ffi::notifications_show_capture_stuck();
+    }
 }
 
 /// Notify that screen capture is wedged and an automatic agent restart did not fix it — the

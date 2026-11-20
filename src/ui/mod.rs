@@ -35,8 +35,10 @@ pub use notifications::{
     show_setup_configuring_notification, show_sources_refreshed_notification,
     show_update_completed_notification, show_update_installing_notification, NotificationAction,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub use notifications::show_capture_stuck_notification;
 #[cfg(target_os = "windows")]
-pub use notifications::{show_capture_stuck_notification, show_window_uncapturable_notification};
+pub use notifications::show_window_uncapturable_notification;
 pub use tray::*;
 #[cfg(target_os = "linux")]
 pub use tray_linux::request_tray_exit;

@@ -2,7 +2,9 @@
 
 mod engine;
 
-pub use engine::{create_engine_channels, SyncEngine};
+pub use engine::{
+    create_engine_channels, startup_capture_setup_completed, StartupCaptureWatchdog, SyncEngine,
+};
 #[cfg(target_os = "windows")]
 pub(crate) use engine::migrate_legacy_recordings_dir;
 
