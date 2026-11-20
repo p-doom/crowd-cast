@@ -973,8 +973,12 @@ pub const STARTUP_CAPTURE_WATCHDOG_ENABLED: bool = cfg!(all(target_os = "macos",
 
 /// How long startup capture setup may go without a capture source creation returning, counted
 /// only while the display is awake, before the process restarts (PDOOM-1782). Fleet, November,
-/// starts not following a display change: 6 of 18,918 setup steps took 60s or longer.
-const STARTUP_SETUP_STALL_LIMIT: Duration = Duration::from_secs(60);
+/// starts not following a display change: 6 of 18,918 setup steps took 60s or longer, 4 of them
+/// on one Mac that finished each in 72-109s on its own; 2 took 120s or longer.
+const STARTUP_SETUP_STALL_LIMIT: Duration = Duration::from_secs(120);
+
+/// A watchdog tick that took longer than this in wall-clock time spanned a system sleep.
+const STARTUP_TICK_SPANNED_SLEEP: Duration = Duration::from_secs(5);
 
 /// Persisted marker (in the per-app capture-dead map, 1h expiry): the previous process restarted
 /// because its startup capture setup stalled. Cleared once a setup completes.
@@ -1002,7 +1006,9 @@ const STARTUP_SETUP_ALERTED_MARKER: &str = "alerted:startup:capture-setup-stalle
 ///
 /// A stall is [`STARTUP_SETUP_STALL_LIMIT`] with no source creation returning, counted in
 /// one-second ticks and only while a display is awake: time asleep (dark wakes included) is not
-/// evidence of a hang, and a setup that resumes on wake is left alone. On a stall: restart (under
+/// evidence of a hang, and a setup that resumes on wake is left alone. Two independent sleep
+/// signals reset the count: a display reported asleep or absent, and a tick that spanned a system
+/// sleep (much more wall-clock time than its length). On a stall: restart (under
 /// the shared restart backoff). If the previous process also restarted for a stalled startup
 /// within the hour, also notify once that capture cannot start.
 ///
@@ -1044,15 +1050,17 @@ pub fn startup_capture_setup_completed() {
     }
 }
 
-/// One watchdog tick: the stall clock after a tick of length `tick`. Any progress, or a display
-/// that is asleep (or absent), resets it to zero.
+/// One watchdog tick: the stall clock after a tick of length `tick` that took `wall_elapsed` of
+/// wall-clock time. Any progress, a display that is asleep (or absent), or a tick that spanned a
+/// system sleep resets it to zero.
 fn startup_stall_after_tick(
     stalled_for: Duration,
     progressed: bool,
     display_awake: bool,
     tick: Duration,
+    wall_elapsed: Duration,
 ) -> Duration {
-    if progressed || !display_awake {
+    if progressed || !display_awake || wall_elapsed > STARTUP_TICK_SPANNED_SLEEP {
         Duration::ZERO
     } else {
         stalled_for + tick
@@ -1089,16 +1097,20 @@ fn watch_startup_capture(done: Arc<AtomicBool>) {
     let mut last_progress = crate::capture::capture_source_creations_returned();
     let mut stalled_for = Duration::ZERO;
     loop {
+        // Wall clock on purpose: it keeps running while the system sleeps.
+        let tick_started = std::time::SystemTime::now();
         std::thread::sleep(TICK);
         if done.load(AtomicOrdering::SeqCst) {
             return;
         }
+        let wall_elapsed = tick_started.elapsed().unwrap_or(Duration::ZERO);
         let progress = crate::capture::capture_source_creations_returned();
         stalled_for = startup_stall_after_tick(
             stalled_for,
             progress != last_progress,
             any_display_awake(),
             TICK,
+            wall_elapsed,
         );
         last_progress = progress;
         if stalled_for >= STARTUP_SETUP_STALL_LIMIT {
@@ -6383,48 +6395,93 @@ mod tests {
 
         const TICK: Duration = Duration::from_secs(1);
 
-        /// Run the stall clock over a sequence of `(progressed, display_awake)` ticks.
-        fn run(ticks: &[(bool, bool)]) -> Duration {
-            ticks.iter().fold(Duration::ZERO, |stalled, &(progressed, awake)| {
-                startup_stall_after_tick(stalled, progressed, awake, TICK)
-            })
+        const LIMIT_TICKS: usize = 120;
+
+        /// One tick: (progressed, display_awake, wall-clock seconds the tick took).
+        type Tick = (bool, bool, u64);
+        const AWAKE: Tick = (false, true, 1);
+        const ASLEEP: Tick = (false, false, 1);
+
+        /// Run the stall clock over a sequence of ticks.
+        fn run(ticks: &[Tick]) -> Duration {
+            ticks
+                .iter()
+                .fold(Duration::ZERO, |stalled, &(progressed, awake, wall)| {
+                    startup_stall_after_tick(
+                        stalled,
+                        progressed,
+                        awake,
+                        TICK,
+                        Duration::from_secs(wall),
+                    )
+                })
+        }
+
+        fn ticks(parts: &[(Tick, usize)]) -> Vec<Tick> {
+            parts
+                .iter()
+                .flat_map(|&(t, n)| std::iter::repeat(t).take(n))
+                .collect()
+        }
+
+        #[test]
+        fn limit_matches_the_tick_count() {
+            assert_eq!(STARTUP_SETUP_STALL_LIMIT, TICK * LIMIT_TICKS as u32);
         }
 
         #[test]
         fn stall_counts_awake_ticks_without_progress() {
-            assert_eq!(run(&[(false, true); 60]), STARTUP_SETUP_STALL_LIMIT);
-            assert!(run(&[(false, true); 59]) < STARTUP_SETUP_STALL_LIMIT);
+            assert_eq!(
+                run(&ticks(&[(AWAKE, LIMIT_TICKS)])),
+                STARTUP_SETUP_STALL_LIMIT
+            );
+            assert!(run(&ticks(&[(AWAKE, LIMIT_TICKS - 1)])) < STARTUP_SETUP_STALL_LIMIT);
         }
 
         #[test]
         fn progress_resets_the_stall() {
-            // A slow but progressing setup (one source every 59s) never stalls.
-            let mut ticks = Vec::new();
+            // A slow but progressing setup (one source just under the limit apart) never stalls.
+            let progressed: Tick = (true, true, 1);
+            let mut all = Vec::new();
             for _ in 0..10 {
-                ticks.extend(std::iter::repeat((false, true)).take(58));
-                ticks.push((true, true));
+                all.extend(ticks(&[(AWAKE, LIMIT_TICKS - 2), (progressed, 1)]));
             }
-            assert_eq!(run(&ticks), Duration::ZERO);
+            assert_eq!(run(&all), Duration::ZERO);
         }
 
         #[test]
         fn asleep_display_resets_the_stall() {
             // Lid closed partway through: the ticks before sleep do not carry over to the wake.
-            let mut ticks = vec![(false, true); 50];
-            ticks.push((false, false));
-            ticks.extend(std::iter::repeat((false, true)).take(50));
-            assert_eq!(run(&ticks), Duration::from_secs(50));
+            assert_eq!(
+                run(&ticks(&[(AWAKE, 100), (ASLEEP, 1), (AWAKE, 50)])),
+                Duration::from_secs(50)
+            );
             // Asleep for any length of time never reaches the limit.
-            assert_eq!(run(&[(false, false); 10_000]), Duration::ZERO);
+            assert_eq!(run(&ticks(&[(ASLEEP, 10_000)])), Duration::ZERO);
+        }
+
+        #[test]
+        fn a_tick_that_spanned_a_system_sleep_resets_the_stall() {
+            // Even if the display were wrongly reported awake during dark wakes, each sleep
+            // between them shows up as one long tick and resets the count.
+            let spanned_sleep: Tick = (false, true, 900);
+            let dark_wake = ticks(&[(AWAKE, 40), (spanned_sleep, 1)]);
+            let night: Vec<Tick> = std::iter::repeat(dark_wake).take(50).flatten().collect();
+            assert_eq!(run(&night), Duration::ZERO);
+            // Five wall seconds is still an ordinary (slow) tick.
+            let slow: Tick = (false, true, 5);
+            assert_eq!(run(&ticks(&[(slow, 3)])), Duration::from_secs(3));
         }
 
         #[test]
         fn stuck_after_wake_still_stalls() {
             // The 2026-11-13 shape: request issued in a dark wake, lid opened hours later, no
             // answer ever. Once awake for the limit, the watchdog fires.
-            let mut ticks = vec![(false, false); 3_600];
-            ticks.extend(std::iter::repeat((false, true)).take(60));
-            assert_eq!(run(&ticks), STARTUP_SETUP_STALL_LIMIT);
+            let woke: Tick = (false, true, 3_600);
+            assert_eq!(
+                run(&ticks(&[(ASLEEP, 600), (woke, 1), (AWAKE, LIMIT_TICKS)])),
+                STARTUP_SETUP_STALL_LIMIT
+            );
         }
 
         #[test]
