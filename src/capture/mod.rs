@@ -85,7 +85,10 @@ pub use recording::{
     RecordingState, VideoCodecPreference,
 };
 pub use recovery::{get_display_name, get_display_uuid, DisplayChangeEvent, DisplayMonitor};
-pub use sources::{get_main_display_resolution, get_main_display_uuid, ScreenCaptureSource};
+pub use sources::{
+    capture_source_creations_returned, get_main_display_resolution, get_main_display_uuid,
+    ScreenCaptureSource,
+};
 // Linux/Wayland display-capture restore-token persistence (handled in main): the reserved
 // map key and the session predicate used to gate the one-time monitor-pick wait.
 #[cfg(target_os = "linux")]

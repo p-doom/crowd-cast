@@ -966,6 +966,177 @@ where
     result
 }
 
+/// Whether startup capture setup runs under [`StartupCaptureWatchdog`]. macOS only: the stall it
+/// guards against is ScreenCaptureKit's, and Linux setup can legitimately wait on the user in a
+/// portal picker dialog.
+pub const STARTUP_CAPTURE_WATCHDOG_ENABLED: bool = cfg!(all(target_os = "macos", not(no_tray)));
+
+/// How long startup capture setup may go without a capture source creation returning, counted
+/// only while the display is awake, before the process restarts (PDOOM-1782). Fleet, November,
+/// starts not following a display change: 6 of 18,918 setup steps took 60s or longer.
+const STARTUP_SETUP_STALL_LIMIT: Duration = Duration::from_secs(60);
+
+/// Persisted marker (in the per-app capture-dead map, 1h expiry): the previous process restarted
+/// because its startup capture setup stalled. Cleared once a setup completes.
+#[cfg_attr(
+    not(any(all(target_os = "macos", not(no_tray)), target_os = "windows")),
+    allow(dead_code)
+)]
+const STARTUP_SETUP_STALLED_MARKER: &str = "startup:capture-setup-stalled";
+
+/// Persisted marker: the participant was already notified about stalled startups within the hour.
+#[cfg_attr(
+    not(any(all(target_os = "macos", not(no_tray)), target_os = "windows")),
+    allow(dead_code)
+)]
+const STARTUP_SETUP_ALERTED_MARKER: &str = "alerted:startup:capture-setup-stalled";
+
+/// Watches one startup capture-setup attempt (libobs init + capture source creation) and restarts
+/// the process if it stalls (PDOOM-1782).
+///
+/// The libobs macOS capture plugin waits for ScreenCaptureKit's shareable-content answer with no
+/// timeout. A request issued while the Mac is going to sleep (a display-change restart as the lid
+/// closes) or while replayd is stuck can go unanswered forever, and the agent then sits there
+/// with no tray icon (created after setup) and no relaunch (launchd only relaunches on exit) until
+/// the next login. The wait cannot be interrupted, so the watchdog acts from its own thread.
+///
+/// A stall is [`STARTUP_SETUP_STALL_LIMIT`] with no source creation returning, counted in
+/// one-second ticks and only while a display is awake: time asleep (dark wakes included) is not
+/// evidence of a hang, and a setup that resumes on wake is left alone. On a stall: restart (under
+/// the shared restart backoff). If the previous process also restarted for a stalled startup
+/// within the hour, also notify once that capture cannot start.
+///
+/// Arm once per attempt and drop it when the attempt returns, so retry sleeps between attempts
+/// never count as a stall. Inert unless [`STARTUP_CAPTURE_WATCHDOG_ENABLED`].
+pub struct StartupCaptureWatchdog {
+    done: Arc<AtomicBool>,
+}
+
+impl StartupCaptureWatchdog {
+    pub fn arm() -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        if STARTUP_CAPTURE_WATCHDOG_ENABLED {
+            let thread_done = done.clone();
+            if let Err(e) = std::thread::Builder::new()
+                .name("startup-capture-watchdog".into())
+                .spawn(move || watch_startup_capture(thread_done))
+            {
+                warn!("Could not start the startup capture watchdog: {}", e);
+            }
+        }
+        Self { done }
+    }
+}
+
+impl Drop for StartupCaptureWatchdog {
+    fn drop(&mut self) {
+        self.done.store(true, AtomicOrdering::SeqCst);
+    }
+}
+
+/// Call once startup capture setup has completed: the next stalled startup counts as a first one
+/// again (restart only, no notification).
+pub fn startup_capture_setup_completed() {
+    #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
+    if STARTUP_CAPTURE_WATCHDOG_ENABLED {
+        clear_capture_dead_restart(STARTUP_SETUP_STALLED_MARKER);
+        clear_capture_dead_restart(STARTUP_SETUP_ALERTED_MARKER);
+    }
+}
+
+/// One watchdog tick: the stall clock after a tick of length `tick`. Any progress, or a display
+/// that is asleep (or absent), resets it to zero.
+fn startup_stall_after_tick(
+    stalled_for: Duration,
+    progressed: bool,
+    display_awake: bool,
+    tick: Duration,
+) -> Duration {
+    if progressed || !display_awake {
+        Duration::ZERO
+    } else {
+        stalled_for + tick
+    }
+}
+
+/// Whether a stalled startup should notify the participant: only when the previous process also
+/// restarted for a stalled startup (the restart did not fix it), and not if already notified.
+#[cfg_attr(
+    not(any(all(target_os = "macos", not(no_tray)), target_os = "windows")),
+    allow(dead_code)
+)]
+fn startup_stall_should_notify(previous_start_stalled: bool, already_notified: bool) -> bool {
+    previous_start_stalled && !already_notified
+}
+
+/// Whether a display is awake right now. Asleep or absent (lid closed, dark wake) means a stall
+/// clock must not run.
+fn any_display_awake() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use core_graphics::display::CGDisplay;
+        !CGDisplay::active_displays().unwrap_or_default().is_empty()
+            && !CGDisplay::main().is_asleep()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+fn watch_startup_capture(done: Arc<AtomicBool>) {
+    const TICK: Duration = Duration::from_secs(1);
+    let mut last_progress = crate::capture::capture_source_creations_returned();
+    let mut stalled_for = Duration::ZERO;
+    loop {
+        std::thread::sleep(TICK);
+        if done.load(AtomicOrdering::SeqCst) {
+            return;
+        }
+        let progress = crate::capture::capture_source_creations_returned();
+        stalled_for = startup_stall_after_tick(
+            stalled_for,
+            progress != last_progress,
+            any_display_awake(),
+            TICK,
+        );
+        last_progress = progress;
+        if stalled_for >= STARTUP_SETUP_STALL_LIMIT {
+            break;
+        }
+    }
+    error!(
+        "Startup capture setup made no progress for {}s with the display awake (screen capture \
+         is not answering) — restarting process",
+        STARTUP_SETUP_STALL_LIMIT.as_secs()
+    );
+    #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
+    {
+        let previous_start_stalled =
+            capture_dead_restart_age(STARTUP_SETUP_STALLED_MARKER).is_some();
+        let already_notified = capture_dead_restart_age(STARTUP_SETUP_ALERTED_MARKER).is_some();
+        if startup_stall_should_notify(previous_start_stalled, already_notified) {
+            error!("Startup capture setup also stalled in the previous process; notifying");
+            note_capture_dead_restart(STARTUP_SETUP_ALERTED_MARKER);
+            crate::ui::show_capture_stuck_notification();
+        }
+        note_capture_dead_restart(STARTUP_SETUP_STALLED_MARKER);
+        // The backoff only ever defers a restart. While deferred, keep waiting in this process
+        // (exiting instead would make launchd relaunch it within seconds, a loop), and stand down
+        // if the setup finishes after all. 15s between checks: each deferred check logs a line.
+        loop {
+            if done.load(AtomicOrdering::SeqCst) {
+                info!("Startup capture setup finished after all; not restarting");
+                return;
+            }
+            if restart_allowed_with_backoff() {
+                restart_process();
+            }
+            std::thread::sleep(Duration::from_secs(15));
+        }
+    }
+}
+
 /// Persisted recording state — survives restarts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PersistedRecordingState {
@@ -6204,6 +6375,77 @@ pub fn create_engine_channels() -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Startup capture watchdog decisions (PDOOM-1782). Pure functions only: arming the real
+    // watchdog in a test would spawn a thread that restarts the installed agent after 60s.
+    mod startup_capture_watchdog {
+        use super::*;
+
+        const TICK: Duration = Duration::from_secs(1);
+
+        /// Run the stall clock over a sequence of `(progressed, display_awake)` ticks.
+        fn run(ticks: &[(bool, bool)]) -> Duration {
+            ticks.iter().fold(Duration::ZERO, |stalled, &(progressed, awake)| {
+                startup_stall_after_tick(stalled, progressed, awake, TICK)
+            })
+        }
+
+        #[test]
+        fn stall_counts_awake_ticks_without_progress() {
+            assert_eq!(run(&[(false, true); 60]), STARTUP_SETUP_STALL_LIMIT);
+            assert!(run(&[(false, true); 59]) < STARTUP_SETUP_STALL_LIMIT);
+        }
+
+        #[test]
+        fn progress_resets_the_stall() {
+            // A slow but progressing setup (one source every 59s) never stalls.
+            let mut ticks = Vec::new();
+            for _ in 0..10 {
+                ticks.extend(std::iter::repeat((false, true)).take(58));
+                ticks.push((true, true));
+            }
+            assert_eq!(run(&ticks), Duration::ZERO);
+        }
+
+        #[test]
+        fn asleep_display_resets_the_stall() {
+            // Lid closed partway through: the ticks before sleep do not carry over to the wake.
+            let mut ticks = vec![(false, true); 50];
+            ticks.push((false, false));
+            ticks.extend(std::iter::repeat((false, true)).take(50));
+            assert_eq!(run(&ticks), Duration::from_secs(50));
+            // Asleep for any length of time never reaches the limit.
+            assert_eq!(run(&[(false, false); 10_000]), Duration::ZERO);
+        }
+
+        #[test]
+        fn stuck_after_wake_still_stalls() {
+            // The 2026-11-13 shape: request issued in a dark wake, lid opened hours later, no
+            // answer ever. Once awake for the limit, the watchdog fires.
+            let mut ticks = vec![(false, false); 3_600];
+            ticks.extend(std::iter::repeat((false, true)).take(60));
+            assert_eq!(run(&ticks), STARTUP_SETUP_STALL_LIMIT);
+        }
+
+        #[test]
+        fn notifies_only_on_a_repeated_stall_once() {
+            // First stalled startup: restart silently.
+            assert!(!startup_stall_should_notify(false, false));
+            // The restarted process stalled too: notify.
+            assert!(startup_stall_should_notify(true, false));
+            // Already notified within the hour: do not notify again.
+            assert!(!startup_stall_should_notify(true, true));
+            assert!(!startup_stall_should_notify(false, true));
+        }
+
+        #[test]
+        fn markers_are_distinct_and_not_app_ids() {
+            // Both share the per-app capture-dead map with bundle ids and process names, which
+            // never contain ':'.
+            assert!(STARTUP_SETUP_STALLED_MARKER.contains(':'));
+            assert_ne!(STARTUP_SETUP_STALLED_MARKER, STARTUP_SETUP_ALERTED_MARKER);
+        }
+    }
 
     // The dead-source escalation decision (dead_source_action) is macOS-only; gate its tests.
     // Per-app STATE isolation (dead clock / alerted set / restart marker keyed by app) is a
