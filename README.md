@@ -393,7 +393,16 @@ one-time step that needs network access.
 
 ### Linux
 
-Support coming soon...
+Linux releases are built and published by the [Linux Release workflow](.github/workflows/linux-release.yml). Run it from the Actions tab, or:
+
+```bash
+gh workflow run linux-release.yml -f channel=dev    # pre-release on a separate update feed
+gh workflow run linux-release.yml -f channel=prod   # public release
+```
+
+The version comes from `Cargo.toml`; bump it there for a new version (the workflow refuses any other). The workflow signs the update manifest with [`scripts/release-linux.sh`](scripts/release-linux.sh).
+
+The libobs bundle is not rebuilt for each release. It is published once per OBS version as its own GitHub Release (currently `obs-bundle-32.0.2`); [packaging/linux/README.md](packaging/linux/README.md) explains how to build a new one.
 
 ## Backend Setup
 
