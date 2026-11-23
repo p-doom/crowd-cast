@@ -10,7 +10,29 @@ use libobs_wrapper::scenes::ObsSceneRef;
 use libobs_wrapper::sources::{ObsSourceBuilder, ObsSourceRef};
 use libobs_wrapper::unsafe_send::Sendable;
 use libobs_wrapper::utils::traits::ObsUpdatable;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
+
+/// How many macOS capture-source creations have returned, success or error. The startup watchdog
+/// (`sync::engine::StartupCaptureWatchdog`, PDOOM-1782) reads it to tell a slow but progressing
+/// capture setup from one stuck inside ScreenCaptureKit. Bumped at runtime too; only read at
+/// startup. Never bumped off macOS.
+static CAPTURE_SOURCE_CREATIONS_RETURNED: AtomicU64 = AtomicU64::new(0);
+
+/// See [`CAPTURE_SOURCE_CREATIONS_RETURNED`].
+pub fn capture_source_creations_returned() -> u64 {
+    CAPTURE_SOURCE_CREATIONS_RETURNED.load(Ordering::Relaxed)
+}
+
+/// Counts one returned source creation when dropped, so every return path (including `?`) counts.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct CountCreationReturn;
+
+impl Drop for CountCreationReturn {
+    fn drop(&mut self) {
+        CAPTURE_SOURCE_CREATIONS_RETURNED.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 #[cfg(target_os = "macos")]
 use libobs_simple::sources::macos::{
@@ -112,6 +134,7 @@ impl ScreenCaptureSource {
         capture_audio: bool,
         _restore_token: Option<&str>,
     ) -> Result<Self> {
+        let _count_return = CountCreationReturn;
         // Get the current main display UUID - this is refreshed each time,
         // so it will be correct even after display reconnection
         let display_uuid = get_main_display_uuid()
@@ -295,6 +318,7 @@ impl ScreenCaptureSource {
         capture_audio: bool,
         _restore_token: Option<&str>,
     ) -> Result<Self> {
+        let _count_return = CountCreationReturn;
         info!(
             "Creating macOS application capture source: {} (app: {}, audio: {})",
             name, bundle_id, capture_audio

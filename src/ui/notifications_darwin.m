@@ -545,6 +545,36 @@ void notifications_show_upload_queue_warning(unsigned long count) {
     }
 }
 
+// Screen capture could not start, and an automatic restart did not fix it (PDOOM-1782).
+// Posted from the startup watchdog thread while the main thread is still stuck in capture
+// setup, so it must not depend on the main run loop (UNUserNotificationCenter does not; an
+// NSAlert would).
+void notifications_show_capture_stuck(void) {
+    if (!g_initialized) {
+        NSLog(@"[CrowdCast] Notifications not initialized");
+        return;
+    }
+
+    @autoreleasepool {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = @"crowd-cast cannot capture the screen";
+        content.body = @"crowd-cast could not fix this automatically. Please restart your Mac.";
+
+        NSString *identifier = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *request = [UNNotificationRequest
+            requestWithIdentifier:identifier
+            content:content
+            trigger:nil];
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[CrowdCast] Failed to show notification: %@", error);
+            }
+        }];
+    }
+}
+
 // Check if notifications are authorized
 // Returns: 1 if authorized, 0 if not, -1 on error
 int notifications_is_authorized(void) {
